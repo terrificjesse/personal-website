@@ -22,7 +22,14 @@ intentionally left as failing-test stubs for the user to implement — see below
   flat 7 days regardless of item. 1 failing test (`pantry_items_get_a_long_shelf_life`)
   marks the gap; the other tests pass by coincidence (7 days happens to fall in their
   accepted ranges) — don't take those passes as "done."
-- Run: `cargo run` (serves on `127.0.0.1:8080`). Test: `cargo test`.
+- `data/foodkeeper/` — USDA FSIS FoodKeeper shelf-life reference data (661 products, 25
+  categories), vendored as CSV to back `expiration.rs`. Nothing reads it yet. **Read
+  `data/foodkeeper/README.md` before writing any parsing code** — it documents provenance
+  (mirror verified against the official feed by hash), the `DOP_` = "date of purchase"
+  column semantics that are easy to get backwards, and seven data-shape traps found by
+  profiling (`_Metric` is a tagged union carrying `Not Recommended`/`Indefinitely`, prose
+  in integer fields, 184 rows with no refrigerate data, `Name` is not unique).
+- Run: `cargo run` (serves on `0.0.0.0:8080` — see LAN access note below). Test: `cargo test`.
 
 ## Frontend (`frontend/src/app/fridge/`)
 
@@ -30,6 +37,20 @@ intentionally left as failing-test stubs for the user to implement — see below
   (`NEXT_PUBLIC_FRIDGE_API_URL`, defaults to `http://127.0.0.1:8080`).
 - `AddItemForm.tsx`, `ExpirationBadge.tsx` — presentational pieces.
 - Verified working in-browser: add item, see it listed with expiration badge, remove it.
+
+## LAN access (testing from other devices)
+
+- Backend binds `0.0.0.0:8080` (changed from `127.0.0.1` in `src/main.rs`) so other devices
+  on the same Wi-Fi can reach it. First run after this change, macOS prompts to allow
+  incoming connections for `fridge_backend` — must be approved manually, not scriptable.
+- `frontend/.env.local` sets `NEXT_PUBLIC_FRIDGE_API_URL` to the host machine's LAN IP
+  (was `192.168.12.146` as of this writing) instead of `127.0.0.1`, since a browser on
+  another device resolves `127.0.0.1` to itself, not this machine.
+- That IP is DHCP-assigned and can change (reboot, Wi-Fi reconnect, etc). If LAN access
+  stops working, re-check it with `ipconfig getifaddr en0` and update `.env.local`.
+- No auth exists yet (Phase 5), so anything on the LAN can hit the API while it's bound to
+  `0.0.0.0` — fine on a trusted home network, not elsewhere.
+- `.env.local` is gitignored, so this LAN IP is local-machine-only config, not committed.
 
 ## Known environment quirks
 
@@ -42,6 +63,17 @@ intentionally left as failing-test stubs for the user to implement — see below
   `/Users/jesseli/projects/meal/.claude/launch.json` (name `personal-website-frontend`,
   `autoPort: true` since port 3000 is often occupied by an unrelated project on this
   machine).
+- If the fridge tab seems to "hang" on loading forever (not error, just an endless
+  spinner), first suspect is loading the page via the wrong URL — e.g. the Next.js dev
+  server's printed "Network" URL from a browser on this same machine still works, but
+  loading it as if it were a different machine's localhost won't. Confirm which URL is
+  loaded before assuming a code bug.
+
+## Git / GitHub
+
+- Repo is initialized at the `personal-website` root, on branch `main`, with remote
+  `origin` set to `git@github.com:terrificjesse/personal-website.git` over SSH (auth
+  already configured — see `~/.ssh/id_ed25519`).
 
 ## Next up
 

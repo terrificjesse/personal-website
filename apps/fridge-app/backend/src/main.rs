@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init_pool(&database_url).await?;
     let app = routes::build_router(pool);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("fridge_backend listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

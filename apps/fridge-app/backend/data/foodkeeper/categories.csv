@@ -1,0 +1,26 @@
+Category_ID,Category_Name,Subcategory_Name
+1,Baby Food,
+2,Baked Goods,Bakery
+3,Baked Goods,Baking and Cooking
+4,Baked Goods,Refrigerated Dough
+5,Beverages,
+6,"Condiments, Sauces & Canned Goods",
+7,Dairy Products & Eggs,
+8,Food Purchased Frozen,
+9,"Grains, Beans & Pasta",
+10,Meat,Fresh
+11,Meat,Shelf Stable Foods
+12,Meat,Smoked or Processed
+13,Meat,Stuffed or Assembled
+14,Poultry,Cooked or Processed
+15,Poultry,Fresh
+16,Poultry,Shelf Stable Foods
+17,Poultry,Stuffed or Assembled
+18,Produce,Fresh Fruits
+19,Produce,Fresh Vegetables
+20,Seafood,Fresh
+21,Seafood,Shellfish
+22,Seafood,Smoked
+23,Shelf Stable Foods,
+24,Vegetarian Proteins,
+25,Deli & Prepared Foods,
