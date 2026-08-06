@@ -13,11 +13,22 @@ intentionally left as failing-test stubs for the user to implement — see below
 - Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migrations/`.
 - `src/models.rs` — `FridgeItem` struct. `id` is a `String` (UUID text), not `uuid::Uuid`,
   to sidestep sqlx's BLOB-based Uuid encoding mismatch with our TEXT column.
-- `src/routes/items.rs` — `GET /items`, `POST /items`, `DELETE /items/:id`. Wired to call
-  `nlp::resolve_item_name` and `expiration::estimate_expiration` on add.
-- `src/nlp.rs` — **[learn] not yet implemented.** `resolve_item_name` only does exact
-  case-insensitive matching today. `cargo test` has 2 failing tests here
-  (`plural_resolves_to_singular`, `common_typo_resolves`) marking the gap.
+- `src/routes/items.rs` — `GET /items`, `POST /items`, `DELETE /items/:id`. Calls
+  `expiration::estimate_expiration` on add. It no longer resolves names: the user confirms
+  the name in the dropdown before the request is sent, so the server takes it at face value
+  and only normalizes whitespace/casing.
+- `src/routes/suggest.rs` — `GET /items/suggest?q=&limit=`, backing the add-item typeahead.
+  Empty `q` returns recent fridge items (fully working, doesn't touch the ranker); non-empty
+  `q` builds a candidate list of fridge names + FoodKeeper catalog and calls
+  `nlp::suggest_item_names`.
+- `src/foodkeeper.rs` — parses the vendored CSV into a `Catalog` of 466 distinct names with
+  their `Keywords` as aliases, loaded once at startup into `AppState`. Collapses duplicate
+  names (README gotcha 6) and keeps every product id per name.
+- `src/nlp.rs` — **[learn] not yet implemented.** Interface changed from the old
+  auto-merging `resolve_item_name -> MatchResult` to `suggest_item_names -> Vec<Suggestion>`
+  (ranked, best-first) now that a human confirms every match. Placeholder does exact
+  name/alias matching only. `cargo test` has 7 failing tests here covering the tiers to
+  build: prefix, coverage ranking, substring, typo, transposition, plural, fridge-wins-ties.
 - `src/expiration.rs` — **[learn] not yet implemented.** `estimate_expiration` returns a
   flat 7 days regardless of item. 1 failing test (`pantry_items_get_a_long_shelf_life`)
   marks the gap; the other tests pass by coincidence (7 days happens to fall in their
@@ -33,10 +44,17 @@ intentionally left as failing-test stubs for the user to implement — see below
 
 ## Frontend (`frontend/src/app/fridge/`)
 
+- Next.js 16.2.12. `frontend/AGENTS.md` requires reading `node_modules/next/dist/docs/`
+  before writing frontend code — this version has breaking changes vs. older Next.
 - `page.tsx` — client component, fetches from the Rust API via `src/lib/fridgeApi.ts`
   (`NEXT_PUBLIC_FRIDGE_API_URL`, defaults to `http://127.0.0.1:8080`).
 - `AddItemForm.tsx`, `ExpirationBadge.tsx` — presentational pieces.
-- Verified working in-browser: add item, see it listed with expiration badge, remove it.
+- `ItemNameCombobox.tsx` — the add-item typeahead. **Deliberately never preselects a
+  suggestion**: `activeIndex` starts at -1 and resets on every keystroke, so Enter commits
+  the literal typed text unless the user arrows onto a suggestion first. This is the whole
+  safety property of the design — don't "helpfully" auto-highlight the top result.
+- Verified working in-browser: recent-items empty state, typed suggestions, arrow
+  navigation with wrap back to raw text, Enter-selects vs. Enter-submits, add, remove.
 
 ## LAN access (testing from other devices)
 
@@ -75,8 +93,34 @@ intentionally left as failing-test stubs for the user to implement — see below
   `origin` set to `git@github.com:terrificjesse/personal-website.git` over SSH (auth
   already configured — see `~/.ssh/id_ed25519`).
 
+## Open decisions (not yet made)
+
+- **`foodkeeper_product_id` is a representative row for collapsed names.** `Ham` collapses
+  20 CSV rows with different shelf lives; the stored id is just the first. `expiration.rs`
+  will need `Name_subtitle` to disambiguate properly (README gotcha 6).
+- **`expiration.rs` re-parses the whole CSV on every call** and has its own `PRODUCTS_CSV`
+  `include_str!` + `FoodKeeperRow` separate from `foodkeeper.rs`. Worth reconciling once
+  `estimate_expiration` settles — the catalog is already loaded once into `AppState`.
+
+## Quantity merging on add
+
+`POST /items` folds a new item into an existing row instead of creating a duplicate, but
+only when **name + unit + expiration** all line up (`routes/items.rs`):
+
+- Name and unit must match exactly (2 count + 1 litre isn't 3 of anything).
+- Expirations must be within `MERGE_EXPIRATION_TOLERANCE_DAYS` (3) of each other, so
+  two-week-old milk never absorbs today's. Rows with a NULL expiration never merge.
+- On merge the **earlier** expiration wins — warning early about good food is cheaper than
+  staying quiet about spoiled food.
+- `foodkeeper_product_id` is backfilled via `COALESCE` if the existing row was freehand.
+- Returns **200** on merge, **201** on insert.
+
+The decision itself is `find_merge_target`, kept pure and separate from the SQL, with 7
+unit tests. Tune the tolerance constant there if merging feels too eager or too shy.
+
 ## Next up
 
-- You implement `resolve_item_name` and `estimate_expiration` (see TODOs in those files).
+- You implement `suggest_item_names` (7 failing tests) and `estimate_expiration`
+  (1 failing test: `produce_gets_a_short_shelf_life`).
 - Once both are green under `cargo test`, Phase 1 is done — move to Phase 2 in
   `docs/PLAN.md`.

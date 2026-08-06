@@ -7,13 +7,44 @@ export type FridgeItem = {
   unit: string;
   added_at: string;
   estimated_expiration: string | null;
+  foodkeeper_product_id: number | null;
 };
 
 export type AddItemInput = {
   name: string;
   quantity: number;
   unit: string;
+  foodkeeper_product_id?: number | null;
 };
+
+/** Where a suggestion came from: already in the fridge, or the FoodKeeper catalog. */
+export type SuggestionSource = "fridge" | "foodkeeper";
+
+export type Suggestion = {
+  name: string;
+  source: SuggestionSource;
+  foodkeeper_product_id: number | null;
+  score: number;
+};
+
+/**
+ * Ranked name suggestions for the add-item dropdown. An empty `query` returns recently
+ * added fridge items instead of running the ranker.
+ */
+export async function fetchSuggestions(
+  query: string,
+  opts: { limit?: number; signal?: AbortSignal } = {},
+): Promise<Suggestion[]> {
+  const params = new URLSearchParams({ q: query });
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+
+  const res = await fetch(`${API_BASE}/items/suggest?${params}`, {
+    cache: "no-store",
+    signal: opts.signal,
+  });
+  if (!res.ok) throw new Error(`Failed to fetch suggestions: ${res.status}`);
+  return res.json();
+}
 
 export async function fetchItems(): Promise<FridgeItem[]> {
   const res = await fetch(`${API_BASE}/items`, { cache: "no-store" });

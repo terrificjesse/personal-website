@@ -1,23 +1,44 @@
 "use client";
 
 import { useState } from "react";
-import type { AddItemInput } from "@/lib/fridgeApi";
+import type { AddItemInput, Suggestion } from "@/lib/fridgeApi";
+import { ItemNameCombobox } from "./ItemNameCombobox";
 
 export function AddItemForm({ onAdd }: { onAdd: (input: AddItemInput) => Promise<void> }) {
   const [name, setName] = useState("");
   const [quantity, setQuantity] = useState(1);
   const [unit, setUnit] = useState("count");
   const [submitting, setSubmitting] = useState(false);
+  // Set only when the name came from a suggestion, so expiration estimation can look the
+  // item up directly instead of re-matching the string.
+  const [foodkeeperProductId, setFoodkeeperProductId] = useState<number | null>(null);
+
+  function handleNameChange(next: string) {
+    setName(next);
+    // Editing the text after picking a suggestion breaks the link to that catalog entry.
+    setFoodkeeperProductId(null);
+  }
+
+  function handleSelect(suggestion: Suggestion) {
+    setName(suggestion.name);
+    setFoodkeeperProductId(suggestion.foodkeeper_product_id);
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim()) return;
     setSubmitting(true);
     try {
-      await onAdd({ name: name.trim(), quantity, unit });
+      await onAdd({
+        name: name.trim(),
+        quantity,
+        unit,
+        foodkeeper_product_id: foodkeeperProductId,
+      });
       setName("");
       setQuantity(1);
       setUnit("count");
+      setFoodkeeperProductId(null);
     } finally {
       setSubmitting(false);
     }
@@ -29,12 +50,12 @@ export function AddItemForm({ onAdd }: { onAdd: (input: AddItemInput) => Promise
         <label htmlFor="item-name" className="text-xs opacity-70">
           Item
         </label>
-        <input
-          id="item-name"
+        <ItemNameCombobox
+          inputId="item-name"
           value={name}
-          onChange={(e) => setName(e.target.value)}
+          onChange={handleNameChange}
+          onSelect={handleSelect}
           placeholder="e.g. tomato"
-          className="rounded border border-black/15 px-2 py-1.5 text-sm dark:border-white/20 dark:bg-transparent"
         />
       </div>
       <div className="flex flex-col">

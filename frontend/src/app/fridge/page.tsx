@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { addItem, fetchItems, removeItem, type FridgeItem } from "@/lib/fridgeApi";
+import { addItem, fetchItems, removeItem, type AddItemInput, type FridgeItem } from "@/lib/fridgeApi";
 import { AddItemForm } from "./AddItemForm";
 import { ExpirationBadge } from "./ExpirationBadge";
 
@@ -33,7 +33,7 @@ export default function FridgePage() {
     };
   }, [reloadKey]);
 
-  async function handleAdd(input: { name: string; quantity: number; unit: string }) {
+  async function handleAdd(input: AddItemInput) {
     await addItem(input);
     setReloadKey((key) => key + 1);
   }

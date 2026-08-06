@@ -11,6 +11,9 @@ pub struct FridgeItem {
     pub unit: String,
     pub added_at: DateTime<Utc>,
     pub estimated_expiration: Option<DateTime<Utc>>,
+    /// Which FoodKeeper product the user picked from the suggestion dropdown, if any.
+    /// `None` means the name was typed freehand.
+    pub foodkeeper_product_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +23,9 @@ pub struct AddItemRequest {
     pub quantity: f64,
     #[serde(default = "default_unit")]
     pub unit: String,
+    /// Set when the name came from a suggestion; omitted for freehand entries.
+    #[serde(default)]
+    pub foodkeeper_product_id: Option<i64>,
 }
 
 fn default_quantity() -> f64 {
