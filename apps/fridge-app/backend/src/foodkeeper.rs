@@ -15,6 +15,7 @@ const PRODUCTS_CSV: &str = include_str!("../data/foodkeeper/products.csv");
 pub struct CatalogEntry {
     /// Display name, trimmed. First-seen casing wins.
     pub name: String,
+    pub name_lower: String,
     /// Lowercased, trimmed, deduped `Keywords` values across all collapsed rows.
     /// These are alternate names ("spaghetti" for tomato sauce) and are worth matching
     /// against in addition to `name`.
@@ -72,6 +73,7 @@ impl Catalog {
                 .entry(name.to_lowercase())
                 .or_insert_with(|| CatalogEntry {
                     name: name.to_string(),
+                    name_lower: name.to_lowercase(),
                     aliases: Vec::new(),
                     product_ids: Vec::new(),
                 });

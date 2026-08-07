@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
 use crate::foodkeeper::Catalog;
-use crate::nlp::{suggest_item_names, Candidate, Suggestion, SuggestionSource};
+use crate::nlp::{Candidate, Suggestion, SuggestionSource, suggest_item_names};
 
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 25;
@@ -54,6 +54,7 @@ pub async fn suggest_items(
     let mut candidates: Vec<Candidate> = fridge_names
         .into_iter()
         .map(|(name, foodkeeper_product_id)| Candidate {
+            name_lower: name.to_lowercase(),
             name,
             source: SuggestionSource::Fridge,
             aliases: Vec::new(),
@@ -63,6 +64,7 @@ pub async fn suggest_items(
 
     candidates.extend(catalog.entries().iter().map(|entry| Candidate {
         name: entry.name.clone(),
+        name_lower: entry.name_lower.clone(),
         source: SuggestionSource::Foodkeeper,
         aliases: entry.aliases.clone(),
         // Representative row for names that collapse several CSV rows — see
