@@ -7,29 +7,38 @@
 //! committed without the user picking it, so returning a mediocre 5th suggestion costs
 //! nothing — tune for recall, not precision.
 //!
-//! TODO(you): fill in `score_one`. The surrounding pipeline (normalize, rank, truncate) is
-//! already wired up; all the interesting decisions live in that one function.
+//! Scoring is a banded tier stack. Each tier owns a disjoint score range, and matches on a
+//! candidate's `aliases` sit one `ALIAS_CONST` below the equivalent match on its `name` —
+//! so the ranking is always explainable as "which tier fired, name or alias?":
 //!
-//! The plan is a banded tier stack, where each tier owns a disjoint score range so ranking
-//! stays explainable:
+//! | Score       | Tier                                                       |
+//! |-------------|------------------------------------------------------------|
+//! | 1.00        | exact, name                                                |
+//! | 0.90        | exact, alias                                               |
+//! | 0.80 – 0.89 | prefix, name — whole string or any token                    |
+//! | 0.70 – 0.79 | prefix, alias                                              |
+//! | 0.60 – 0.69 | substring, name — "melon" -> "watermelon"                   |
+//! | 0.50 – 0.59 | substring, alias                                            |
+//! | 0.30 – 0.49 | fuzzy — not implemented, see TODO below                     |
 //!
-//!   1.0        exact match (normalized)
-//!   0.80-0.95  prefix match — whole string OR any token ("oil" -> "olive oil"),
-//!              ranked within the band by coverage (query.len / candidate.len)
-//!   0.60-0.80  substring / containment ("mato" -> "tomato")
-//!   0.30-0.60  normalized Damerau-Levenshtein ("tomatoe", "tomtao")
+//! Within a band, `BAND_WIDTH * coverage` positions the score, where coverage is the
+//! query's length over the length of *the string that matched* — the name for name tiers,
+//! the matched alias for alias tiers. Since every matcher is anchored or containment-based,
+//! `query.len() <= matched.len()` always holds, so coverage can't exceed 1.0 and no band
+//! can overflow into the one above it.
 //!
-//! Run the whole stack against `Candidate::name` *and* every entry in `Candidate::aliases`,
-//! taking the best score. Then run it a second time over stemmed/singularized forms at a
-//! small discount (~0.95x) to pick up plurals without letting stemming contaminate the
-//! prefix scores.
+//! Branches are checked in descending score order and return on the first hit, which is
+//! only sound because the bands are disjoint. Adding a tier means putting it in the right
+//! place in that order, not just appending it.
 //!
-//! Suggested crates (neither is a dependency yet — add what you use):
-//!   strsim = "0.11.1"         normalized_damerau_levenshtein for the typo tier
-//!   rust-stemmers = "1.2.0"   Snowball English stemmer for the plural pass
+//! TODO(you): the fuzzy tier. Normalized Damerau-Levenshtein for real typos ("tomtao"),
+//! plus a second pass over stemmed forms at a small discount to pick up plurals without
+//! letting stemming contaminate the prefix scores. Early-out when the length difference
+//! already exceeds the edits you'd accept — it's the only costly tier. Two crates worth
+//! adding when you get there:
 //!
-//! The tests below describe the behavior this needs. They fail against the current
-//! placeholder, which only does exact matching.
+//!     strsim = "0.11.1"         normalized_damerau_levenshtein for the typo tier
+//!     rust-stemmers = "1.2.0"   Snowball English stemmer for the plural pass
 
 use serde::Serialize;
 
@@ -73,7 +82,13 @@ const BAND_PREFIX: f32 = 0.80;
 const BAND_SUBSTRING: f32 = 0.60;
 const BAND_FUZZY: f32 = 0.30;
 
-const ALIAS_FACTOR: f32 = 0.9;
+const ALIAS_CONST: f32 = 0.1;
+
+/// How far a match can climb above its band floor, scaled by coverage.
+///
+/// Must stay strictly below `ALIAS_CONST`, or a top-of-band name match would tie or
+/// overtake the exact-alias match sitting one band above it. The current margin is 0.01.
+const BAND_WIDTH: f32 = 0.09;
 
 /// Anything scoring below this never reaches the dropdown. Nothing auto-highlights, so a
 /// mediocre 5th suggestion costs the user nothing — keep this generous.
@@ -123,49 +138,62 @@ pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -
 
 /// The whole ranking algorithm: how well does `candidate` match `query`?
 ///
-/// `query` is already normalized. Returns `None` when there's no plausible match at all;
-/// the caller applies `SCORE_FLOOR` and handles sorting and truncation.
+/// `query` is already normalized. Returns `None` when nothing matches at all; the caller
+/// applies `SCORE_FLOOR` and handles sorting and truncation. See the module docs for the
+/// band table these branches implement.
 ///
-/// TODO(you): build this up one tier at a time. Each tier should score against
-/// `candidate.name` *and* every entry in `candidate.aliases`, keeping the best result —
-/// take the max, never a sum, or entries like "Ham" (46 aliases) win on volume alone.
+/// The branches run in descending score order and return on the first hit. Two subtleties
+/// worth not re-deriving:
 ///
-///   1. EXACT     — the placeholder below already matches, but scores a name hit and an
-///                  alias hit identically. Decide how much to discount alias hits, or
-///                  "Kefir" keeps tying with "Milk" for the query "milk".
-///   2. PREFIX    — whole string and per-token ("oil" -> "olive oil"), ranked within the
-///                  band by coverage (query.len / candidate.len).
-///   3. SUBSTRING — containment anywhere ("mato" -> "tomato").
-///   4. FUZZY     — normalized Damerau-Levenshtein. Early-out when the length difference
-///                  already exceeds the edits you'd accept; it's the only costly tier.
-///
-/// Then re-run the stack over stemmed forms at a small discount for plurals.
+/// - The token-prefix branches are *not* redundant with the whole-string ones: a token can
+///   start with the query when the whole string doesn't ("cheese" in "cream cheese").
+/// - The substring tier needs no token variant. A token is a contiguous substring of the
+///   whole string, so token containment is entirely subsumed by string containment.
 fn score_one(query: &str, candidate: &Candidate) -> Option<f32> {
-    // Placeholder, carried over from the original stub: exact match on name or alias, both
-    // scored identically. This is what tier 1 has to fix.
     if candidate.name_lower == query {
         return Some(BAND_EXACT);
     }
     if candidate.aliases.iter().any(|a| a == query) {
-        return Some(BAND_EXACT * ALIAS_FACTOR);
+        return Some(BAND_EXACT - ALIAS_CONST);
     }
+
     if candidate.name_lower.starts_with(query) {
-        return Some(BAND_PREFIX + 0.5);
+        return Some(
+            BAND_PREFIX + BAND_WIDTH * (query.len() as f32 / (candidate.name_lower.len() as f32)),
+        );
     }
     if candidate
         .name_lower
         .split_whitespace()
         .any(|a| a.starts_with(query))
     {
-        return Some(BAND_PREFIX + 0.5 * (query.len() as f32 / (candidate.name.len() as f32)));
+        return Some(
+            BAND_PREFIX + BAND_WIDTH * (query.len() as f32 / (candidate.name_lower.len() as f32)),
+        );
     }
-    if candidate
+    if let Some(alias) = candidate.aliases.iter().find(|a| a.starts_with(query)) {
+        return Some(
+            BAND_PREFIX - ALIAS_CONST + BAND_WIDTH * (query.len() as f32 / (alias.len() as f32)),
+        );
+    }
+    if let Some(alias) = candidate
         .aliases
         .iter()
-        .any(|a| a.split_whitespace().any(|b| b.starts_with(query)))
+        .find(|a| a.split_whitespace().any(|b| b.starts_with(query)))
     {
         return Some(
-            BAND_PREFIX + 0.5 * ALIAS_FACTOR * (query.len() as f32 / (candidate.name.len() as f32)),
+            BAND_PREFIX - ALIAS_CONST + BAND_WIDTH * (query.len() as f32 / (alias.len() as f32)),
+        );
+    }
+
+    if candidate.name_lower.contains(query) {
+        return Some(
+            BAND_SUBSTRING + BAND_WIDTH * (query.len() as f32 / (candidate.name_lower.len() as f32)),
+        );
+    }
+    if let Some(alias) = candidate.aliases.iter().find(|a| a.contains(query)) {
+        return Some(
+            BAND_SUBSTRING - ALIAS_CONST + BAND_WIDTH * (query.len() as f32 / (alias.len() as f32)),
         );
     }
     None
