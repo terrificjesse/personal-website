@@ -8,18 +8,13 @@
 //! required behavior — they will fail against the current placeholder (which always
 //! returns a flat 7 days) until you implement real category-based logic.
 
-use std::println;
-
-use chrono::{DateTime, Duration, Utc, format::parse};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[allow(non_snake_case)]
 struct FoodKeeperRow {
-    Category_ID: u32,
     Name: String,
-    Name_subtitle: Option<String>,
-    Keywords: Option<String>,
 
     Pantry_Max: Option<u32>,
     Pantry_Metric: Option<String>,
@@ -101,8 +96,8 @@ fn parse_foodkeeper() -> Result<Vec<FoodKeeperRow>, csv::Error> {
 
 pub fn estimate_expiration(item_name: &str, added_at: DateTime<Utc>) -> DateTime<Utc> {
     let mut time = Duration::days(7);
-    let FoodData = parse_foodkeeper().expect("parse");
-    for row in FoodData {
+    let food_data = parse_foodkeeper().expect("parse");
+    for row in food_data {
         let borrow = &row;
         if borrow.Name.trim().eq_ignore_ascii_case(item_name) {
             if let Some((_, Some(num), Some(metric))) = row.best_storage() {
