@@ -11,36 +11,41 @@
 //! candidate's `aliases` sit one `ALIAS_CONST` below the equivalent match on its `name` —
 //! so the ranking is always explainable as "which tier fired, name or alias?":
 //!
-//! | Score       | Tier                                                       |
-//! |-------------|------------------------------------------------------------|
-//! | 1.00        | exact, name                                                |
-//! | 0.90        | exact, alias                                               |
-//! | 0.80 – 0.89 | prefix, name — whole string or any token                    |
-//! | 0.70 – 0.79 | prefix, alias                                              |
-//! | 0.60 – 0.69 | substring, name — "melon" -> "watermelon"                   |
-//! | 0.50 – 0.59 | substring, alias                                            |
-//! | 0.30 – 0.49 | fuzzy — not implemented, see TODO below                     |
+//! | Score       | Tier                                                     |
+//! |-------------|----------------------------------------------------------|
+//! | 1.00        | exact, name                                              |
+//! | 0.90        | exact, alias                                             |
+//! | 0.80 – 0.89 | prefix, name — whole string or any token                  |
+//! | 0.70 – 0.79 | prefix, alias                                            |
+//! | 0.60 – 0.69 | substring, name — "melon" -> "watermelon"                 |
+//! | 0.50 – 0.59 | substring, alias                                          |
+//! | 0.30 – 0.50 | fuzzy, name tokens — Damerau-Levenshtein ("clery")        |
 //!
-//! Within a band, `BAND_WIDTH * coverage` positions the score, where coverage is the
-//! query's length over the length of *the string that matched* — the name for name tiers,
-//! the matched alias for alias tiers. Since every matcher is anchored or containment-based,
-//! `query.len() <= matched.len()` always holds, so coverage can't exceed 1.0 and no band
-//! can overflow into the one above it.
+//! For the exact/prefix/substring tiers, `BAND_WIDTH * coverage` positions the score within
+//! its band, where coverage is the query's length over the length of *the string that
+//! matched* — the name for name tiers, the matched alias for alias tiers. Since every one
+//! of those matchers is anchored or containment-based, `query.len() <= matched.len()` always
+//! holds, so coverage can't exceed 1.0 and no band can overflow into the one above it.
 //!
 //! Branches are checked in descending score order and return on the first hit, which is
 //! only sound because the bands are disjoint. Adding a tier means putting it in the right
 //! place in that order, not just appending it.
 //!
-//! TODO(you): the fuzzy tier. Normalized Damerau-Levenshtein for real typos ("tomtao"),
-//! plus a second pass over stemmed forms at a small discount to pick up plurals without
-//! letting stemming contaminate the prefix scores. Early-out when the length difference
-//! already exceeds the edits you'd accept — it's the only costly tier. Two crates worth
-//! adding when you get there:
+//! The fuzzy tier is the exception to all of the above, and the one still under
+//! construction. It is not a predicate: every string has *some* similarity to every other
+//! string, so unlike the tiers above it needs an explicit cutoff or it matches the entire
+//! catalog on every keystroke. Measured against this data, real typos score 0.75–0.875 and
+//! the best unrelated noise scores 0.571, so a similarity threshold around 0.7 separates
+//! them cleanly. It also uses its own width (0.2) rather than `BAND_WIDTH`, which is why
+//! its range is listed as 0.30–0.50 above.
 //!
-//!     strsim = "0.11.1"         normalized_damerau_levenshtein for the typo tier
-//!     rust-stemmers = "1.2.0"   Snowball English stemmer for the plural pass
+//! TODO(you): the fuzzy threshold, and optionally a stemming pass. `plural_matches_-
+//! singular_name` currently passes through fuzzy rather than stemming — a plural isn't
+//! really a typo, so `rust-stemmers = "1.2.0"` is still the semantically right tool if you
+//! want it, but no test will tell you the difference.
 
 use serde::Serialize;
+use strsim::normalized_damerau_levenshtein;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,10 +89,12 @@ const BAND_FUZZY: f32 = 0.30;
 
 const ALIAS_CONST: f32 = 0.1;
 
-/// How far a match can climb above its band floor, scaled by coverage.
+/// How far an exact/prefix/substring match can climb above its band floor, scaled by
+/// coverage.
 ///
 /// Must stay strictly below `ALIAS_CONST`, or a top-of-band name match would tie or
 /// overtake the exact-alias match sitting one band above it. The current margin is 0.01.
+/// The fuzzy tier does not use this — it has its own, wider width.
 const BAND_WIDTH: f32 = 0.09;
 
 /// Anything scoring below this never reaches the dropdown. Nothing auto-highlights, so a
@@ -142,13 +149,16 @@ pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -
 /// applies `SCORE_FLOOR` and handles sorting and truncation. See the module docs for the
 /// band table these branches implement.
 ///
-/// The branches run in descending score order and return on the first hit. Two subtleties
-/// worth not re-deriving:
+/// The branches run in descending score order and return on the first hit. Three
+/// subtleties worth not re-deriving:
 ///
 /// - The token-prefix branches are *not* redundant with the whole-string ones: a token can
 ///   start with the query when the whole string doesn't ("cheese" in "cream cheese").
 /// - The substring tier needs no token variant. A token is a contiguous substring of the
 ///   whole string, so token containment is entirely subsumed by string containment.
+/// - Fuzzy is the reverse of prefix: whole-string similarity is near-useless against long
+///   multi-word names ("brocolli" vs "broccoli and broccoli raab (rapini)" scores ~0), so
+///   per-token is the primary matcher there rather than the supplement.
 fn score_one(query: &str, candidate: &Candidate) -> Option<f32> {
     if candidate.name_lower == query {
         return Some(BAND_EXACT);
@@ -188,13 +198,24 @@ fn score_one(query: &str, candidate: &Candidate) -> Option<f32> {
 
     if candidate.name_lower.contains(query) {
         return Some(
-            BAND_SUBSTRING + BAND_WIDTH * (query.len() as f32 / (candidate.name_lower.len() as f32)),
+            BAND_SUBSTRING
+                + BAND_WIDTH * (query.len() as f32 / (candidate.name_lower.len() as f32)),
         );
     }
     if let Some(alias) = candidate.aliases.iter().find(|a| a.contains(query)) {
         return Some(
             BAND_SUBSTRING - ALIAS_CONST + BAND_WIDTH * (query.len() as f32 / (alias.len() as f32)),
         );
+    }
+
+    let fuzscore = candidate
+        .name_lower
+        .split_whitespace()
+        .map(|token| normalized_damerau_levenshtein(query, token) as f32)
+        .fold(0.0, f32::max);
+
+    if fuzscore > 0.7 {
+        return Some(BAND_FUZZY + 0.2 * fuzscore);
     }
     None
 }
