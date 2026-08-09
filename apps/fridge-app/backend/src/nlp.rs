@@ -47,7 +47,7 @@
 use serde::Serialize;
 use strsim::normalized_damerau_levenshtein;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SuggestionSource {
     /// Already in the fridge. Picking one of these means the user probably meant the
@@ -134,11 +134,20 @@ pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -
         })
         .collect();
 
-    // Sort before truncating, or "top 5" is just the first 5 in catalog order.
-    // `sort_by` is stable and the route pushes fridge candidates ahead of catalog ones, so
-    // equal scores keep fridge items on top for free. `total_cmp` avoids the unwrap that
+    // Sort before truncating, or "top 5" is just the first 5 in catalog order. The
+    // tie-break has to live on this sort rather than a later one: truncation decides which
+    // candidates survive at all, so a tie-break applied afterwards could only reorder the
+    // survivors, never rescue a fridge item that had already been cut.
+    //
+    // Note the deliberately different argument orders. Score is `b` then `a` — reversed,
+    // for descending. Source is `a` then `b` — not reversed, so the *smaller* variant wins,
+    // and `Fridge` is declared before `Foodkeeper`. `total_cmp` avoids the unwrap that
     // `partial_cmp` would force, since f32 isn't Ord.
-    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.source.cmp(&b.source))
+    });
     scored.truncate(limit);
     scored
 }

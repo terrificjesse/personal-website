@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -62,15 +63,43 @@ pub async fn suggest_items(
         })
         .collect();
 
-    candidates.extend(catalog.entries().iter().map(|entry| Candidate {
-        name: entry.name.clone(),
-        name_lower: entry.name_lower.clone(),
-        source: SuggestionSource::Foodkeeper,
-        aliases: entry.aliases.clone(),
-        // Representative row for names that collapse several CSV rows — see
-        // `CatalogEntry::product_ids`.
-        foodkeeper_product_id: entry.product_ids.first().copied(),
-    }));
+    // Index the fridge candidates by name so catalog entries can be folded *into* them
+    // rather than appended alongside. Without this, anything that's both in the fridge and
+    // in FoodKeeper (eggs, ham, milk) yields two rows that match identically and score
+    // identically — a visible duplicate in the dropdown.
+    //
+    // Keys are cloned rather than borrowed because the loop below mutates `candidates`,
+    // and a borrowed key would hold an immutable borrow across that mutation.
+    let fridge_by_name: HashMap<String, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.name_lower.clone(), index))
+        .collect();
+
+    for entry in catalog.entries() {
+        match fridge_by_name.get(&entry.name_lower) {
+            // Already in the fridge. Merge instead of dropping either side: the fridge row
+            // knows it's in the fridge, the catalog row knows the synonyms and the product
+            // id. Keeping `SuggestionSource::Fridge` means it still renders "in fridge" and
+            // still routes to the quantity-merge path in `add_item`.
+            Some(&index) => {
+                let candidate = &mut candidates[index];
+                candidate.aliases.extend(entry.aliases.iter().cloned());
+                if candidate.foodkeeper_product_id.is_none() {
+                    candidate.foodkeeper_product_id = entry.product_ids.first().copied();
+                }
+            }
+            None => candidates.push(Candidate {
+                name: entry.name.clone(),
+                name_lower: entry.name_lower.clone(),
+                source: SuggestionSource::Foodkeeper,
+                aliases: entry.aliases.clone(),
+                // Representative row for names that collapse several CSV rows — see
+                // `CatalogEntry::product_ids`.
+                foodkeeper_product_id: entry.product_ids.first().copied(),
+            }),
+        }
+    }
 
     Ok(Json(suggest_item_names(query, &candidates, limit)))
 }

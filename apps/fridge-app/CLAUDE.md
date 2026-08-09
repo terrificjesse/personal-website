@@ -3,10 +3,16 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-## Current status: Phase 1 in progress
+## Current status: Phase 1 essentially complete
 
-Scaffolding is done and working end to end (add/list/remove items, UI, DB). Two pieces are
-intentionally left as failing-test stubs for the user to implement — see below.
+Working end to end (add/list/remove items, typeahead, expiration estimates, UI, DB), with
+`cargo test` fully green — 30 passing, 0 failing. Both `[learn]` pieces (`nlp.rs`,
+`expiration.rs`) are implemented.
+
+The one Phase 1 item from `docs/PLAN.md` not built is **`PATCH /items/:id`** — the router
+has GET/POST/DELETE plus `GET /items/suggest`, but no update endpoint. Nothing in the UI
+needs it yet (quantity changes happen through the add-and-merge path), so it was never
+wired up. Decide whether you want it before calling Phase 1 closed.
 
 ## Backend (`apps/fridge-app/backend/`)
 
@@ -18,23 +24,33 @@ intentionally left as failing-test stubs for the user to implement — see below
   the name in the dropdown before the request is sent, so the server takes it at face value
   and only normalizes whitespace/casing.
 - `src/routes/suggest.rs` — `GET /items/suggest?q=&limit=`, backing the add-item typeahead.
-  Empty `q` returns recent fridge items (fully working, doesn't touch the ranker); non-empty
-  `q` builds a candidate list of fridge names + FoodKeeper catalog and calls
-  `nlp::suggest_item_names`.
+  Empty `q` returns recent fridge items (doesn't touch the ranker); non-empty `q` builds a
+  candidate list of fridge names + FoodKeeper catalog and calls `nlp::suggest_item_names`.
+  Catalog entries whose name matches a fridge item are **merged into** that item rather than
+  appended — otherwise anything in both lists (eggs, ham, milk) shows as a visible duplicate
+  in the dropdown. The merged candidate keeps `SuggestionSource::Fridge` but inherits the
+  catalog's aliases and product id, so a freehand-added item picks up its synonyms and its
+  link to shelf-life data.
 - `src/foodkeeper.rs` — parses the vendored CSV into a `Catalog` of 466 distinct names with
   their `Keywords` as aliases, loaded once at startup into `AppState`. Collapses duplicate
   names (README gotcha 6) and keeps every product id per name.
-- `src/nlp.rs` — **[learn] not yet implemented.** Interface changed from the old
-  auto-merging `resolve_item_name -> MatchResult` to `suggest_item_names -> Vec<Suggestion>`
-  (ranked, best-first) now that a human confirms every match. Placeholder does exact
-  name/alias matching only. `cargo test` has 7 failing tests here covering the tiers to
-  build: prefix, coverage ranking, substring, typo, transposition, plural, fridge-wins-ties.
-- `src/expiration.rs` — **[learn] not yet implemented.** `estimate_expiration` returns a
-  flat 7 days regardless of item. 1 failing test (`pantry_items_get_a_long_shelf_life`)
-  marks the gap; the other tests pass by coincidence (7 days happens to fall in their
-  accepted ranges) — don't take those passes as "done."
+- `src/nlp.rs` — **[learn] implemented.** `suggest_item_names -> Vec<Suggestion>` (ranked,
+  best-first), replacing the original auto-merging `resolve_item_name -> MatchResult` once
+  the design changed so a human confirms every match. Scoring is a banded tier stack —
+  exact / prefix / substring / fuzzy, each with a name variant and an alias variant one
+  `ALIAS_CONST` lower. **The module doc is the reference**; it carries the band table and
+  the invariants that make first-hit-return sound. Uses `strsim` for the fuzzy tier
+  (similarity threshold 0.7, chosen from measured data: real typos land at 0.75–0.875,
+  best unrelated noise at 0.571).
+- `src/expiration.rs` — **[learn] implemented.** Parses the FoodKeeper CSV directly and
+  walks a storage-preference chain (`DOP_Refrigerate` first, then opened/after-date/pantry/
+  freezer) to pick a shelf life. Note: `produce_gets_a_short_shelf_life` was **deliberately
+  removed** — it asserted lettuce expires in 3–10 days, but FoodKeeper has two `Lettuce`
+  rows (iceberg/romaine 1–2 weeks, leaf/spinach 3–7 days) and the answer depends on which
+  row wins. That's README gotcha 6; revisit if `Name_subtitle` disambiguation gets built.
 - `data/foodkeeper/` — USDA FSIS FoodKeeper shelf-life reference data (661 products, 25
-  categories), vendored as CSV to back `expiration.rs`. Nothing reads it yet. **Read
+  categories), vendored as CSV. Read twice, independently: `foodkeeper.rs` for names and
+  synonyms, `expiration.rs` for shelf lives. **Read
   `data/foodkeeper/README.md` before writing any parsing code** — it documents provenance
   (mirror verified against the official feed by hash), the `DOP_` = "date of purchase"
   column semantics that are easy to get backwards, and seven data-shape traps found by
@@ -120,7 +136,8 @@ unit tests. Tune the tolerance constant there if merging feels too eager or too 
 
 ## Next up
 
-- You implement `suggest_item_names` (7 failing tests) and `estimate_expiration`
-  (1 failing test: `produce_gets_a_short_shelf_life`).
-- Once both are green under `cargo test`, Phase 1 is done — move to Phase 2 in
-  `docs/PLAN.md`.
+- Decide whether `PATCH /items/:id` is wanted before closing Phase 1 (see status above).
+- Then Phase 2 in `docs/PLAN.md` — shopping list + purchase-based recommendations. The
+  `[learn]` piece there is `suggest_shopping_items`.
+- `docs/TODO.md` holds deferred ideas that came up during Phase 1 and were consciously
+  postponed; out-of-order token matching for the NLP tier is the first entry.
