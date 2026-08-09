@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::expiration::estimate_expiration;
 use crate::models::{AddItemRequest, FridgeItem};
+use crate::purchase_history;
 
 /// How far apart two expiration dates can be and still count as the same batch.
 ///
@@ -20,23 +21,42 @@ const MERGE_EXPIRATION_TOLERANCE_DAYS: i64 = 3;
 pub async fn list_items(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<FridgeItem>>, StatusCode> {
-    let items = sqlx::query_as::<_, FridgeItem>(
+    Ok(Json(fetch_all(&pool).await?))
+}
+
+/// All fridge items, most recently added first. Shared by `GET /items` and the
+/// shopping-list suggestions endpoint, which needs current fridge contents as input to
+/// `recommend::suggest_shopping_items`.
+pub(crate) async fn fetch_all(pool: &SqlitePool) -> Result<Vec<FridgeItem>, StatusCode> {
+    sqlx::query_as::<_, FridgeItem>(
         "SELECT id, canonical_name, quantity, unit, added_at, estimated_expiration, \
          foodkeeper_product_id \
          FROM fridge_items ORDER BY added_at DESC",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(items))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 pub async fn add_item(
     State(pool): State<SqlitePool>,
     Json(req): Json<AddItemRequest>,
 ) -> Result<(StatusCode, Json<FridgeItem>), StatusCode> {
-    // Name resolution now happens before the request gets here: the user picks from the
+    let (status, item) = upsert_fridge_item(&pool, &req).await?;
+    Ok((status, Json(item)))
+}
+
+/// Inserts a new fridge row for `req`, or merges into an existing one when
+/// `find_merge_target` says they're the same batch. This is the single call site for
+/// "a grocery item was acquired" — it's used directly by `POST /items` and also by
+/// `shopping_list::mark_purchased` when a grocery item is checked off the shopping list,
+/// so a purchase is logged to `purchase_history` exactly once no matter which flow
+/// produced it, never twice.
+pub(crate) async fn upsert_fridge_item(
+    pool: &SqlitePool,
+    req: &AddItemRequest,
+) -> Result<(StatusCode, FridgeItem), StatusCode> {
+    // Name resolution happens before the request gets here: the user picks from the
     // suggestion dropdown (`GET /items/suggest`) or commits what they typed. The server
     // takes the confirmed name at face value and only normalizes whitespace/casing.
     let canonical_name = req.name.trim().to_lowercase();
@@ -56,12 +76,16 @@ pub async fn add_item(
     )
     .bind(&canonical_name)
     .bind(&req.unit)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(target) = find_merge_target(&existing, estimated_expiration) {
-        return merge_into_existing(&pool, target, &req, estimated_expiration).await;
+        let result = merge_into_existing(pool, target, req, estimated_expiration).await?;
+        purchase_history::record(pool, &canonical_name, req.quantity, added_at)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(result);
     }
 
     let id = Uuid::new_v4().to_string();
@@ -77,21 +101,25 @@ pub async fn add_item(
     .bind(added_at)
     .bind(estimated_expiration)
     .bind(req.foodkeeper_product_id)
-    .execute(&pool)
+    .execute(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    purchase_history::record(pool, &canonical_name, req.quantity, added_at)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let item = FridgeItem {
         id,
         canonical_name,
         quantity: req.quantity,
-        unit: req.unit,
+        unit: req.unit.clone(),
         added_at,
         estimated_expiration: Some(estimated_expiration),
         foodkeeper_product_id: req.foodkeeper_product_id,
     };
 
-    Ok((StatusCode::CREATED, Json(item)))
+    Ok((StatusCode::CREATED, item))
 }
 
 /// An existing row that `add_item` could fold the new quantity into.
@@ -131,7 +159,7 @@ async fn merge_into_existing(
     target: &MergeCandidate,
     req: &AddItemRequest,
     new_expiration: DateTime<Utc>,
-) -> Result<(StatusCode, Json<FridgeItem>), StatusCode> {
+) -> Result<(StatusCode, FridgeItem), StatusCode> {
     // Keep the *earlier* of the two dates. The merged row now covers food of slightly
     // different ages, and warning early about food that's still fine is a much cheaper
     // mistake than staying quiet about food that isn't.
@@ -167,7 +195,7 @@ async fn merge_into_existing(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // 200 rather than 201: this updated a row instead of creating one.
-    Ok((StatusCode::OK, Json(item)))
+    Ok((StatusCode::OK, item))
 }
 
 pub async fn remove_item(

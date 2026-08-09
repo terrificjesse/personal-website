@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { addItem, fetchItems, removeItem, type AddItemInput, type FridgeItem } from "@/lib/fridgeApi";
 import { AddItemForm } from "./AddItemForm";
 import { ExpirationBadge } from "./ExpirationBadge";
@@ -46,7 +47,12 @@ export default function FridgePage() {
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
       <h1 className="text-xl font-semibold">Fridge</h1>
-      <p className="mt-1 text-sm opacity-70">What&apos;s currently in the fridge.</p>
+      <p className="mt-1 text-sm opacity-70">
+        {"What's currently in the fridge. "}
+        <Link href="/fridge/shopping-list" className="underline underline-offset-4">
+          Shopping list
+        </Link>
+      </p>
 
       <div className="mt-6">
         <AddItemForm onAdd={handleAdd} />

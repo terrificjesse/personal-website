@@ -3,16 +3,22 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-## Current status: Phase 1 essentially complete
+## Current status: Phase 1 complete, Phase 2 scaffolded
 
-Working end to end (add/list/remove items, typeahead, expiration estimates, UI, DB), with
-`cargo test` fully green — 30 passing, 0 failing. Both `[learn]` pieces (`nlp.rs`,
-`expiration.rs`) are implemented.
+Phase 1 works end to end (add/list/remove items, typeahead, expiration estimates, UI, DB).
+Both `[learn]` pieces (`nlp.rs`, `expiration.rs`) are implemented.
 
-The one Phase 1 item from `docs/PLAN.md` not built is **`PATCH /items/:id`** — the router
-has GET/POST/DELETE plus `GET /items/suggest`, but no update endpoint. Nothing in the UI
-needs it yet (quantity changes happen through the add-and-merge path), so it was never
-wired up. Decide whether you want it before calling Phase 1 closed.
+**`PATCH /items/:id` was decided against**, not just deferred — Phase 2 doesn't touch an
+existing fridge row's fields directly (quantity still flows through add-and-merge), so
+there was no concrete need to build it opportunistically. Revisit only if a real caller
+shows up.
+
+Phase 2 (shopping list + purchase-based recommendations) is **scaffolded, not
+implemented**: data models, migrations, all endpoints, and the frontend are complete and
+verified working end to end in-browser. The one `[learn]` piece —
+`recommend::suggest_shopping_items` — is a stub returning `[]`; `cargo test` is
+**34 passed, 2 failed**, and the 2 failures are expected (they assert real suggestions
+against the placeholder) until you implement it.
 
 ## Backend (`apps/fridge-app/backend/`)
 
@@ -58,6 +64,35 @@ wired up. Decide whether you want it before calling Phase 1 closed.
   in integer fields, 184 rows with no refrigerate data, `Name` is not unique).
 - Run: `cargo run` (serves on `0.0.0.0:8080` — see LAN access note below). Test: `cargo test`.
 
+### Phase 2 additions (shopping list + purchase history)
+
+- `src/models.rs` — `ShoppingListStatus` (Pending/Purchased, mapped to TEXT via
+  `sqlx::Type` the same way `SuggestionSource` is in `nlp.rs`), `ShoppingListItem`,
+  `AddShoppingListItemRequest`, `PurchaseHistory`. `ShoppingListItem` carries `quantity` and
+  `unit` beyond `docs/PLAN.md`'s literal struct sketch — the unified purchase trigger (next
+  bullet) needs a quantity to merge into the fridge or log to `purchase_history` with, so
+  it wasn't optional.
+- **Purchase-history trigger, decided:** unified through the fridge path, not two
+  independent triggers. `routes/items.rs`'s `upsert_fridge_item` (the renamed core of what
+  used to be `add_item`'s body) is the *only* place that writes to `purchase_history` — it's
+  called directly by `POST /items` and also by `shopping_list::mark_purchased` when a
+  grocery item is checked off the list. One log site means a purchase can never be
+  double-counted, and marking something purchased on the list now also lands it in the
+  fridge with an expiration estimate, for free.
+- `src/routes/shopping_list.rs` — `GET/POST /shopping-list`, `DELETE /shopping-list/:id`,
+  `POST /shopping-list/:id/purchase` (the unified trigger above — non-grocery items only
+  flip status, never touch the fridge table or purchase history), `GET
+  /shopping-list/suggestions` (calls `recommend::suggest_shopping_items`).
+- `src/purchase_history.rs` — `record`/`list_all` against the `purchase_history` table.
+  Nothing else writes to it.
+- `src/recommend.rs` — **[learn] stub.** `suggest_shopping_items(history, fridge) ->
+  Vec<Suggestion>` returns `vec![]` as a placeholder. 6 tests describe the two signals
+  named in `docs/PLAN.md` (frequency, expiring-soon-as-replacement) plus negative cases
+  (already in fridge, one-off purchase isn't a cadence, plenty of shelf life left); the 2
+  "should suggest" tests fail against the placeholder by design — same pattern
+  `expiration.rs` shipped with originally.
+- Migrations `0003_create_shopping_list_items.sql`, `0004_create_purchase_history.sql`.
+
 ## Frontend (`frontend/src/app/fridge/`)
 
 - Next.js 16.2.12. `frontend/AGENTS.md` requires reading `node_modules/next/dist/docs/`
@@ -71,6 +106,23 @@ wired up. Decide whether you want it before calling Phase 1 closed.
   safety property of the design — don't "helpfully" auto-highlight the top result.
 - Verified working in-browser: recent-items empty state, typed suggestions, arrow
   navigation with wrap back to raw text, Enter-selects vs. Enter-submits, add, remove.
+
+### Phase 2 additions (`frontend/src/app/fridge/shopping-list/`)
+
+- Scaffolded as a sub-route of the Fridge tab (`/fridge/shopping-list`), not a new
+  top-level nav tab — `apps/fridge-app` is one app in the site's tab philosophy, and this
+  is still that app. Small reciprocal links added between `/fridge` and
+  `/fridge/shopping-list`; redo as a standalone tab if that stops feeling right.
+- `lib/shoppingListApi.ts` — deliberately separate type/function names from
+  `fridgeApi.ts` (`ShoppingSuggestion` vs. `Suggestion`, etc.) to avoid collisions; the two
+  are unrelated concepts that happen to share a word.
+- `page.tsx`, `AddShoppingItemForm.tsx`, `SuggestedItemsPanel.tsx`. The suggested-items
+  panel always renders "No suggestions right now" — expected, since the backend stub
+  returns `[]`. Its "Add to list" button calls `addShoppingListItem` with
+  `added_manually: false`, distinguishing accepted suggestions from typed-in items.
+- Verified working in-browser end to end: add a shopping-list item, mark it purchased,
+  confirm it lands in the fridge with an expiration estimate and logs exactly one
+  `purchase_history` row, confirm a non-grocery item marked purchased touches neither.
 
 ## LAN access (testing from other devices)
 
@@ -93,10 +145,14 @@ wired up. Decide whether you want it before calling Phase 1 closed.
   being able to list that directory. Fixed by pinning `turbopack.root` in
   `frontend/next.config.ts`. If you see a similar `TurbopackInternalError: reading dir`
   again, that config is the first place to check.
-- Local dev preview for this repo is configured at
-  `/Users/jesseli/projects/meal/.claude/launch.json` (name `personal-website-frontend`,
-  `autoPort: true` since port 3000 is often occupied by an unrelated project on this
-  machine).
+- Local dev preview for this repo is configured at `.claude/launch.json` in the repo root
+  (name `personal-website-frontend`, `cwd: frontend`, `autoPort: true` since port 3000 is
+  often occupied by an unrelated project on this machine). An unrelated
+  `/Users/jesseli/projects/meal/.claude/launch.json` also exists — that one is not this
+  project, don't be misled by it.
+- A `next dev` server and a `cargo run` backend are often already running from a previous
+  session. Check `lsof -ti tcp:3000` / `tcp:8080` before starting another; the Next.js dev
+  server refuses to double-start, and the backend fails with "Address already in use".
 - If the fridge tab seems to "hang" on loading forever (not error, just an endless
   spinner), first suspect is loading the page via the wrong URL — e.g. the Next.js dev
   server's printed "Network" URL from a browser on this same machine still works, but
@@ -134,10 +190,34 @@ only when **name + unit + expiration** all line up (`routes/items.rs`):
 The decision itself is `find_merge_target`, kept pure and separate from the SQL, with 7
 unit tests. Tune the tolerance constant there if merging feels too eager or too shy.
 
+## Working patterns established in Phase 1
+
+Phase 2's `suggest_shopping_items` is another `[learn]` scoring function, so these carry
+over — they were all learned the hard way in `nlp.rs`:
+
+- **Enforce numeric invariants by construction, not convention.** Three separate scoring
+  bugs in `nlp.rs` were band overflows: a width that exceeded its band, branches ordered by
+  source instead of by score, and a coverage ratio whose denominator wasn't the string that
+  matched. Each was arithmetic that *happened* to be right until it wasn't.
+- **Name the constants, and derive them from each other where the relationship matters.**
+  Magic literals repeated across branches are how the bands drifted apart.
+- **A continuous score needs an explicit threshold; a predicate doesn't.** The fuzzy tier
+  matched all 466 candidates on every query until it got a cutoff. Recommendation scoring
+  will have the same property.
+- **Tests passing is a weaker signal than it looks.** Several `nlp.rs` tests passed for the
+  wrong reason — one via fixture ordering, one because a "typo" happened to be a prefix.
+  Check behaviour against the live endpoint with real data too, not just `cargo test`.
+- **Check reachability before writing a branch.** Two dead branches got written and later
+  deleted: token-substring (subsumed by string-substring) and an alias-fuzzy band that sat
+  entirely below `SCORE_FLOOR`. `pub` fields and unreachable match arms don't warn.
+
 ## Next up
 
-- Decide whether `PATCH /items/:id` is wanted before closing Phase 1 (see status above).
-- Then Phase 2 in `docs/PLAN.md` — shopping list + purchase-based recommendations. The
-  `[learn]` piece there is `suggest_shopping_items`.
+- Implement `recommend::suggest_shopping_items` in `src/recommend.rs` — the last piece of
+  Phase 2. Tests are already written and describe the required behavior; 2 currently fail
+  against the `vec![]` placeholder by design.
+- Once that's done and reviewed, Phase 3 in `docs/PLAN.md` — recipe recommendations. Not
+  a `[learn]` phase; scaffold-and-implement freely when it's time.
 - `docs/TODO.md` holds deferred ideas that came up during Phase 1 and were consciously
-  postponed; out-of-order token matching for the NLP tier is the first entry.
+  postponed; out-of-order token matching for the NLP tier is the first entry. Nothing new
+  was added to it during Phase 2 scaffolding.

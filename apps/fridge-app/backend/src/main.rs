@@ -3,6 +3,8 @@ mod expiration;
 mod foodkeeper;
 mod models;
 mod nlp;
+mod purchase_history;
+mod recommend;
 mod routes;
 
 use std::net::SocketAddr;

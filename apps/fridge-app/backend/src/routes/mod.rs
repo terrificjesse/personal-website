@@ -1,12 +1,13 @@
 pub mod health;
 pub mod items;
+pub mod shopping_list;
 pub mod suggest;
 
 use std::sync::Arc;
 
 use axum::{
     extract::FromRef,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Router,
 };
 use sqlx::SqlitePool;
@@ -47,6 +48,14 @@ pub fn build_router(state: AppState) -> Router {
         // unambiguous against the DELETE route below.
         .route("/items/suggest", get(suggest::suggest_items))
         .route("/items/{id}", delete(items::remove_item))
+        .route(
+            "/shopping-list",
+            get(shopping_list::list_shopping_list).post(shopping_list::add_shopping_list_item),
+        )
+        // Static segment, same priority reasoning as `/items/suggest` above.
+        .route("/shopping-list/suggestions", get(shopping_list::suggestions))
+        .route("/shopping-list/{id}", delete(shopping_list::remove_shopping_list_item))
+        .route("/shopping-list/{id}/purchase", post(shopping_list::mark_purchased))
         .with_state(state)
         .layer(cors)
 }
