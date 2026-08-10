@@ -5,6 +5,7 @@ import Link from "next/link";
 import { addItem, fetchItems, removeItem, type AddItemInput, type FridgeItem } from "@/lib/fridgeApi";
 import { AddItemForm } from "./AddItemForm";
 import { ExpirationBadge } from "./ExpirationBadge";
+import { GroceryListPopup } from "./GroceryListPopup";
 
 export default function FridgePage() {
   const [items, setItems] = useState<FridgeItem[]>([]);
@@ -87,6 +88,8 @@ export default function FridgePage() {
           ))}
         </ul>
       )}
+
+      <GroceryListPopup />
     </div>
   );
 }

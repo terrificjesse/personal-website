@@ -13,12 +13,10 @@ existing fridge row's fields directly (quantity still flows through add-and-merg
 there was no concrete need to build it opportunistically. Revisit only if a real caller
 shows up.
 
-Phase 2 (shopping list + purchase-based recommendations) is **scaffolded, not
-implemented**: data models, migrations, all endpoints, and the frontend are complete and
-verified working end to end in-browser. The one `[learn]` piece —
-`recommend::suggest_shopping_items` — is a stub returning `[]`; `cargo test` is
-**34 passed, 2 failed**, and the 2 failures are expected (they assert real suggestions
-against the placeholder) until you implement it.
+Phase 2 (shopping list + purchase-based recommendations) is **complete**: data models,
+migrations, all endpoints, the frontend, and the `[learn]` piece —
+`recommend::suggest_shopping_items` — are all implemented. `cargo test` is
+**36 passed, 0 failed**, clippy clean, same bar Phase 1 hit.
 
 ## Backend (`apps/fridge-app/backend/`)
 
@@ -83,14 +81,31 @@ against the placeholder) until you implement it.
   `POST /shopping-list/:id/purchase` (the unified trigger above — non-grocery items only
   flip status, never touch the fridge table or purchase history), `GET
   /shopping-list/suggestions` (calls `recommend::suggest_shopping_items`).
+  **`POST /shopping-list` merges on add** — same name + unit + still `pending` folds the
+  new quantity into the existing row (200) instead of creating a duplicate (201), the same
+  shape as `items::upsert_fridge_item`'s merge but without an expiration tolerance to
+  weigh. Deliberately excludes `purchased` rows from matching, so checking something off
+  the list and re-adding it starts a fresh pending row rather than silently reviving the
+  old one with extra quantity.
 - `src/purchase_history.rs` — `record`/`list_all` against the `purchase_history` table.
   Nothing else writes to it.
-- `src/recommend.rs` — **[learn] stub.** `suggest_shopping_items(history, fridge) ->
-  Vec<Suggestion>` returns `vec![]` as a placeholder. 6 tests describe the two signals
-  named in `docs/PLAN.md` (frequency, expiring-soon-as-replacement) plus negative cases
-  (already in fridge, one-off purchase isn't a cadence, plenty of shelf life left); the 2
-  "should suggest" tests fail against the placeholder by design — same pattern
-  `expiration.rs` shipped with originally.
+- `src/recommend.rs` — **[learn] implemented.** `suggest_shopping_items(history, fridge)
+  -> Vec<Suggestion>`. Expiring-replacement is a straight filter on `fridge` (expiration
+  within 3 days, `None` explicitly excluded rather than relying on `Option`'s default
+  ordering). Frequently-purchased groups `history` by item name into a `HashMap<&str,
+  Vec<&PurchaseHistory>>`, sorts each group ascending by `purchased_at`, and calls
+  `calculate_mad` — despite the name, it currently computes the **median gap** (the
+  middle value of the sorted consecutive-purchase gaps from `.windows(2)`), not yet the
+  full median-absolute-deviation regularity check discussed while building it; that's the
+  natural next refinement if the simple version over- or under-suggests against real
+  data. An item is suggested when it's absent from `fridge` and the time since its most
+  recent purchase (`.last()` on the sorted group) exceeds that median gap. Debugging this
+  one surfaced two sharp Rust edges worth remembering: a slice `windows(2)` closure
+  pattern (`|[a, b]|`) doesn't compile because slice length isn't known at the type level
+  (index instead, e.g. `w[0]`/`w[1]`), and passing an owned value into a helper function
+  moves it — `calculate_mad` takes `&[&PurchaseHistory]` rather than
+  `Vec<&PurchaseHistory>` specifically so the caller's loop can still use its `item`
+  afterward.
 - Migrations `0003_create_shopping_list_items.sql`, `0004_create_purchase_history.sql`.
 
 ## Frontend (`frontend/src/app/fridge/`)
@@ -213,11 +228,13 @@ over — they were all learned the hard way in `nlp.rs`:
 
 ## Next up
 
-- Implement `recommend::suggest_shopping_items` in `src/recommend.rs` — the last piece of
-  Phase 2. Tests are already written and describe the required behavior; 2 currently fail
-  against the `vec![]` placeholder by design.
-- Once that's done and reviewed, Phase 3 in `docs/PLAN.md` — recipe recommendations. Not
-  a `[learn]` phase; scaffold-and-implement freely when it's time.
+- Phase 2 is done. Phase 3 in `docs/PLAN.md` — recipe recommendations — is next. Not a
+  `[learn]` phase; scaffold-and-implement freely when it's time.
+- Worth a real-data check before considering Phase 2 fully closed (see the Phase 1
+  lesson below about tests passing for the wrong reason): `calculate_mad`'s "median gap"
+  approach hasn't been tried against actual purchase history yet, just the hand-built
+  test fixtures. Revisit the MAD-vs-median-gap and minimum-evidence questions from
+  earlier discussion if real suggestions look off.
 - `docs/TODO.md` holds deferred ideas that came up during Phase 1 and were consciously
   postponed; out-of-order token matching for the NLP tier is the first entry. Nothing new
-  was added to it during Phase 2 scaffolding.
+  was added to it during Phase 2.

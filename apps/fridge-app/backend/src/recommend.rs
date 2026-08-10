@@ -18,9 +18,14 @@
 //! will likely bite this too (band overflows, unreachable branches, tests passing for the
 //! wrong reason).
 
+use chrono::{TimeDelta, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 
-use crate::models::{FridgeItem, PurchaseHistory};
+use crate::{
+    models::{FridgeItem, PurchaseHistory},
+    recommend::SuggestionReason::{ExpiringReplacement, FrequentlyPurchased},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,14 +42,64 @@ pub struct Suggestion {
     pub reason: SuggestionReason,
 }
 
+fn calculate_mad(item: &[&PurchaseHistory]) -> Option<TimeDelta> {
+    let iterate = item.windows(2);
+    let mut consec_median: Vec<TimeDelta> = iterate
+        .map(|w| w[1].purchased_at - w[0].purchased_at)
+        .collect();
+    consec_median.sort();
+    consec_median.get(consec_median.len() / 2).copied()
+}
+
 /// Suggests items to add to the shopping list from purchase history and current fridge
 /// contents. See the module doc for the two signals PLAN.md names, and the module
 /// boundary — this function's body is what you implement.
 pub fn suggest_shopping_items(
-    _history: &[PurchaseHistory],
-    _fridge: &[FridgeItem],
+    history: &[PurchaseHistory],
+    fridge: &[FridgeItem],
 ) -> Vec<Suggestion> {
-    Vec::new()
+    let expiring_soon_cutoff = Utc::now() + TimeDelta::days(3);
+
+    let mut suggest: Vec<Suggestion> = fridge
+        .iter()
+        .filter(|item| {
+            // `estimated_expiration` is `None` when the item has no shelf-life estimate at
+            // all — that's "unknown," not "expiring soon," so it must not match here.
+            // Relying on `Option`'s default ordering would get this backwards: `None` sorts
+            // as less than every `Some(_)`, so a plain `<` comparison would treat "no
+            // estimate" as always expiring before the cutoff.
+            item.estimated_expiration
+                .is_some_and(|expiration| expiration < expiring_soon_cutoff)
+        })
+        .map(|item| Suggestion {
+            item_name: item.canonical_name.clone(),
+            reason: ExpiringReplacement,
+        })
+        .collect();
+
+    let mut by_item: HashMap<&str, Vec<&PurchaseHistory>> = HashMap::new();
+    for entry in history {
+        by_item
+            .entry(entry.item_name.as_str())
+            .or_default()
+            .push(entry)
+    }
+    for item in by_item.values_mut() {
+        item.sort_by_key(|p| p.purchased_at);
+    }
+
+    for (key, item) in &by_item {
+        if !fridge.iter().any(|f| f.canonical_name == *key)
+            && let Some(mad) = calculate_mad(item)
+            && mad < Utc::now() - item.last().unwrap().purchased_at
+        {
+            suggest.push(Suggestion {
+                item_name: key.to_string(),
+                reason: FrequentlyPurchased,
+            });
+        }
+    }
+    suggest
 }
 
 #[cfg(test)]
@@ -93,7 +148,11 @@ mod tests {
 
         let suggestions = suggest_shopping_items(&history, &fridge);
 
-        assert!(suggests(&suggestions, "milk", SuggestionReason::FrequentlyPurchased));
+        assert!(suggests(
+            &suggestions,
+            "milk",
+            SuggestionReason::FrequentlyPurchased
+        ));
     }
 
     #[test]
@@ -108,27 +167,45 @@ mod tests {
 
         let suggestions = suggest_shopping_items(&history, &fridge);
 
-        assert!(!suggests(&suggestions, "milk", SuggestionReason::FrequentlyPurchased));
+        assert!(!suggests(
+            &suggestions,
+            "milk",
+            SuggestionReason::FrequentlyPurchased
+        ));
     }
 
     #[test]
     fn suggests_replacement_for_item_expiring_within_two_days() {
         let history = vec![];
-        let fridge = vec![fridge_item("spinach", Some(Utc::now() + Duration::hours(36)))];
+        let fridge = vec![fridge_item(
+            "spinach",
+            Some(Utc::now() + Duration::hours(36)),
+        )];
 
         let suggestions = suggest_shopping_items(&history, &fridge);
 
-        assert!(suggests(&suggestions, "spinach", SuggestionReason::ExpiringReplacement));
+        assert!(suggests(
+            &suggestions,
+            "spinach",
+            SuggestionReason::ExpiringReplacement
+        ));
     }
 
     #[test]
     fn does_not_suggest_replacement_for_item_with_plenty_of_shelf_life_left() {
         let history = vec![];
-        let fridge = vec![fridge_item("spinach", Some(Utc::now() + Duration::days(10)))];
+        let fridge = vec![fridge_item(
+            "spinach",
+            Some(Utc::now() + Duration::days(10)),
+        )];
 
         let suggestions = suggest_shopping_items(&history, &fridge);
 
-        assert!(!suggests(&suggestions, "spinach", SuggestionReason::ExpiringReplacement));
+        assert!(!suggests(
+            &suggestions,
+            "spinach",
+            SuggestionReason::ExpiringReplacement
+        ));
     }
 
     #[test]
@@ -146,6 +223,10 @@ mod tests {
 
         let suggestions = suggest_shopping_items(&history, &fridge);
 
-        assert!(!suggests(&suggestions, "saffron", SuggestionReason::FrequentlyPurchased));
+        assert!(!suggests(
+            &suggestions,
+            "saffron",
+            SuggestionReason::FrequentlyPurchased
+        ));
     }
 }

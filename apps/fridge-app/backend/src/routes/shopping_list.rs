@@ -28,6 +28,12 @@ pub async fn list_shopping_list(
     Ok(Json(items))
 }
 
+/// A pending row `add_shopping_list_item` could fold a new quantity into.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct MergeCandidate {
+    id: String,
+}
+
 pub async fn add_shopping_list_item(
     State(pool): State<SqlitePool>,
     Json(req): Json<AddShoppingListItemRequest>,
@@ -35,6 +41,48 @@ pub async fn add_shopping_list_item(
     let name = req.name.trim().to_lowercase();
     if name.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Same name and unit, still pending — same idea as the fridge's add-and-merge
+    // (`items::upsert_fridge_item`), just without an expiration tolerance to worry about.
+    // A purchased row never absorbs a new add: reviving a "done" row's quantity behind the
+    // scenes would be more confusing than just starting a fresh pending row for it.
+    let existing = sqlx::query_as::<_, MergeCandidate>(
+        "SELECT id FROM shopping_list_items \
+         WHERE name = ? AND unit = ? AND status = ? \
+         ORDER BY added_at ASC LIMIT 1",
+    )
+    .bind(&name)
+    .bind(&req.unit)
+    .bind(ShoppingListStatus::Pending)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(target) = existing {
+        sqlx::query(
+            "UPDATE shopping_list_items \
+             SET quantity = quantity + ?, foodkeeper_product_id = COALESCE(foodkeeper_product_id, ?) \
+             WHERE id = ?",
+        )
+        .bind(req.quantity)
+        // Backfills the catalog id if the existing row was freehand and this add wasn't.
+        .bind(req.foodkeeper_product_id)
+        .bind(&target.id)
+        .execute(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let item = sqlx::query_as::<_, ShoppingListItem>(&format!(
+            "SELECT {SELECT_COLUMNS} FROM shopping_list_items WHERE id = ?"
+        ))
+        .bind(&target.id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // 200 rather than 201: this updated a row instead of creating one.
+        return Ok((StatusCode::OK, Json(item)));
     }
 
     let id = Uuid::new_v4().to_string();
