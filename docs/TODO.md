@@ -141,3 +141,38 @@ for this one comparison.
   bigger scope change (see `nlp.rs`'s own tier design for how much surface area "fuzzy"
   implies) for a problem that's currently just "missing some matches," not "matching the
   wrong thing."
+
+---
+
+## Duplicated ingredient-availability logic (frontend/backend)
+
+**Status:** deferred — revisit if the backend's matching rule changes and the frontend
+silently falls out of sync
+**Area:** `frontend/src/app/fridge/recipes/RecipeCard.tsx` /
+`apps/fridge-app/backend/src/recommend_recipes.rs`
+**Added:** 2026-08-12
+
+`RecipeCard.tsx` highlights which of a recipe's `fridge_ingredients` you already have by
+independently rebuilding the same lowercased-name set the backend already computes in
+`recommend_recipes.rs` (fridge `canonical_name` ∪ shopping-list `name`) and checking
+membership client-side. It's the same "what counts as available" rule implemented twice, in
+two languages.
+
+**Why not now:** the rule today is a one-line exact-lowercase-match, cheap enough to
+duplicate without much risk, and the API doesn't currently expose per-ingredient match
+status — only the aggregate `matched_ingredient_count`/`total_ingredient_count`. Extending
+the response shape to carry a per-ingredient flag touches `recommend_recipes.rs`'s output,
+which is `[learn]`-owned; not worth doing as a drive-by for a display highlight.
+
+**Sketch:** have `recommend_recipes` (or a thin wrapper around it) annotate each
+`RecipeIngredient` in the response with whether it matched, reusing the same set it already
+built for scoring — single source of truth, no reimplementation. The frontend then just
+reads a boolean instead of recomputing membership itself.
+
+**Watch out for:**
+- If the backend's matching rule ever changes (e.g. the singular/plural fix above lands),
+  the frontend's copy needs the identical update or the highlighting will disagree with the
+  matched/total count shown right next to it — a visible inconsistency, not just stale docs.
+- Any fix here should reuse `recommend_recipes.rs`'s existing membership check rather than
+  writing a second implementation of "is this ingredient available" — that's the whole
+  problem this entry is about; doubling it a third time would be worse.

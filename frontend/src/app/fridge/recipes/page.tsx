@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchRecommendedRecipes, type RecommendedRecipe } from "@/lib/recipesApi";
+import { fetchItems } from "@/lib/fridgeApi";
+import { fetchShoppingList } from "@/lib/shoppingListApi";
 import { LikedRecipesSection } from "./LikedRecipesSection";
 import { RecipeCard } from "./RecipeCard";
 import { RecipeFilterBar } from "./RecipeFilterBar";
@@ -10,6 +12,7 @@ import { RecipeFilterBar } from "./RecipeFilterBar";
 export default function RecipesPage() {
   const [allRecipes, setAllRecipes] = useState<RecommendedRecipe[]>([]);
   const [recipes, setRecipes] = useState<RecommendedRecipe[]>([]);
+  const [availableIngredients, setAvailableIngredients] = useState<Set<string>>(new Set());
   const [cuisine, setCuisine] = useState("");
   const [mealType, setMealType] = useState("");
   const [loading, setLoading] = useState(true);
@@ -22,6 +25,25 @@ export default function RecipesPage() {
       .then(setAllRecipes)
       .catch(() => {
         // The main fetch below surfaces the error; this one is best-effort.
+      });
+  }, []);
+
+  // Fridge + shopping-list contents, once — lets each card highlight which of its
+  // ingredients you already have. Mirrors the backend's "fridge or shopping list counts as
+  // available" rule (recommend_recipes.rs) so the highlighting agrees with the
+  // matched/total count the card already shows.
+  useEffect(() => {
+    Promise.all([fetchItems(), fetchShoppingList()])
+      .then(([fridgeItems, shoppingListItems]) => {
+        setAvailableIngredients(
+          new Set([
+            ...fridgeItems.map((item) => item.canonical_name.toLowerCase()),
+            ...shoppingListItems.map((item) => item.name.toLowerCase()),
+          ]),
+        );
+      })
+      .catch(() => {
+        // Best-effort — cards just show no highlights if this fails.
       });
   }, []);
 
@@ -94,7 +116,11 @@ export default function RecipesPage() {
       ) : (
         <ul className="mt-6 space-y-3">
           {recipes.map((recommended) => (
-            <RecipeCard key={recommended.recipe.id} recommended={recommended} />
+            <RecipeCard
+              key={recommended.recipe.id}
+              recommended={recommended}
+              availableIngredients={availableIngredients}
+            />
           ))}
         </ul>
       )}

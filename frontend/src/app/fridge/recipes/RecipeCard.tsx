@@ -4,7 +4,14 @@ import { useState } from "react";
 import type { RecommendedRecipe } from "@/lib/recipesApi";
 import { ReviewForm } from "./ReviewForm";
 
-export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) {
+export function RecipeCard({
+  recommended,
+  availableIngredients,
+}: {
+  recommended: RecommendedRecipe;
+  /** Lowercased fridge/shopping-list item names, used to highlight ingredients you have. */
+  availableIngredients: Set<string>;
+}) {
   const { recipe, matched_ingredient_count, total_ingredient_count } = recommended;
   const [showInstructions, setShowInstructions] = useState(false);
   const [showReviewForm, setShowReviewForm] = useState(false);
@@ -29,6 +36,23 @@ export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) 
           {" · "}
           {recipe.cook_time_minutes !== null ? `${recipe.cook_time_minutes} min` : "Time not listed"}
         </p>
+
+        {recipe.fridge_ingredients.length > 0 && (
+          <ul className="mt-2 space-y-0.5 text-xs">
+            {recipe.fridge_ingredients.map((ingredient, index) => {
+              const have = availableIngredients.has(ingredient.name.toLowerCase());
+              return (
+                <li
+                  key={`${ingredient.name}-${index}`}
+                  className={have ? "font-medium text-green-700 dark:text-green-400" : "opacity-60"}
+                >
+                  {have ? "✓ " : "· "}
+                  {ingredient.measure} {ingredient.name}
+                </li>
+              );
+            })}
+          </ul>
+        )}
 
         {(recipe.cuisine_tags.length > 0 || recipe.meal_type_tags.length > 0) && (
           <div className="mt-2 flex flex-wrap gap-1">
