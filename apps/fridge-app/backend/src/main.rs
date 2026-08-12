@@ -5,7 +5,9 @@ mod models;
 mod nlp;
 mod purchase_history;
 mod recommend;
+mod recommend_recipes;
 mod routes;
+mod themealdb;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,7 +22,14 @@ async fn main() -> anyhow::Result<()> {
     let catalog = Arc::new(foodkeeper::Catalog::load()?);
     println!("loaded {} FoodKeeper names", catalog.entries().len());
 
-    let app = routes::build_router(routes::AppState { pool, catalog });
+    let recipe_catalog = Arc::new(themealdb::Catalog::load()?);
+    println!("loaded {} TheMealDB recipes", recipe_catalog.recipes().len());
+
+    let app = routes::build_router(routes::AppState {
+        pool,
+        catalog,
+        recipe_catalog,
+    });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("fridge_backend listening on http://{addr}");

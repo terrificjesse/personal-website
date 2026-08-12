@@ -18,14 +18,19 @@ const SELECT_COLUMNS: &str = "id, name, quantity, unit, is_grocery, added_manual
 pub async fn list_shopping_list(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<ShoppingListItem>>, StatusCode> {
-    let items = sqlx::query_as::<_, ShoppingListItem>(&format!(
+    Ok(Json(fetch_all(&pool).await?))
+}
+
+/// All shopping-list rows, most recently added first. Shared by `GET /shopping-list` and
+/// the recipe-recommendation endpoint, which needs current shopping-list contents as input
+/// to `recommend_recipes::recommend_recipes` — same reasoning as `items::fetch_all`.
+pub(crate) async fn fetch_all(pool: &SqlitePool) -> Result<Vec<ShoppingListItem>, StatusCode> {
+    sqlx::query_as::<_, ShoppingListItem>(&format!(
         "SELECT {SELECT_COLUMNS} FROM shopping_list_items ORDER BY added_at DESC"
     ))
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(items))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// A pending row `add_shopping_list_item` could fold a new quantity into.

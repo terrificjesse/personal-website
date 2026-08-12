@@ -100,16 +100,35 @@ non-grocery item (e.g. "paper towels") never shows up as a suggestion.
 required appliances, extra ingredients (spices etc.), and typed filters (cuisine,
 meal type).
 
-- [gen] This phase is not flagged as a learning area — Claude can generate most of it.
 - [gen] Data model: `Recipe { id, name, cuisine_tags, meal_type_tags, cook_time_minutes,
   required_appliances, fridge_ingredients, extra_ingredients }`.
-- [gen] Decide + document a recipe data source: seed a local JSON/DB of recipes to start
-  (simplest, no API keys) vs. an external recipe API (more coverage, needs a key/rate
-  limits). Recommend starting with a seeded local set (~30-50 recipes across a few
-  cuisines) so Phase 4's review system has something to attach to quickly.
-- [gen] Matching logic: score/filter recipes by how many required ingredients are already
-  in fridge+shopping list, then apply the user's typed filters (cuisine/meal type) as a
-  hard filter, not a scoring input — keeps it predictable and easy to reason about.
+- [you] **Decided:** [TheMealDB](https://www.themealdb.com/), vendored as a one-time
+  snapshot rather than called live — same pattern as `data/foodkeeper/`. Fetched
+  2026-08-10 via the shared test API key (`"1"`, no signup needed — free for
+  development/personal/educational use per their terms), enumerated with the standard
+  letter-sweep (`search.php?f=a..z`, deduped by `idMeal`). 789 unique recipes, stored at
+  `apps/fridge-app/backend/data/themealdb/meals.json`. Considered Spoonacular (better
+  field fidelity — native cook time and equipment — but needs your own registered key and
+  a 150 req/day free-tier cap) and Edamam (largest index, but the public free tier reads
+  as trial-limited plus mandatory attribution); TheMealDB won on zero setup friction for a
+  personal project. Full tradeoffs and field-mapping gotchas (no cook-time field, sparse
+  `strArea`, `strCategory` isn't a true meal-type split) are in
+  `apps/fridge-app/backend/data/themealdb/README.md`. TheMealDB's `idMeal` is what Phase
+  4's `Review.recipe_id` will reference.
+- [learn] **Matching/recommendation logic** — reclassified as a learning area at the user's
+  request (originally scoped as [gen]). Score/filter recipes by how many required
+  ingredients are already in fridge+shopping list; the user's typed filters (cuisine/meal
+  type) apply as a hard filter, not a scoring input, so results stay predictable. Claude
+  stubs a function signature — something like `fn recommend_recipes(recipes: &[Recipe],
+  fridge: &[FridgeItem], shopping_list: &[ShoppingListItem], filters: &RecipeFilters) ->
+  Vec<RecommendedRecipe>` — with tests describing the desired behavior (a recipe using more
+  of what you already have ranks higher; a cuisine/meal-type filter excludes non-matching
+  recipes regardless of how well they'd otherwise score; a recipe needing none of your
+  current ingredients still appears if the filters allow it). You implement the body.
+  Worth reading before starting: set-overlap scoring (what fraction of a recipe's
+  ingredients you already have — similar in spirit to Jaccard similarity), and how to
+  combine a hard filter with a soft score cleanly. Good phase to get comfortable with a
+  rules-based recommender's shape before Phase 4 pushes toward a learned one.
 - [gen] Endpoints: `GET /recipes/recommended?cuisine=&mealType=`.
 - [gen] Frontend: recipe cards showing cook time, appliances, extra ingredients needed,
   filter chips/dropdown for cuisine and meal type.

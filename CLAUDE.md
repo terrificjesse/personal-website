@@ -43,8 +43,9 @@ called out three subsystems they want to implement themselves with minimal help:
 1. **Authentication** (Phase 5 — password auth + Google OAuth)
 2. **Natural language processing** — fuzzy/typo-tolerant item matching (Phase 1 — "tomato"
    vs "tomatoes" vs "tomatoe" resolving to the same fridge item)
-3. **Recommendation algorithms** — shopping list suggestions (Phase 2) and recipe
-   recommendation + the like/dislike-weighted re-ranking system (Phase 4)
+3. **Recommendation algorithms** — shopping list suggestions (Phase 2), recipe matching /
+   recommendation logic (Phase 3), and the like/dislike-weighted re-ranking system
+   (Phase 4)
 4. **Expiration date estimation** (Phase 1 — added by the user's own request, not part of
    the original three; same rules apply)
 

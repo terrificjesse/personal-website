@@ -3,238 +3,167 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-## Current status: Phase 1 complete, Phase 2 scaffolded
+## Current status: Phases 1–3 complete
 
-Phase 1 works end to end (add/list/remove items, typeahead, expiration estimates, UI, DB).
-Both `[learn]` pieces (`nlp.rs`, `expiration.rs`) are implemented.
+Phase 1 (fridge CRUD, NLP item matching, expiration estimates), Phase 2 (shopping list,
+purchase history, purchase-based recommendations), and Phase 3 (recipe recommendations) are
+all done. All four `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`,
+`recommend_recipes.rs` — were implemented by the user, with Claude reviewing rather than
+writing them. `cargo test`: 53 passed, 0 failed, clippy clean. Verified working end-to-end
+in-browser, backend and frontend, including against real fridge/shopping-list/catalog data
+(not just the hand-built test fixtures).
 
-**`PATCH /items/:id` was decided against**, not just deferred — Phase 2 doesn't touch an
-existing fridge row's fields directly (quantity still flows through add-and-merge), so
-there was no concrete need to build it opportunistically. Revisit only if a real caller
-shows up.
+`PATCH /items/:id` was decided against, not deferred — nothing in Phase 1 or 2 ended up
+needing it. Revisit only if a real caller shows up.
 
-Phase 2 (shopping list + purchase-based recommendations) is **complete**: data models,
-migrations, all endpoints, the frontend, and the `[learn]` piece —
-`recommend::suggest_shopping_items` — are all implemented. `cargo test` is
-**36 passed, 0 failed**, clippy clean, same bar Phase 1 hit.
+`recommend_recipes`'s final formula: hard-filters on cuisine/meal-type, then sorts by a
+3-key tuple — (a) whether `total_ingredient_count < 2` (trivial recipes sort last as a
+group), (b) missing-ingredient count ascending within each group, (c) total-ingredient-count
+descending as a tie-break within *that*. (b)+(c) together are what stop a 1-ingredient
+recipe you happen to have from outranking a real dinner you're almost fully stocked for;
+(a) is what stops a recipe whose every ingredient turned out to be a pantry staple (e.g.
+"Griddled flatbreads" — flour ×2, yeast, sugar, olive oil, `total_ingredient_count == 0`)
+from reading as a trivially "perfect" match. Two real bugs surfaced and got fixed while
+building this — a `bool`'s `Ord` puts `false` before `true` in ascending order, and it's
+easy to write the trivial-recipe key backwards (promoting instead of demoting) without
+noticing, since none of the six hand-built tests mix trivial and non-trivial recipes in the
+same ordering assertion. Both times the bug was invisible to `cargo test` and obvious
+against the real 789-recipe catalog — caught by re-running the real-data check after the
+change, not by the test suite. Data source: TheMealDB, vendored one-time snapshot (789
+recipes, fetched 2026-08-10) — see `docs/PLAN.md` Phase 3 for why, and
+`data/themealdb/README.md` for field-mapping details.
+
+**Separate observation, not a bug (see `docs/TODO.md`):** exact-name ingredient matching
+means singular/plural mismatches between fridge items and TheMealDB ingredient names
+silently miss — e.g. a fridge item "tomatoes" matches the 21 recipes using `Tomatoes` but
+not the 47 using singular `Tomato`.
 
 ## Backend (`apps/fridge-app/backend/`)
 
-- Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migrations/`.
-- `src/models.rs` — `FridgeItem` struct. `id` is a `String` (UUID text), not `uuid::Uuid`,
-  to sidestep sqlx's BLOB-based Uuid encoding mismatch with our TEXT column.
-- `src/routes/items.rs` — `GET /items`, `POST /items`, `DELETE /items/:id`. Calls
-  `expiration::estimate_expiration` on add. It no longer resolves names: the user confirms
-  the name in the dropdown before the request is sent, so the server takes it at face value
-  and only normalizes whitespace/casing.
-- `src/routes/suggest.rs` — `GET /items/suggest?q=&limit=`, backing the add-item typeahead.
-  Empty `q` returns recent fridge items (doesn't touch the ranker); non-empty `q` builds a
-  candidate list of fridge names + FoodKeeper catalog and calls `nlp::suggest_item_names`.
-  Catalog entries whose name matches a fridge item are **merged into** that item rather than
-  appended — otherwise anything in both lists (eggs, ham, milk) shows as a visible duplicate
-  in the dropdown. The merged candidate keeps `SuggestionSource::Fridge` but inherits the
-  catalog's aliases and product id, so a freehand-added item picks up its synonyms and its
-  link to shelf-life data.
-- `src/foodkeeper.rs` — parses the vendored CSV into a `Catalog` of 466 distinct names with
-  their `Keywords` as aliases, loaded once at startup into `AppState`. Collapses duplicate
-  names (README gotcha 6) and keeps every product id per name.
-- `src/nlp.rs` — **[learn] implemented.** `suggest_item_names -> Vec<Suggestion>` (ranked,
-  best-first), replacing the original auto-merging `resolve_item_name -> MatchResult` once
-  the design changed so a human confirms every match. Scoring is a banded tier stack —
-  exact / prefix / substring / fuzzy, each with a name variant and an alias variant one
-  `ALIAS_CONST` lower. **The module doc is the reference**; it carries the band table and
-  the invariants that make first-hit-return sound. Uses `strsim` for the fuzzy tier
-  (similarity threshold 0.7, chosen from measured data: real typos land at 0.75–0.875,
-  best unrelated noise at 0.571).
-- `src/expiration.rs` — **[learn] implemented.** Parses the FoodKeeper CSV directly and
-  walks a storage-preference chain (`DOP_Refrigerate` first, then opened/after-date/pantry/
-  freezer) to pick a shelf life. Note: `produce_gets_a_short_shelf_life` was **deliberately
-  removed** — it asserted lettuce expires in 3–10 days, but FoodKeeper has two `Lettuce`
-  rows (iceberg/romaine 1–2 weeks, leaf/spinach 3–7 days) and the answer depends on which
-  row wins. That's README gotcha 6; revisit if `Name_subtitle` disambiguation gets built.
-- `data/foodkeeper/` — USDA FSIS FoodKeeper shelf-life reference data (661 products, 25
-  categories), vendored as CSV. Read twice, independently: `foodkeeper.rs` for names and
-  synonyms, `expiration.rs` for shelf lives. **Read
-  `data/foodkeeper/README.md` before writing any parsing code** — it documents provenance
-  (mirror verified against the official feed by hash), the `DOP_` = "date of purchase"
-  column semantics that are easy to get backwards, and seven data-shape traps found by
-  profiling (`_Metric` is a tagged union carrying `Not Recommended`/`Indefinitely`, prose
-  in integer fields, 184 rows with no refrigerate data, `Name` is not unique).
-- Run: `cargo run` (serves on `0.0.0.0:8080` — see LAN access note below). Test: `cargo test`.
+Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migrations/`. Run:
+`cargo run` (binds `0.0.0.0:8080`, see LAN note below). Test: `cargo test`.
 
-### Phase 2 additions (shopping list + purchase history)
-
-- `src/models.rs` — `ShoppingListStatus` (Pending/Purchased, mapped to TEXT via
-  `sqlx::Type` the same way `SuggestionSource` is in `nlp.rs`), `ShoppingListItem`,
-  `AddShoppingListItemRequest`, `PurchaseHistory`. `ShoppingListItem` carries `quantity` and
-  `unit` beyond `docs/PLAN.md`'s literal struct sketch — the unified purchase trigger (next
-  bullet) needs a quantity to merge into the fridge or log to `purchase_history` with, so
-  it wasn't optional.
-- **Purchase-history trigger, decided:** unified through the fridge path, not two
-  independent triggers. `routes/items.rs`'s `upsert_fridge_item` (the renamed core of what
-  used to be `add_item`'s body) is the *only* place that writes to `purchase_history` — it's
-  called directly by `POST /items` and also by `shopping_list::mark_purchased` when a
-  grocery item is checked off the list. One log site means a purchase can never be
-  double-counted, and marking something purchased on the list now also lands it in the
-  fridge with an expiration estimate, for free.
-- `src/routes/shopping_list.rs` — `GET/POST /shopping-list`, `DELETE /shopping-list/:id`,
-  `POST /shopping-list/:id/purchase` (the unified trigger above — non-grocery items only
-  flip status, never touch the fridge table or purchase history), `GET
-  /shopping-list/suggestions` (calls `recommend::suggest_shopping_items`).
-  **`POST /shopping-list` merges on add** — same name + unit + still `pending` folds the
-  new quantity into the existing row (200) instead of creating a duplicate (201), the same
-  shape as `items::upsert_fridge_item`'s merge but without an expiration tolerance to
-  weigh. Deliberately excludes `purchased` rows from matching, so checking something off
-  the list and re-adding it starts a fresh pending row rather than silently reviving the
-  old one with extra quantity.
-- `src/purchase_history.rs` — `record`/`list_all` against the `purchase_history` table.
-  Nothing else writes to it.
-- `src/recommend.rs` — **[learn] implemented.** `suggest_shopping_items(history, fridge)
-  -> Vec<Suggestion>`. Expiring-replacement is a straight filter on `fridge` (expiration
-  within 3 days, `None` explicitly excluded rather than relying on `Option`'s default
-  ordering). Frequently-purchased groups `history` by item name into a `HashMap<&str,
-  Vec<&PurchaseHistory>>`, sorts each group ascending by `purchased_at`, and calls
-  `calculate_mad` — despite the name, it currently computes the **median gap** (the
-  middle value of the sorted consecutive-purchase gaps from `.windows(2)`), not yet the
-  full median-absolute-deviation regularity check discussed while building it; that's the
-  natural next refinement if the simple version over- or under-suggests against real
-  data. An item is suggested when it's absent from `fridge` and the time since its most
-  recent purchase (`.last()` on the sorted group) exceeds that median gap. Debugging this
-  one surfaced two sharp Rust edges worth remembering: a slice `windows(2)` closure
-  pattern (`|[a, b]|`) doesn't compile because slice length isn't known at the type level
-  (index instead, e.g. `w[0]`/`w[1]`), and passing an owned value into a helper function
-  moves it — `calculate_mad` takes `&[&PurchaseHistory]` rather than
-  `Vec<&PurchaseHistory>` specifically so the caller's loop can still use its `item`
-  afterward.
-- Migrations `0003_create_shopping_list_items.sql`, `0004_create_purchase_history.sql`.
+- `src/models.rs` — all request/response/DB-row structs (`FridgeItem`, `ShoppingListItem`,
+  `PurchaseHistory`, etc). `id` fields are `String` (UUID text), not `uuid::Uuid` — sidesteps
+  sqlx's BLOB-based Uuid encoding mismatch with TEXT columns.
+- `src/routes/items.rs` — fridge CRUD. `upsert_fridge_item` is the single place that both
+  inserts/merges a fridge row *and* logs to `purchase_history` — called by `POST /items`
+  directly and by `shopping_list::mark_purchased` for grocery items, so a purchase is never
+  logged twice no matter which flow produced it. Merge-on-add requires matching name + unit
+  + expiration within `MERGE_EXPIRATION_TOLERANCE_DAYS`; see `find_merge_target`'s doc
+  comment for the tolerance/tie-break rules.
+- `src/routes/shopping_list.rs` — shopping-list CRUD + `POST /:id/purchase` (the unified
+  trigger above) + `GET /suggestions` (calls `recommend::suggest_shopping_items`).
+  `POST /shopping-list` also merges on add (same name + unit, still `pending`); a purchased
+  row never absorbs a new add.
+- `src/routes/suggest.rs` — item-name typeahead, calls `nlp::suggest_item_names`.
+- `src/nlp.rs` — **[learn] implemented.** Banded-tier fuzzy/prefix/substring matcher; its
+  module doc is the reference for the scoring bands.
+- `src/expiration.rs` — **[learn] implemented.** FoodKeeper-CSV-backed shelf-life lookup.
+- `src/recommend.rs` — **[learn] implemented.** `suggest_shopping_items`: an expiring-soon
+  filter on `fridge`, plus a frequency signal (group `history` by item, median gap via
+  `calculate_mad`, suggest if absent from `fridge` and overdue). `calculate_mad` currently
+  computes the median gap, not full MAD, and hasn't been checked against real purchase data
+  yet — only the hand-built test fixtures. Worth a real-data pass before trusting it fully.
+- `src/purchase_history.rs`, `src/foodkeeper.rs` — straightforward; see their own doc
+  comments.
+- `data/foodkeeper/README.md` — **read before touching either FoodKeeper-parsing module.**
+  Documents provenance and real data-shape traps (tagged-union `_Metric` fields, prose in
+  integer columns, non-unique `Name`, etc).
+- `src/routes/recipes.rs` — `GET /recipes/recommended?cuisine=&mealType=`, calls
+  `recommend_recipes::recommend_recipes` against the static `Recipe` catalog plus current
+  fridge/shopping-list contents (fetched via `items::fetch_all` /
+  `shopping_list::fetch_all`).
+- `src/themealdb.rs` — parses the vendored `data/themealdb/meals.json` into `Vec<Recipe>`
+  at startup, same embed-at-compile-time pattern as `foodkeeper.rs`. Also where
+  `required_appliances` (keyword scan over instructions) and the `fridge_ingredients` /
+  `extra_ingredients` split (pantry-staple keyword list) are derived — both are documented
+  heuristics, not structured facts; see its module doc and `data/themealdb/README.md`
+  before adjusting either keyword list.
+- `src/recommend_recipes.rs` — **[learn] implemented.** `recommend_recipes` hard-filters on
+  cuisine/meal-type first, then ranks by missing-ingredient count ascending with
+  total-ingredient-count descending as a tie-break (see "Current status" above for why the
+  tie-break exists and the zero-ingredient-recipe ranking gap it doesn't yet cover).
+  `RecipeFilters`/`RecommendedRecipe` live here rather than `models.rs`, same reasoning as
+  `Suggestion`/`SuggestionReason` living in `recommend.rs`.
+- `data/themealdb/README.md` — **read before touching `src/themealdb.rs`.** Field-mapping
+  decisions (why `strCountry` not `strArea`, why `cook_time_minutes` is always `None`) and
+  the appliance/pantry-staple keyword heuristics, including known false-positive risks.
 
 ## Frontend (`frontend/src/app/fridge/`)
 
-- Next.js 16.2.12. `frontend/AGENTS.md` requires reading `node_modules/next/dist/docs/`
-  before writing frontend code — this version has breaking changes vs. older Next.
-- `page.tsx` — client component, fetches from the Rust API via `src/lib/fridgeApi.ts`
-  (`NEXT_PUBLIC_FRIDGE_API_URL`, defaults to `http://127.0.0.1:8080`).
-- `AddItemForm.tsx`, `ExpirationBadge.tsx` — presentational pieces.
-- `ItemNameCombobox.tsx` — the add-item typeahead. **Deliberately never preselects a
-  suggestion**: `activeIndex` starts at -1 and resets on every keystroke, so Enter commits
-  the literal typed text unless the user arrows onto a suggestion first. This is the whole
-  safety property of the design — don't "helpfully" auto-highlight the top result.
-- Verified working in-browser: recent-items empty state, typed suggestions, arrow
-  navigation with wrap back to raw text, Enter-selects vs. Enter-submits, add, remove.
+Next.js 16.2.12. `frontend/AGENTS.md` requires reading `node_modules/next/dist/docs/` before
+writing frontend code — this version has breaking changes vs. older Next.
 
-### Phase 2 additions (`frontend/src/app/fridge/shopping-list/`)
+- `page.tsx` / `lib/fridgeApi.ts` — fridge tab. `ItemNameCombobox.tsx` deliberately never
+  preselects a suggestion (`activeIndex` starts at -1, resets every keystroke) — Enter
+  commits the literal typed text unless the user arrows onto a suggestion first. Don't
+  "helpfully" change that.
+- `shopping-list/` / `lib/shoppingListApi.ts` — shopping-list sub-route of the Fridge tab
+  (not a standalone nav tab — `apps/fridge-app` is one tab in the site's philosophy).
+  Deliberately separate type names from `fridgeApi.ts` to avoid collisions.
+- `GroceryListPopup.tsx` — sticky-note-styled popup on the fridge page for a quick-glance
+  view of the pending shopping list.
+- `recipes/` / `lib/recipesApi.ts` — recipes sub-route, same "sub-route of the Fridge tab"
+  philosophy as `shopping-list/`. `page.tsx` fetches the full catalog unfiltered once (to
+  populate the cuisine/meal-type `<select>` options in `RecipeFilterBar.tsx` from whatever
+  actually exists in the data, not a hardcoded list) plus separately on every filter
+  change. Verified in-browser with real ranked results and real filter values (not mock
+  data) once `recommend_recipes` was implemented — filtering to a cuisine correctly narrows
+  the set *and* preserves the missing-ingredient ranking within it.
 
-- Scaffolded as a sub-route of the Fridge tab (`/fridge/shopping-list`), not a new
-  top-level nav tab — `apps/fridge-app` is one app in the site's tab philosophy, and this
-  is still that app. Small reciprocal links added between `/fridge` and
-  `/fridge/shopping-list`; redo as a standalone tab if that stops feeling right.
-- `lib/shoppingListApi.ts` — deliberately separate type/function names from
-  `fridgeApi.ts` (`ShoppingSuggestion` vs. `Suggestion`, etc.) to avoid collisions; the two
-  are unrelated concepts that happen to share a word.
-- `page.tsx`, `AddShoppingItemForm.tsx`, `SuggestedItemsPanel.tsx`. The suggested-items
-  panel always renders "No suggestions right now" — expected, since the backend stub
-  returns `[]`. Its "Add to list" button calls `addShoppingListItem` with
-  `added_manually: false`, distinguishing accepted suggestions from typed-in items.
-- Verified working in-browser end to end: add a shopping-list item, mark it purchased,
-  confirm it lands in the fridge with an expiration estimate and logs exactly one
-  `purchase_history` row, confirm a non-grocery item marked purchased touches neither.
+## Environment gotchas
 
-## LAN access (testing from other devices)
-
-- Backend binds `0.0.0.0:8080` (changed from `127.0.0.1` in `src/main.rs`) so other devices
-  on the same Wi-Fi can reach it. First run after this change, macOS prompts to allow
-  incoming connections for `fridge_backend` — must be approved manually, not scriptable.
-- `frontend/.env.local` sets `NEXT_PUBLIC_FRIDGE_API_URL` to the host machine's LAN IP
-  (was `192.168.12.146` as of this writing) instead of `127.0.0.1`, since a browser on
-  another device resolves `127.0.0.1` to itself, not this machine.
-- That IP is DHCP-assigned and can change (reboot, Wi-Fi reconnect, etc). If LAN access
-  stops working, re-check it with `ipconfig getifaddr en0` and update `.env.local`.
-- No auth exists yet (Phase 5), so anything on the LAN can hit the API while it's bound to
-  `0.0.0.0` — fine on a trusted home network, not elsewhere.
-- `.env.local` is gitignored, so this LAN IP is local-machine-only config, not committed.
-
-## Known environment quirks
-
-- Turbopack tried to infer the workspace root as `~/Documents` (a stray `bun.lock` in the
-  home directory confused it) and crashed on `next build` due to a sandboxed shell not
-  being able to list that directory. Fixed by pinning `turbopack.root` in
-  `frontend/next.config.ts`. If you see a similar `TurbopackInternalError: reading dir`
-  again, that config is the first place to check.
-- Local dev preview for this repo is configured at `.claude/launch.json` in the repo root
-  (name `personal-website-frontend`, `cwd: frontend`, `autoPort: true` since port 3000 is
-  often occupied by an unrelated project on this machine). An unrelated
-  `/Users/jesseli/projects/meal/.claude/launch.json` also exists — that one is not this
+- Turbopack tried inferring the workspace root as `~/Documents` (a stray `bun.lock` in the
+  home dir confused it). Fixed via `turbopack.root` in `frontend/next.config.ts` — check
+  there first if `TurbopackInternalError: reading dir` reappears.
+- A `next dev` server and/or `cargo run` backend are often already running from a previous
+  session. Check `lsof -ti tcp:3000` / `tcp:8080` before starting another.
+- Fridge tab hanging forever on load (not erroring, just an endless spinner) usually means
+  it was loaded via the wrong URL — e.g. a LAN "Network" URL opened from the same machine
+  that printed it.
+- LAN access: backend binds `0.0.0.0` on purpose; `frontend/.env.local` (gitignored) points
+  `NEXT_PUBLIC_FRIDGE_API_URL` at the host's LAN IP for other-device testing. That IP is
+  DHCP-assigned — re-check with `ipconfig getifaddr en0` if it stops working. No auth yet
+  (Phase 5), so this is fine on a trusted network only.
+- Repo root `.claude/launch.json` (`cwd: frontend`) is this project's dev-preview config; an
+  unrelated `/Users/jesseli/projects/meal/.claude/launch.json` also exists — not this
   project, don't be misled by it.
-- A `next dev` server and a `cargo run` backend are often already running from a previous
-  session. Check `lsof -ti tcp:3000` / `tcp:8080` before starting another; the Next.js dev
-  server refuses to double-start, and the backend fails with "Address already in use".
-- If the fridge tab seems to "hang" on loading forever (not error, just an endless
-  spinner), first suspect is loading the page via the wrong URL — e.g. the Next.js dev
-  server's printed "Network" URL from a browser on this same machine still works, but
-  loading it as if it were a different machine's localhost won't. Confirm which URL is
-  loaded before assuming a code bug.
+
+## Open technical debt
+
+- `foodkeeper_product_id` on a collapsed name (e.g. `Ham`, which collapses 20 CSV rows) is
+  just the first row's id, not disambiguated. Needs `Name_subtitle` handling to fix properly
+  (FoodKeeper README gotcha 6).
+- `expiration.rs` re-parses the FoodKeeper CSV independently of `foodkeeper.rs` (its own
+  `PRODUCTS_CSV` + `FoodKeeperRow`), instead of reusing the `Catalog` already loaded once
+  into `AppState`. Worth reconciling.
+- `calculate_mad` in `recommend.rs` — see backend section above.
+- `themealdb.rs`'s `required_appliances` and `fridge_ingredients`/`extra_ingredients` split
+  are keyword heuristics over free text, not structured data — see its module doc and
+  `data/themealdb/README.md`. Not a bug, but don't build anything downstream that assumes
+  they're exact.
+- `data/themealdb/meals.json` is a 2026-08-10 snapshot; TheMealDB adds recipes over time.
+  Re-run the letter-sweep fetch (see the README) if the catalog starts feeling stale.
+
+## Working patterns from Phase 1/2 scoring bugs
+
+Relevant again for Phase 3's `recommend_recipes` and Phase 4's `rerank_recommendations` —
+both are `[learn]` scoring functions too. In short: enforce numeric invariants by
+construction, name and derive constants instead of repeating magic literals, give any
+continuous score an explicit threshold, don't trust passing tests without checking against
+real data, and check a branch is reachable before writing it. Full detail is in `nlp.rs` /
+`recommend.rs` git history if wanted later.
 
 ## Git / GitHub
 
-- Repo is initialized at the `personal-website` root, on branch `main`, with remote
-  `origin` set to `git@github.com:terrificjesse/personal-website.git` over SSH (auth
-  already configured — see `~/.ssh/id_ed25519`).
-
-## Open decisions (not yet made)
-
-- **`foodkeeper_product_id` is a representative row for collapsed names.** `Ham` collapses
-  20 CSV rows with different shelf lives; the stored id is just the first. `expiration.rs`
-  will need `Name_subtitle` to disambiguate properly (README gotcha 6).
-- **`expiration.rs` re-parses the whole CSV on every call** and has its own `PRODUCTS_CSV`
-  `include_str!` + `FoodKeeperRow` separate from `foodkeeper.rs`. Worth reconciling once
-  `estimate_expiration` settles — the catalog is already loaded once into `AppState`.
-
-## Quantity merging on add
-
-`POST /items` folds a new item into an existing row instead of creating a duplicate, but
-only when **name + unit + expiration** all line up (`routes/items.rs`):
-
-- Name and unit must match exactly (2 count + 1 litre isn't 3 of anything).
-- Expirations must be within `MERGE_EXPIRATION_TOLERANCE_DAYS` (3) of each other, so
-  two-week-old milk never absorbs today's. Rows with a NULL expiration never merge.
-- On merge the **earlier** expiration wins — warning early about good food is cheaper than
-  staying quiet about spoiled food.
-- `foodkeeper_product_id` is backfilled via `COALESCE` if the existing row was freehand.
-- Returns **200** on merge, **201** on insert.
-
-The decision itself is `find_merge_target`, kept pure and separate from the SQL, with 7
-unit tests. Tune the tolerance constant there if merging feels too eager or too shy.
-
-## Working patterns established in Phase 1
-
-Phase 2's `suggest_shopping_items` is another `[learn]` scoring function, so these carry
-over — they were all learned the hard way in `nlp.rs`:
-
-- **Enforce numeric invariants by construction, not convention.** Three separate scoring
-  bugs in `nlp.rs` were band overflows: a width that exceeded its band, branches ordered by
-  source instead of by score, and a coverage ratio whose denominator wasn't the string that
-  matched. Each was arithmetic that *happened* to be right until it wasn't.
-- **Name the constants, and derive them from each other where the relationship matters.**
-  Magic literals repeated across branches are how the bands drifted apart.
-- **A continuous score needs an explicit threshold; a predicate doesn't.** The fuzzy tier
-  matched all 466 candidates on every query until it got a cutoff. Recommendation scoring
-  will have the same property.
-- **Tests passing is a weaker signal than it looks.** Several `nlp.rs` tests passed for the
-  wrong reason — one via fixture ordering, one because a "typo" happened to be a prefix.
-  Check behaviour against the live endpoint with real data too, not just `cargo test`.
-- **Check reachability before writing a branch.** Two dead branches got written and later
-  deleted: token-substring (subsumed by string-substring) and an alias-fuzzy band that sat
-  entirely below `SCORE_FLOOR`. `pub` fields and unreachable match arms don't warn.
+Repo root, branch `main`, remote `origin` →
+`git@github.com:terrificjesse/personal-website.git` over SSH (`~/.ssh/id_ed25519`).
 
 ## Next up
 
-- Phase 2 is done. Phase 3 in `docs/PLAN.md` — recipe recommendations — is next. Not a
-  `[learn]` phase; scaffold-and-implement freely when it's time.
-- Worth a real-data check before considering Phase 2 fully closed (see the Phase 1
-  lesson below about tests passing for the wrong reason): `calculate_mad`'s "median gap"
-  approach hasn't been tried against actual purchase history yet, just the hand-built
-  test fixtures. Revisit the MAD-vs-median-gap and minimum-evidence questions from
-  earlier discussion if real suggestions look off.
-- `docs/TODO.md` holds deferred ideas that came up during Phase 1 and were consciously
-  postponed; out-of-order token matching for the NLP tier is the first entry. Nothing new
-  was added to it during Phase 2.
+Phases 1–3 are all complete, no open items in `recommend_recipes`. Phase 4 (review system +
+learned re-ranking) is next in `docs/PLAN.md`, but per this repo's phase-discipline rule,
+don't scaffold it until asked. `docs/TODO.md` holds three deferred ideas (out-of-order token
+matching in `nlp.rs`, quantity/measure-aware ingredient matching, singular/plural
+ingredient-name matching); nothing there blocks Phase 4.

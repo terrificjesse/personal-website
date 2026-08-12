@@ -1,5 +1,6 @@
 pub mod health;
 pub mod items;
+pub mod recipes;
 pub mod shopping_list;
 pub mod suggest;
 
@@ -14,11 +15,13 @@ use sqlx::SqlitePool;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::foodkeeper::Catalog;
+use crate::themealdb::Catalog as RecipeCatalog;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub catalog: Arc<Catalog>,
+    pub recipe_catalog: Arc<RecipeCatalog>,
 }
 
 // These let handlers keep extracting just the piece of state they need
@@ -33,6 +36,12 @@ impl FromRef<AppState> for SqlitePool {
 impl FromRef<AppState> for Arc<Catalog> {
     fn from_ref(state: &AppState) -> Self {
         Arc::clone(&state.catalog)
+    }
+}
+
+impl FromRef<AppState> for Arc<RecipeCatalog> {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.recipe_catalog)
     }
 }
 
@@ -56,6 +65,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/shopping-list/suggestions", get(shopping_list::suggestions))
         .route("/shopping-list/{id}", delete(shopping_list::remove_shopping_list_item))
         .route("/shopping-list/{id}/purchase", post(shopping_list::mark_purchased))
+        .route("/recipes/recommended", get(recipes::recommended))
         .with_state(state)
         .layer(cors)
 }

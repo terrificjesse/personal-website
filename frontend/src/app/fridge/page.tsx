@@ -53,6 +53,10 @@ export default function FridgePage() {
         <Link href="/fridge/shopping-list" className="underline underline-offset-4">
           Shopping list
         </Link>
+        {" · "}
+        <Link href="/fridge/recipes" className="underline underline-offset-4">
+          Recipes
+        </Link>
       </p>
 
       <div className="mt-6">

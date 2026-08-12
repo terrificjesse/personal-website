@@ -80,6 +80,10 @@ export default function ShoppingListPage() {
         <Link href="/fridge" className="underline underline-offset-4">
           Fridge
         </Link>
+        {" · "}
+        <Link href="/fridge/recipes" className="underline underline-offset-4">
+          Recipes
+        </Link>
         {" · What to buy next."}
       </p>
 

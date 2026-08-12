@@ -100,3 +100,41 @@ pub struct PurchaseHistory {
     pub quantity: f64,
     pub purchased_at: DateTime<Utc>,
 }
+
+/// One ingredient line from a recipe — a name plus its free-text measure ("2 cloves", "1
+/// cup"). Not parsed into a quantity/unit pair; TheMealDB's measures aren't consistent
+/// enough to parse reliably (see `data/themealdb/README.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeIngredient {
+    pub name: String,
+    pub measure: String,
+}
+
+/// A recipe from the vendored TheMealDB catalog (`src/themealdb.rs`). Static reference
+/// data, not a DB row — there's no `sqlx::FromRow` here because these are never queried
+/// from `fridge.db`; they're parsed once at startup from `data/themealdb/meals.json`.
+///
+/// `id` is TheMealDB's `idMeal`, kept as the source gave it (a numeric string) rather than
+/// parsed to an integer — same reasoning as every other `id` field in this file: nothing
+/// here does arithmetic on it, and Phase 4's `Review.recipe_id` just needs a stable key to
+/// reference back to.
+///
+/// See `data/themealdb/README.md` for how each field below was derived from the source
+/// data, including which ones are heuristics rather than structured facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Recipe {
+    pub id: String,
+    pub name: String,
+    pub cuisine_tags: Vec<String>,
+    pub meal_type_tags: Vec<String>,
+    /// Always `None` — TheMealDB has no cook-time field and nothing else in the source data
+    /// is reliable enough to derive one from. See `data/themealdb/README.md`.
+    pub cook_time_minutes: Option<u32>,
+    /// Best-effort, keyword-derived. See `APPLIANCE_KEYWORDS` in `src/themealdb.rs`.
+    pub required_appliances: Vec<String>,
+    /// Ingredients an inventory app would plausibly track (proteins, produce, dairy, etc).
+    pub fridge_ingredients: Vec<RecipeIngredient>,
+    /// Pantry staples/spices, split out via a keyword list rather than tracked individually.
+    pub extra_ingredients: Vec<RecipeIngredient>,
+    pub image_url: Option<String>,
+}
