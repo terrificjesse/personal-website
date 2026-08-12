@@ -159,16 +159,59 @@ pub struct Review {
     pub rating: i64,
     pub cooked_at: DateTime<Utc>,
     pub notes: Option<String>,
+    /// Who wrote it. `None` for anything written before Phase 5 — the app was single-user,
+    /// so there was nobody else it could belong to. See `Review::is_by`.
+    pub user_id: Option<String>,
+    /// Opt-in world-readability. Private reviews still count toward *your own*
+    /// personalization; they're just never served to anyone else.
+    pub is_public: bool,
+    /// Moderation tombstone — excluded from every read path, but the row survives.
+    pub hidden: bool,
+}
+
+impl Review {
+    /// Whether `viewer` wrote this review — the personal-vs-global distinction
+    /// `rerank_recommendations` needs in order to weight your own feedback differently from
+    /// a stranger's.
+    ///
+    /// `viewer == None` means pre-Phase-5 single-user mode: there are no accounts yet, so
+    /// every review in the database is by definition the local user's and counts as
+    /// personal. Once Phase 5 threads a real session user id through, this becomes a genuine
+    /// ownership check with no further changes at the call sites.
+    pub fn is_by(&self, viewer: Option<&str>) -> bool {
+        match viewer {
+            None => true,
+            Some(viewer_id) => self.user_id.as_deref() == Some(viewer_id),
+        }
+    }
 }
 
 /// A rating at or above this counts as "liked" for `GET /recipes/liked` — the plain
 /// membership filter for the "recipes you liked" section (Phase 4). This is a simple
-/// threshold, not the learned part of Phase 4; ordering within the liked set (and any
-/// suppression of disliked recipes) is `rerank_recommendations`'s job.
+/// threshold, not the learned part of Phase 4; ordering *within* the liked set is
+/// `rerank_recommendations`'s job.
 pub const LIKED_RATING_THRESHOLD: i64 = 4;
+
+/// A rating at or below this suppresses a recipe from the *general* recommendations
+/// (`GET /recipes/recommended`), satisfying PLAN.md's Phase 4 checkpoint: "rate one poorly,
+/// confirm it drops out of general recommendations."
+///
+/// Suppression deliberately lives on the general-recommendations path rather than inside
+/// `rerank_recommendations` — a filter composes cleanly with Phase 3's ingredient ranking,
+/// whereas a second *ordering* would fight it. `rerank_recommendations` only ever reorders.
+///
+/// No recency decay: a recipe you disliked stays suppressed regardless of when. Revisit if
+/// permanently hiding something you disliked once starts feeling wrong (Phase 5's notes on
+/// decay apply here too).
+pub const SUPPRESSED_RATING_THRESHOLD: i64 = 2;
 
 pub const MIN_RATING: i64 = 1;
 pub const MAX_RATING: i64 = 5;
+
+/// Cap on `Review.notes`. Nothing enforced this before; once reviews are world-readable an
+/// unbounded free-text field reachable by `POST` is a liability, so the limit lands with the
+/// schema rather than after it.
+pub const MAX_NOTES_LENGTH: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 pub struct AddReviewRequest {
@@ -180,4 +223,48 @@ pub struct AddReviewRequest {
     /// cooking.
     #[serde(default)]
     pub cooked_at: Option<DateTime<Utc>>,
+    /// Opt-in. Defaults to private so a client that doesn't know about this field yet can
+    /// never accidentally publish.
+    #[serde(default)]
+    pub is_public: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(user_id: Option<&str>) -> Review {
+        Review {
+            id: "test".to_string(),
+            recipe_id: "52967".to_string(),
+            rating: 5,
+            cooked_at: Utc::now(),
+            notes: None,
+            user_id: user_id.map(str::to_string),
+            is_public: false,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn pre_auth_every_review_counts_as_personal() {
+        // The configuration the app actually runs in today: no accounts, so `viewer` is None
+        // and `user_id` is NULL on every row. Everything must read as the local user's, or
+        // single-user personalization silently stops working.
+        assert!(review(None).is_by(None));
+        assert!(review(Some("someone")).is_by(None));
+    }
+
+    #[test]
+    fn a_review_is_personal_only_to_its_own_author() {
+        assert!(review(Some("me")).is_by(Some("me")));
+        assert!(!review(Some("someone-else")).is_by(Some("me")));
+    }
+
+    #[test]
+    fn a_pre_auth_review_belongs_to_nobody_once_accounts_exist() {
+        // A NULL `user_id` must not silently match a signed-in viewer — Phase 5 backfills
+        // those rows with a real account id rather than relying on a match here.
+        assert!(!review(None).is_by(Some("me")));
+    }
 }

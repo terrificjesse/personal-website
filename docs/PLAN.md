@@ -184,11 +184,50 @@ built for real.
   external accounts or credentials on your behalf); store secrets in `.env`, never commit
   them.
 
+### Global review aggregator (added Phase 4, activates here)
+
+Decided during Phase 4: reviews should eventually be shareable across users — anyone can
+write one, opt in to publishing it, and see everyone else's public reviews. The **schema and
+endpoints for this were scaffolded in Phase 4** (migration `0006_add_review_ownership.sql`)
+because retrofitting ownership onto rows that never had it is far more painful than carrying
+nullable columns for a phase. What's already in place: `reviews.user_id` (NULL pre-auth),
+`reviews.is_public` (defaults 0 — opt-in, never opt-out), `reviews.hidden` (moderation
+tombstone), `GET /recipes/{id}/reviews` (public wall for one recipe), visibility-scoped
+reads (`fetch_for_viewer` / `fetch_visible_to`), a notes length cap, and a
+`reviews::current_viewer()` seam that returns `None` until sessions exist.
+
+- [gen] Replace `reviews::current_viewer()` with a real session-user extractor, and backfill
+  the NULL `user_id`s with the account created at registration. Every read path already
+  threads the result through, so this should land in one place.
+- [gen] Rate limiting on `POST /reviews`, and a moderation path for setting `hidden`.
+- [learn] **Small-sample rating statistics.** Once reviews come from many users, a naive
+  mean is badly behaved: one 5★ review must not outrank two hundred averaging 4.6★.
+  Deliberately deferred from Phase 4 — with a single user there is no crowd to average, so
+  the problem doesn't exist yet. Worth researching when you get here: Bayesian averaging /
+  shrinkage toward the global mean (the IMDb Top 250 formula is the canonical reference
+  implementation), Wilson score lower bounds if you ever collapse ratings to binary
+  like/dislike, and Laplace/add-k smoothing as the crude first cut. Same rules as every
+  other `[learn]` item — Claude discusses and reviews, you implement.
+- [learn] **Weighting personal vs. global feedback** in `rerank_recommendations`. The
+  plumbing exists (`Review::is_by(viewer)` distinguishes the two populations, and
+  `fetch_visible_to` hands the function both in one slice); the weighting itself is yours.
+  Note these are different signals, not one pooled average — your own history is
+  personalization, the crowd's is a quality prior. See `src/rerank.rs`'s module doc.
+- [learn] Optional, once a real multi-user corpus exists: collaborative filtering
+  ("people who liked what you liked also liked X"). This is the condition Phase 4's notes
+  set for reaching past simple weighted scoring — don't start here.
+
+**Do not expose the review endpoints publicly before auth lands.** The backend binds
+`0.0.0.0` with no authentication, so until Phase 5 is done a global review wall is an
+unauthenticated, unattributable write endpoint. Fine on a trusted LAN, not fine anywhere else.
+
 ### Checkpoint
 Register an account with a password, log out, log back in; connect Google as an alternate
 login method; confirm fridge/shopping/recipe data is scoped to your account (even though
 you're the only user, verify the scoping actually works — e.g. a fresh second test account
-sees an empty fridge).
+sees an empty fridge). With two test accounts, confirm a public review written by one is
+visible to the other while a private one is not, and that a recipe only the *other* account
+rated highly never appears in your "Recipes you liked" section.
 
 ---
 

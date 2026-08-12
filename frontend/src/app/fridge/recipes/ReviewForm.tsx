@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { submitReview } from "@/lib/reviewsApi";
+import { MAX_NOTES_LENGTH, submitReview } from "@/lib/reviewsApi";
 
 const RATINGS = [5, 4, 3, 2, 1];
 
@@ -14,13 +14,21 @@ export function ReviewForm({
 }) {
   const [rating, setRating] = useState(5);
   const [notes, setNotes] = useState("");
+  // Defaults to private, matching the backend default — publishing is always a deliberate
+  // choice, never something that happens because a control was left alone.
+  const [isPublic, setIsPublic] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitting(true);
     try {
-      await submitReview({ recipe_id: recipeId, rating, notes: notes.trim() || undefined });
+      await submitReview({
+        recipe_id: recipeId,
+        rating,
+        notes: notes.trim() || undefined,
+        is_public: isPublic,
+      });
       onSubmitted(rating);
     } finally {
       setSubmitting(false);
@@ -57,10 +65,19 @@ export function ReviewForm({
           id={`notes-${recipeId}`}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
+          maxLength={MAX_NOTES_LENGTH}
           placeholder="How did it turn out?"
           className="rounded border border-black/15 px-2 py-1.5 text-sm dark:border-white/20 dark:bg-transparent"
         />
       </div>
+      <label className="flex items-center gap-1.5 pb-1.5 text-xs opacity-70">
+        <input
+          type="checkbox"
+          checked={isPublic}
+          onChange={(e) => setIsPublic(e.target.checked)}
+        />
+        Share publicly
+      </label>
       <button
         type="submit"
         disabled={submitting}

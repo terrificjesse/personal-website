@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Recipe } from "@/lib/recipesApi";
-import { fetchLikedRecipes } from "@/lib/reviewsApi";
+import { fetchLikedRecipes, type RankedRecipe } from "@/lib/reviewsApi";
 import { LikedRecipeCard } from "./LikedRecipeCard";
 
 /**
@@ -12,7 +11,7 @@ import { LikedRecipeCard } from "./LikedRecipeCard";
  * expected, not a bug.
  */
 export function LikedRecipesSection() {
-  const [recipes, setRecipes] = useState<Recipe[]>([]);
+  const [recipes, setRecipes] = useState<RankedRecipe[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -36,8 +35,8 @@ export function LikedRecipesSection() {
 
   return (
     <ul className="mt-3 space-y-3">
-      {recipes.map((recipe) => (
-        <LikedRecipeCard key={recipe.id} recipe={recipe} />
+      {recipes.map((ranked) => (
+        <LikedRecipeCard key={ranked.recipe.id} ranked={ranked} />
       ))}
     </ul>
   );

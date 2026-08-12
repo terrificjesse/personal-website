@@ -70,6 +70,8 @@ pub fn build_router(state: AppState) -> Router {
         // Static segment, same priority reasoning as `/items/suggest` above.
         .route("/recipes/liked", get(recipes::liked))
         .route("/reviews", get(reviews::list_reviews).post(reviews::submit_review))
+        // Public review wall for one recipe — the read half of the global aggregator.
+        .route("/recipes/{id}/reviews", get(reviews::list_recipe_reviews))
         .with_state(state)
         .layer(cors)
 }

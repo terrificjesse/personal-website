@@ -55,6 +55,8 @@ export default function ReviewHistoryPage() {
                   {"★".repeat(review.rating) + "☆".repeat(5 - review.rating)}
                   {" · "}
                   {new Date(review.cooked_at).toLocaleDateString()}
+                  {" · "}
+                  {review.is_public ? "Public" : "Private"}
                 </p>
                 {review.notes && <p className="mt-1 text-xs opacity-80">{review.notes}</p>}
               </div>
