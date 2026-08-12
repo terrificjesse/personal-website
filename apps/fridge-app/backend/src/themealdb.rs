@@ -148,6 +148,7 @@ fn parse_recipe(value: &Value) -> Option<Recipe> {
         fridge_ingredients,
         extra_ingredients,
         image_url,
+        instructions: instructions.trim().to_string(),
     })
 }
 
@@ -187,6 +188,23 @@ mod tests {
     #[test]
     fn cook_time_is_always_none() {
         assert!(catalog().recipes().iter().all(|r| r.cook_time_minutes.is_none()));
+    }
+
+    #[test]
+    fn every_recipe_has_non_empty_instructions() {
+        // TheMealDB's terse floor is "Make and enjoy" (see data README) — short, but never
+        // empty across the vendored snapshot.
+        assert!(catalog().recipes().iter().all(|r| !r.instructions.is_empty()));
+    }
+
+    #[test]
+    fn instructions_are_trimmed() {
+        assert!(
+            catalog()
+                .recipes()
+                .iter()
+                .all(|r| r.instructions.trim() == r.instructions)
+        );
     }
 
     #[test]

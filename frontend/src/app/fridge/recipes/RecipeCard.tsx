@@ -1,7 +1,11 @@
+"use client";
+
+import { useState } from "react";
 import type { RecommendedRecipe } from "@/lib/recipesApi";
 
 export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) {
   const { recipe, matched_ingredient_count, total_ingredient_count } = recommended;
+  const [showInstructions, setShowInstructions] = useState(false);
 
   return (
     <li className="flex gap-4 rounded border border-black/10 p-4 dark:border-white/10">
@@ -44,6 +48,22 @@ export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) 
           <p className="mt-1 text-xs opacity-60">
             Extras: {recipe.extra_ingredients.map((i) => i.name).join(", ")}
           </p>
+        )}
+
+        {recipe.instructions && (
+          <div className="mt-2">
+            <button
+              onClick={() => setShowInstructions((prev) => !prev)}
+              className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+            >
+              {showInstructions ? "Hide instructions" : "Show instructions"}
+            </button>
+            {showInstructions && (
+              <p className="mt-1 whitespace-pre-line text-xs opacity-80">
+                {recipe.instructions}
+              </p>
+            )}
+          </div>
         )}
       </div>
     </li>

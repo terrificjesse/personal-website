@@ -79,11 +79,14 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   `required_appliances` (keyword scan over instructions) and the `fridge_ingredients` /
   `extra_ingredients` split (pantry-staple keyword list) are derived — both are documented
   heuristics, not structured facts; see its module doc and `data/themealdb/README.md`
-  before adjusting either keyword list.
+  before adjusting either keyword list. `Recipe.instructions` is `strInstructions`
+  trimmed and passed through unprocessed — the one field here that's a straight pass-through
+  rather than a heuristic, since every one of the 789 records has a real (if occasionally
+  one-line) value.
 - `src/recommend_recipes.rs` — **[learn] implemented.** `recommend_recipes` hard-filters on
-  cuisine/meal-type first, then ranks by missing-ingredient count ascending with
-  total-ingredient-count descending as a tie-break (see "Current status" above for why the
-  tie-break exists and the zero-ingredient-recipe ranking gap it doesn't yet cover).
+  cuisine/meal-type first, then sorts by (trivial-recipe flag, missing-ingredient count
+  ascending, total-ingredient-count descending) — see "Current status" above for the full
+  formula and the two real bugs the real-data check caught along the way.
   `RecipeFilters`/`RecommendedRecipe` live here rather than `models.rs`, same reasoning as
   `Suggestion`/`SuggestionReason` living in `recommend.rs`.
 - `data/themealdb/README.md` — **read before touching `src/themealdb.rs`.** Field-mapping
@@ -111,6 +114,11 @@ writing frontend code — this version has breaking changes vs. older Next.
   change. Verified in-browser with real ranked results and real filter values (not mock
   data) once `recommend_recipes` was implemented — filtering to a cuisine correctly narrows
   the set *and* preserves the missing-ingredient ranking within it.
+- `RecipeCard.tsx` — `"use client"`, holds its own `showInstructions` toggle state per card.
+  `recipe.instructions` renders collapsed behind a "Show instructions" button by default —
+  789 recipes averaging ~840 characters of instructions each is too much to show inline on
+  every card at once. `whitespace-pre-line` preserves the source text's line breaks
+  (paragraphs, numbered steps) without needing to parse or split it.
 
 ## Environment gotchas
 

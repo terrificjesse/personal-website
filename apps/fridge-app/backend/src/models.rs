@@ -137,4 +137,9 @@ pub struct Recipe {
     /// Pantry staples/spices, split out via a keyword list rather than tracked individually.
     pub extra_ingredients: Vec<RecipeIngredient>,
     pub image_url: Option<String>,
+    /// Free-text cooking instructions straight from TheMealDB, trimmed but otherwise
+    /// unprocessed. Quality varies with the source — most are a real paragraph or
+    /// numbered-step list, but a few are as terse as "Make and enjoy" (see
+    /// `data/themealdb/README.md`).
+    pub instructions: String,
 }

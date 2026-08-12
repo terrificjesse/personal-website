@@ -17,6 +17,8 @@ export type Recipe = {
   fridge_ingredients: RecipeIngredient[];
   extra_ingredients: RecipeIngredient[];
   image_url: string | null;
+  /** Free-text, straight from TheMealDB. Quality varies — some are one line. */
+  instructions: string;
 };
 
 export type RecommendedRecipe = {

@@ -125,6 +125,7 @@ mod tests {
             fridge_ingredients: fridge_ingredients.iter().map(|n| ingredient(n)).collect(),
             extra_ingredients: vec![ingredient("Salt")],
             image_url: None,
+            instructions: "Mix and cook.".to_string(),
         }
     }
 

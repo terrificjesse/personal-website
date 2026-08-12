@@ -60,6 +60,12 @@ followed; flagged to the user rather than acted on.
   an inventory app actually tracks) goes to `fridge_ingredients`. Heuristic, not a taxonomy —
   edge cases (e.g. is "butter" a staple or a fridge item?) were judgment calls, adjust the
   keyword list if it misclassifies something that matters.
+- **`instructions`** ← `strInstructions`, trimmed but otherwise passed through unprocessed —
+  no parsing, no step-splitting. All 789 records have a non-empty value (14 to 4,507 chars,
+  median ~840), so this one's a straight pass-through, not a heuristic. Quality is
+  crowd-sourced and uneven: "Bread omelette"'s entire instructions field is `"Make and
+  enjoy"`. Frontend renders it collapsed by default (`RecipeCard.tsx`) for exactly this
+  reason — display space shouldn't assume every recipe earns a full paragraph.
 
 ## Known gaps
 
@@ -67,5 +73,7 @@ followed; flagged to the user rather than acted on.
 - `required_appliances` and the fridge/extra ingredient split are both keyword heuristics
   over free text, not structured data. Good enough for card display and Phase 3 filtering;
   don't build anything downstream that assumes they're exact.
+- `instructions` is raw crowd-sourced text of wildly varying quality/detail — see the
+  "Bread omelette" example above. Don't assume it's step-by-step or even actionable.
 - This is a point-in-time snapshot (2026-08-10). TheMealDB adds recipes over time; re-run
   the same letter-sweep fetch to refresh if the catalog feels stale.
