@@ -143,3 +143,41 @@ pub struct Recipe {
     /// `data/themealdb/README.md`).
     pub instructions: String,
 }
+
+/// One rating a user gave a recipe after cooking it. `recipe_id` is TheMealDB's `idMeal`
+/// (matches `Recipe.id`), not a foreign key — recipes are static reference data, not a DB
+/// table. This is a history, not a single "current" review per recipe: re-cooking and
+/// re-rating the same recipe over time is expected, and `GET /reviews` browses the whole
+/// history rather than one row per recipe.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Review {
+    pub id: String,
+    pub recipe_id: String,
+    /// 1–5. Whether a given rating counts as "liked" for the recommended-again section is
+    /// `LIKED_RATING_THRESHOLD`, not baked into this struct — and whether/how a low rating
+    /// suppresses a recipe elsewhere is `rerank_recommendations`'s job (`src/rerank.rs`).
+    pub rating: i64,
+    pub cooked_at: DateTime<Utc>,
+    pub notes: Option<String>,
+}
+
+/// A rating at or above this counts as "liked" for `GET /recipes/liked` — the plain
+/// membership filter for the "recipes you liked" section (Phase 4). This is a simple
+/// threshold, not the learned part of Phase 4; ordering within the liked set (and any
+/// suppression of disliked recipes) is `rerank_recommendations`'s job.
+pub const LIKED_RATING_THRESHOLD: i64 = 4;
+
+pub const MIN_RATING: i64 = 1;
+pub const MAX_RATING: i64 = 5;
+
+#[derive(Debug, Deserialize)]
+pub struct AddReviewRequest {
+    pub recipe_id: String,
+    pub rating: i64,
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Defaults to submission time when omitted — most reviews are logged right after
+    /// cooking.
+    #[serde(default)]
+    pub cooked_at: Option<DateTime<Utc>>,
+}

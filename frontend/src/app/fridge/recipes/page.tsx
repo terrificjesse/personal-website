@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchRecommendedRecipes, type RecommendedRecipe } from "@/lib/recipesApi";
+import { LikedRecipesSection } from "./LikedRecipesSection";
 import { RecipeCard } from "./RecipeCard";
 import { RecipeFilterBar } from "./RecipeFilterBar";
 
@@ -61,10 +62,19 @@ export default function RecipesPage() {
         <Link href="/fridge/shopping-list" className="underline underline-offset-4">
           Shopping list
         </Link>
+        {" · "}
+        <Link href="/fridge/recipes/reviews" className="underline underline-offset-4">
+          Review history
+        </Link>
         {" · Recommended from what you have."}
       </p>
 
-      <div className="mt-6">
+      <section className="mt-8">
+        <h2 className="text-sm font-semibold opacity-80">Recipes you liked</h2>
+        <LikedRecipesSection />
+      </section>
+
+      <div className="mt-8">
         <RecipeFilterBar
           cuisines={cuisines}
           mealTypes={mealTypes}

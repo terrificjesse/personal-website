@@ -3,40 +3,50 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-## Current status: Phases 1–3 complete
+## Current status: Phases 1–3 complete; Phase 4 scaffolded, `rerank_recommendations` open
 
 Phase 1 (fridge CRUD, NLP item matching, expiration estimates), Phase 2 (shopping list,
 purchase history, purchase-based recommendations), and Phase 3 (recipe recommendations) are
 all done. All four `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`,
 `recommend_recipes.rs` — were implemented by the user, with Claude reviewing rather than
-writing them. `cargo test`: 53 passed, 0 failed, clippy clean. Verified working end-to-end
-in-browser, backend and frontend, including against real fridge/shopping-list/catalog data
-(not just the hand-built test fixtures).
+writing them. Verified end-to-end in-browser against real fridge/shopping-list/catalog data,
+not just hand-built test fixtures.
+
+Phase 4's `[gen]` surface — `Review` data model, `POST /reviews`, `GET /reviews`, `GET
+/recipes/liked`, and the frontend (review form on each recipe card, review history page,
+"Recipes you liked" section) — was scaffolded by Claude and verified end-to-end in-browser:
+submitted a real review through the UI, confirmed it shows up on `GET /reviews`/the review
+history page with the right recipe name/image joined in, and confirmed `GET /recipes/liked`
+correctly identifies the reviewed recipe as liked (rating ≥ `LIKED_RATING_THRESHOLD`) but
+currently returns `[]` because `rerank_recommendations` — the one `[learn]` piece — is still
+the unimplemented stub. `cargo test`: 59 passed, 3 failed, clippy clean; the 3 failures are
+`rerank.rs`'s tests, expected to fail until the user implements it (same situation
+`recommend_recipes.rs`'s tests were in before Phase 3 was implemented).
+
+`GET /recipes/liked`'s split: membership (does this recipe have a review rating ≥
+`LIKED_RATING_THRESHOLD`?) is a plain `[gen]` filter in `routes/recipes.rs::liked`; ordering
+within that liked set is `rerank_recommendations`'s job. Deliberately did *not* wire
+`rerank_recommendations` into `GET /recipes/recommended` (Phase 3's general list) — the user
+only asked for a separate "recipes you liked" section, and doing so would have made an
+already-shipped, already-tested endpoint start returning `[]` the moment the new stub landed.
+Revisit if the user wants disliked recipes suppressed from general recommendations too.
 
 `PATCH /items/:id` was decided against, not deferred — nothing in Phase 1 or 2 ended up
 needing it. Revisit only if a real caller shows up.
 
-`recommend_recipes`'s final formula: hard-filters on cuisine/meal-type, then sorts by a
-3-key tuple — (a) whether `total_ingredient_count < 2` (trivial recipes sort last as a
-group), (b) missing-ingredient count ascending within each group, (c) total-ingredient-count
-descending as a tie-break within *that*. (b)+(c) together are what stop a 1-ingredient
-recipe you happen to have from outranking a real dinner you're almost fully stocked for;
-(a) is what stops a recipe whose every ingredient turned out to be a pantry staple (e.g.
-"Griddled flatbreads" — flour ×2, yeast, sugar, olive oil, `total_ingredient_count == 0`)
-from reading as a trivially "perfect" match. Two real bugs surfaced and got fixed while
-building this — a `bool`'s `Ord` puts `false` before `true` in ascending order, and it's
-easy to write the trivial-recipe key backwards (promoting instead of demoting) without
-noticing, since none of the six hand-built tests mix trivial and non-trivial recipes in the
-same ordering assertion. Both times the bug was invisible to `cargo test` and obvious
-against the real 789-recipe catalog — caught by re-running the real-data check after the
-change, not by the test suite. Data source: TheMealDB, vendored one-time snapshot (789
+`recommend_recipes`'s final formula: hard-filters on cuisine/meal-type, then sorts by
+(trivial-recipe flag, missing-ingredient count ascending, total-ingredient-count descending)
+— trivial recipes (`total_ingredient_count < 2`, e.g. "Griddled flatbreads," whose every
+ingredient turned out to be a pantry staple) sort last as a group; within a group, fewer
+missing ingredients ranks higher, with size as a tie-break so a 1-ingredient match can't
+outrank a near-complete real dinner. Data source: TheMealDB, vendored one-time snapshot (789
 recipes, fetched 2026-08-10) — see `docs/PLAN.md` Phase 3 for why, and
 `data/themealdb/README.md` for field-mapping details.
 
-**Separate observation, not a bug (see `docs/TODO.md`):** exact-name ingredient matching
-means singular/plural mismatches between fridge items and TheMealDB ingredient names
-silently miss — e.g. a fridge item "tomatoes" matches the 21 recipes using `Tomatoes` but
-not the 47 using singular `Tomato`.
+**Known limitations, not bugs (see `docs/TODO.md`):** ingredient matching is exact-name,
+presence-only — no quantity/measure comparison ("2 cups flour" matches on having any flour
+at all) and no singular/plural normalization (a fridge item "tomatoes" won't match a recipe
+listing singular "Tomato").
 
 ## Backend (`apps/fridge-app/backend/`)
 
@@ -83,15 +93,21 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   trimmed and passed through unprocessed — the one field here that's a straight pass-through
   rather than a heuristic, since every one of the 789 records has a real (if occasionally
   one-line) value.
-- `src/recommend_recipes.rs` — **[learn] implemented.** `recommend_recipes` hard-filters on
-  cuisine/meal-type first, then sorts by (trivial-recipe flag, missing-ingredient count
-  ascending, total-ingredient-count descending) — see "Current status" above for the full
-  formula and the two real bugs the real-data check caught along the way.
-  `RecipeFilters`/`RecommendedRecipe` live here rather than `models.rs`, same reasoning as
-  `Suggestion`/`SuggestionReason` living in `recommend.rs`.
+- `src/recommend_recipes.rs` — **[learn] implemented.** See "Current status" above for the
+  ranking formula. `RecipeFilters`/`RecommendedRecipe` live here rather than `models.rs`,
+  same reasoning as `Suggestion`/`SuggestionReason` living in `recommend.rs`.
 - `data/themealdb/README.md` — **read before touching `src/themealdb.rs`.** Field-mapping
   decisions (why `strCountry` not `strArea`, why `cook_time_minutes` is always `None`) and
   the appliance/pantry-staple keyword heuristics, including known false-positive risks.
+- `src/routes/reviews.rs` — `POST /reviews` (insert-only, no merge — re-cooking and
+  re-rating the same recipe is a new row, a history not a current-state table) and `GET
+  /reviews` (joins each row against the in-memory recipe catalog for `recipe_name`/
+  `recipe_image_url` so the frontend doesn't need a second fetch). `fetch_all` is `pub(crate)`
+  and shared with `recipes::liked`, same pattern as `items::fetch_all`.
+- `src/rerank.rs` — **[learn] stub, not yet implemented.** `rerank_recommendations(candidates:
+  &[Recipe], reviews: &[Review]) -> Vec<Recipe>`, placeholder always returns `[]`. Its only
+  caller is `routes/recipes.rs::liked`. See its module doc for the desired behavior and the
+  three tests describing it (liked ranks higher, disliked suppressed, unreviewed unaffected).
 
 ## Frontend (`frontend/src/app/fridge/`)
 
@@ -118,7 +134,25 @@ writing frontend code — this version has breaking changes vs. older Next.
   `recipe.instructions` renders collapsed behind a "Show instructions" button by default —
   789 recipes averaging ~840 characters of instructions each is too much to show inline on
   every card at once. `whitespace-pre-line` preserves the source text's line breaks
-  (paragraphs, numbered steps) without needing to parse or split it.
+  (paragraphs, numbered steps) without needing to parse or split it. Also now holds a "Mark
+  cooked" toggle that reveals `ReviewForm.tsx`; once submitted the card shows a static
+  "Reviewed ★★★★★" line instead (self-contained per-card state, no lifted state — submitting
+  a review doesn't need to affect the rest of the page).
+- `ReviewForm.tsx` — rating `<select>` (1–5, defaults to 5) + optional notes text input,
+  posts straight to `reviewsApi.submitReview`. No `cooked_at` field in the UI — the backend
+  defaults it to submission time; PLAN.md's model has the field for completeness/future
+  backdating, not because the v1 form needs to set it.
+- `LikedRecipesSection.tsx` / `LikedRecipeCard.tsx` — the "Recipes you liked" section on the
+  recipes page, fetching `GET /recipes/liked`. Deliberately a separate, simpler card
+  (`LikedRecipeCard`) rather than reusing `RecipeCard` — the liked endpoint returns bare
+  `Recipe`s with no `matched_ingredient_count`/`total_ingredient_count`, since that's a
+  Phase-3-specific concept `RecipeCard` depends on. Always shows the empty state until
+  `rerank_recommendations` is implemented, even after submitting a qualifying review —
+  verified this in-browser and confirmed it's the stub, not a wiring bug (see "Current
+  status").
+- `recipes/reviews/page.tsx` — review history page (`/fridge/recipes/reviews`), lists every
+  `GET /reviews` row most-recently-cooked-first. Plain read-only list, no edit/delete —
+  PLAN.md's Phase 4 checkpoint only asks that history be "browsable."
 
 ## Environment gotchas
 
@@ -154,14 +188,16 @@ writing frontend code — this version has breaking changes vs. older Next.
 - `data/themealdb/meals.json` is a 2026-08-10 snapshot; TheMealDB adds recipes over time.
   Re-run the letter-sweep fetch (see the README) if the catalog starts feeling stale.
 
-## Working patterns from Phase 1/2 scoring bugs
+## Working patterns from Phase 1–3 scoring bugs
 
-Relevant again for Phase 3's `recommend_recipes` and Phase 4's `rerank_recommendations` —
-both are `[learn]` scoring functions too. In short: enforce numeric invariants by
-construction, name and derive constants instead of repeating magic literals, give any
-continuous score an explicit threshold, don't trust passing tests without checking against
-real data, and check a branch is reachable before writing it. Full detail is in `nlp.rs` /
-`recommend.rs` git history if wanted later.
+Relevant again for Phase 4's `rerank_recommendations` — same category of `[learn]` scoring
+function. Enforce numeric invariants by construction, name and derive constants instead of
+repeating magic literals, give any continuous score an explicit threshold, and check a
+branch is reachable before writing it. Above all: **don't trust a green test suite without
+checking against real data.** Three scoring functions in this project have now shipped
+passing tests while ranking real data wrong (`nlp.rs` once, `recommend_recipes.rs` twice) —
+every one of those bugs was invisible to `cargo test` and obvious the moment the real
+catalog/fridge contents ran through the function. Full detail in git history if wanted.
 
 ## Git / GitHub
 
@@ -170,8 +206,10 @@ Repo root, branch `main`, remote `origin` →
 
 ## Next up
 
-Phases 1–3 are all complete, no open items in `recommend_recipes`. Phase 4 (review system +
-learned re-ranking) is next in `docs/PLAN.md`, but per this repo's phase-discipline rule,
-don't scaffold it until asked. `docs/TODO.md` holds three deferred ideas (out-of-order token
-matching in `nlp.rs`, quantity/measure-aware ingredient matching, singular/plural
-ingredient-name matching); nothing there blocks Phase 4.
+Phase 4's `[gen]` scaffolding is done (see "Current status"). What's left before Phase 4 is
+complete: implement `rerank_recommendations` in `src/rerank.rs` — the sole remaining
+`[learn]` piece — against the three tests already there. Once it's real, worth a real-data
+pass in-browser (submit a few reviews, confirm "Recipes you liked" populates and orders
+sensibly), same "don't trust a green test suite" discipline as the last three scoring
+functions — see "Working patterns" below. `docs/TODO.md` holds three deferred ideas; nothing
+there blocks Phase 4.

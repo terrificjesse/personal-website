@@ -6,6 +6,7 @@ mod nlp;
 mod purchase_history;
 mod recommend;
 mod recommend_recipes;
+mod rerank;
 mod routes;
 mod themealdb;
 

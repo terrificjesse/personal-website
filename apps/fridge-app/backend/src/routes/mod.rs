@@ -1,6 +1,7 @@
 pub mod health;
 pub mod items;
 pub mod recipes;
+pub mod reviews;
 pub mod shopping_list;
 pub mod suggest;
 
@@ -66,6 +67,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/shopping-list/{id}", delete(shopping_list::remove_shopping_list_item))
         .route("/shopping-list/{id}/purchase", post(shopping_list::mark_purchased))
         .route("/recipes/recommended", get(recipes::recommended))
+        // Static segment, same priority reasoning as `/items/suggest` above.
+        .route("/recipes/liked", get(recipes::liked))
+        .route("/reviews", get(reviews::list_reviews).post(reviews::submit_review))
         .with_state(state)
         .layer(cors)
 }

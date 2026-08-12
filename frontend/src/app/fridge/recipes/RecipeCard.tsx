@@ -2,10 +2,13 @@
 
 import { useState } from "react";
 import type { RecommendedRecipe } from "@/lib/recipesApi";
+import { ReviewForm } from "./ReviewForm";
 
 export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) {
   const { recipe, matched_ingredient_count, total_ingredient_count } = recommended;
   const [showInstructions, setShowInstructions] = useState(false);
+  const [showReviewForm, setShowReviewForm] = useState(false);
+  const [submittedRating, setSubmittedRating] = useState<number | null>(null);
 
   return (
     <li className="flex gap-4 rounded border border-black/10 p-4 dark:border-white/10">
@@ -65,6 +68,30 @@ export function RecipeCard({ recommended }: { recommended: RecommendedRecipe }) 
             )}
           </div>
         )}
+
+        <div className="mt-2">
+          {submittedRating !== null ? (
+            <span className="text-xs opacity-60">
+              Reviewed {"★".repeat(submittedRating) + "☆".repeat(5 - submittedRating)}
+            </span>
+          ) : (
+            <button
+              onClick={() => setShowReviewForm((prev) => !prev)}
+              className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+            >
+              {showReviewForm ? "Cancel" : "Mark cooked"}
+            </button>
+          )}
+          {showReviewForm && submittedRating === null && (
+            <ReviewForm
+              recipeId={recipe.id}
+              onSubmitted={(rating) => {
+                setSubmittedRating(rating);
+                setShowReviewForm(false);
+              }}
+            />
+          )}
+        </div>
       </div>
     </li>
   );
