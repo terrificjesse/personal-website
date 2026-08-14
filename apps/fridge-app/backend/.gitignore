@@ -1,4 +1,7 @@
 /target
 *.db
 *.db-journal
+# Manual copies of the database (e.g. fridge.db.pre-phase5-backup) — real user data, and
+# `*.db` alone doesn't match a suffixed filename.
+*.db.*
 .env

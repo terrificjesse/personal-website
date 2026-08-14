@@ -8,6 +8,7 @@ import { fetchShoppingList } from "@/lib/shoppingListApi";
 import { LikedRecipesSection } from "./LikedRecipesSection";
 import { RecipeCard } from "./RecipeCard";
 import { RecipeFilterBar } from "./RecipeFilterBar";
+import { useApiError } from "@/lib/useApiError";
 
 export default function RecipesPage() {
   const [allRecipes, setAllRecipes] = useState<RecommendedRecipe[]>([]);
@@ -17,6 +18,7 @@ export default function RecipesPage() {
   const [mealType, setMealType] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const handleApiError = useApiError();
 
   // Unfiltered fetch, once — used only to populate the filter dropdowns with cuisines and
   // meal types that actually appear in the catalog, rather than a hardcoded list.
@@ -57,9 +59,9 @@ export default function RecipesPage() {
         setRecipes(data);
         setError(null);
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
-        setError("Couldn't reach the fridge API. Is the backend running on :8080?");
+        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -68,7 +70,7 @@ export default function RecipesPage() {
     return () => {
       cancelled = true;
     };
-  }, [cuisine, mealType]);
+  }, [cuisine, mealType, handleApiError]);
 
   const cuisines = [...new Set(allRecipes.flatMap((r) => r.recipe.cuisine_tags))].sort();
   const mealTypes = [...new Set(allRecipes.flatMap((r) => r.recipe.meal_type_tags))].sort();

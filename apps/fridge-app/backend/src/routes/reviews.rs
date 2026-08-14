@@ -11,23 +11,20 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::models::{AddReviewRequest, Review, MAX_NOTES_LENGTH, MAX_RATING, MIN_RATING};
+use crate::routes::auth::CurrentUser;
 use crate::themealdb::Catalog as RecipeCatalog;
 
 const SELECT_COLUMNS: &str = "id, recipe_id, rating, cooked_at, notes, user_id, is_public, hidden";
 
-/// Who is making the current request. Always `None` until Phase 5 introduces sessions —
-/// there are no accounts yet, so there is nobody else to be.
-///
-/// This exists as a named seam rather than a `None` literal sprinkled through the handlers:
-/// every read path already threads its result into the visibility queries and into
-/// `rerank_recommendations`, so Phase 5 replaces the body here (with a real session-user
-/// extractor) and the rest of the review plumbing keeps working unchanged.
-pub(crate) fn current_viewer() -> Option<String> {
-    None
-}
+// Phase 4 left a `current_viewer()` seam here that returned `None` unconditionally. Phase 5
+// replaced it with the `CurrentUser` extractor in `routes/auth.rs`: handlers now receive the
+// session's user directly and pass `user.viewer()` into the same `Option<&str>` parameters
+// that were already threaded through every read path. Nothing below the handler layer
+// changed — see `routes/auth.rs`'s module doc for why that parameter stays an `Option`.
 
 pub async fn submit_review(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<AddReviewRequest>,
 ) -> Result<(StatusCode, Json<Review>), StatusCode> {
     if req.recipe_id.trim().is_empty() || !(MIN_RATING..=MAX_RATING).contains(&req.rating) {
@@ -39,7 +36,9 @@ pub async fn submit_review(
 
     let id = Uuid::new_v4().to_string();
     let cooked_at = req.cooked_at.unwrap_or_else(Utc::now);
-    let user_id = current_viewer();
+    // Always `Some` now: the extractor rejects unauthenticated requests before this runs, so
+    // no review written from here on can be an unclaimed NULL row.
+    let user_id = Some(user.id.clone());
 
     sqlx::query(
         "INSERT INTO reviews (id, recipe_id, rating, cooked_at, notes, user_id, is_public, hidden) \
@@ -70,9 +69,14 @@ pub async fn submit_review(
     Ok((StatusCode::CREATED, Json(review)))
 }
 
-/// Reviews written by `viewer`, most recently cooked first. Pre-Phase-5 (`viewer == None`)
-/// there are no accounts, so this is every non-hidden row — which is still exactly "the
-/// local user's reviews". Backs `GET /reviews` (the review-history page).
+/// Reviews written by `viewer`, most recently cooked first. Backs `GET /reviews` (the
+/// review-history page).
+///
+/// The `viewer == None` branch is the pre-auth semantics: no accounts, so every non-hidden
+/// row is the local user's. No handler reaches it any more — `CurrentUser` guarantees a real
+/// id — but it stays because it's the documented meaning of `None` throughout the review
+/// plumbing (`Review::is_by`), and because a NULL `user_id` in that branch is exactly the
+/// unclaimed pre-Phase-5 row that `claim_unowned_rows` fixes at first registration.
 pub(crate) async fn fetch_for_viewer(
     pool: &SqlitePool,
     viewer: Option<&str>,
@@ -151,9 +155,9 @@ fn with_recipe(catalog: &RecipeCatalog, review: Review) -> ReviewWithRecipe {
 pub async fn list_reviews(
     State(pool): State<SqlitePool>,
     State(catalog): State<Arc<RecipeCatalog>>,
+    user: CurrentUser,
 ) -> Result<Json<Vec<ReviewWithRecipe>>, StatusCode> {
-    let viewer = current_viewer();
-    let reviews = fetch_for_viewer(&pool, viewer.as_deref()).await?;
+    let reviews = fetch_for_viewer(&pool, user.viewer()).await?;
 
     Ok(Json(
         reviews
@@ -167,10 +171,16 @@ pub async fn list_reviews(
 /// reviews, newest first. The read half of the global aggregator.
 ///
 /// Returns only `is_public` rows, so it never leaks a private review even to its own author
-/// — use `GET /reviews` for your own history. Once Phase 5 lands, this is also where a
-/// per-recipe aggregate (count + smoothed mean) would be surfaced; see `docs/PLAN.md`.
+/// — use `GET /reviews` for your own history. This is also where a per-recipe aggregate
+/// (count + smoothed mean) would be surfaced; that's the deferred small-sample-statistics
+/// `[learn]` item in `docs/PLAN.md`.
+///
+/// Requires a session even though every row it returns is public. Nothing here is secret, but
+/// an unauthenticated endpoint on a backend bound to `0.0.0.0` is the exact thing PLAN.md
+/// warned about, and this app has no anonymous-browsing story to justify the exception.
 pub async fn list_recipe_reviews(
     State(pool): State<SqlitePool>,
+    _user: CurrentUser,
     Path(recipe_id): Path<String>,
 ) -> Result<Json<Vec<Review>>, StatusCode> {
     let reviews = sqlx::query_as::<_, Review>(&format!(

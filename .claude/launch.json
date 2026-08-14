@@ -8,6 +8,13 @@
       "cwd": "frontend",
       "port": 3000,
       "autoPort": true
+    },
+    {
+      "name": "fridge-backend",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run"],
+      "cwd": "apps/fridge-app/backend",
+      "port": 8080
     }
   ]
 }

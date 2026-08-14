@@ -192,10 +192,19 @@ Verified against real seeded data (16 reviews across 10 recipes, backdated via
 **Goal:** Password-based accounts, optional Google OAuth. Single user in practice, but
 built for real.
 
-- [gen] Claude can scaffold the *shape* of this: user table/migration, route structure
-  (`/api/auth/register`, `/login`, `/logout`, session/cookie plumbing on the Next.js side,
-  protected-route middleware), and can explain concepts (password hashing algorithms,
-  session vs. JWT tradeoffs, OAuth flow steps) at a conceptual level.
+- [gen] **Done.** Scaffolding built and verified 2026-08-13: migrations `0007` (users,
+  sessions, oauth_identities) and `0008` (per-account `user_id` on fridge/shopping/purchase
+  rows); `POST /auth/register`, `/auth/login`, `/auth/logout`, `GET /auth/me`,
+  `GET /auth/google/start`, `GET /auth/google/callback`; `CurrentUser`/`MaybeUser` extractors;
+  every data query scoped by account; CORS switched off the wildcard so credentialed requests
+  work; and on the Next side `proxy.ts` route protection, login/register pages, `SessionNav`,
+  and a shared `apiFetch` that can't forget `credentials: "include"`.
+
+  Two decisions taken during scaffolding that are worth knowing about:
+  - **Sessions are server-side opaque tokens, not JWTs**, so logout actually revokes rather
+    than asking the browser to forget. The `sessions` row stores a *hash* of the token.
+  - **Route protection is per-handler, via the `CurrentUser` extractor**, not a middleware
+    list — a route's signature is the authority on whether it needs a session.
 - [learn] **The actual auth implementation** — password hashing/verification (e.g. with
   `argon2`), session issuance and validation, and the Google OAuth flow — is flagged as a
   learning area. You implement it; Claude reviews and helps debug rather than writing it
@@ -217,10 +226,15 @@ tombstone), `GET /recipes/{id}/reviews` (public wall for one recipe), visibility
 reads (`fetch_for_viewer` / `fetch_visible_to`), a notes length cap, and a
 `reviews::current_viewer()` seam that returns `None` until sessions exist.
 
-- [gen] Replace `reviews::current_viewer()` with a real session-user extractor, and backfill
-  the NULL `user_id`s with the account created at registration. Every read path already
-  threads the result through, so this should land in one place.
-- [gen] Rate limiting on `POST /reviews`, and a moderation path for setting `hidden`.
+- [gen] **Done.** `reviews::current_viewer()` is replaced by the `CurrentUser` extractor in
+  `routes/auth.rs`; it landed in one place as predicted, with handlers passing `user.viewer()`
+  into the `Option<&str>` parameters that were already threaded through. Backfill is
+  `routes::auth::claim_unowned_rows`, run inside the first registration's transaction across
+  all four owned tables. NULL means *unclaimed*, not public — those rows are invisible to
+  every scoped read until then.
+- [gen] Rate limiting on `POST /reviews`, and a moderation path for setting `hidden`. **Not
+  done** — deliberately left, since neither is needed while the app is single-user behind a
+  login, and both are easier to size once real usage exists.
 - [learn] **Small-sample rating statistics.** Once reviews come from many users, a naive
   mean is badly behaved: one 5★ review must not outrank two hundred averaging 4.6★.
   Deliberately deferred from Phase 4 — with a single user there is no crowd to average, so
@@ -238,17 +252,44 @@ reads (`fetch_for_viewer` / `fetch_visible_to`), a notes length cap, and a
   ("people who liked what you liked also liked X"). This is the condition Phase 4's notes
   set for reaching past simple weighted scoring — don't start here.
 
-**Do not expose the review endpoints publicly before auth lands.** The backend binds
-`0.0.0.0` with no authentication, so until Phase 5 is done a global review wall is an
-unauthenticated, unattributable write endpoint. Fine on a trusted LAN, not fine anywhere else.
+~~**Do not expose the review endpoints publicly before auth lands.**~~ Resolved 2026-08-13:
+every route except `/health` and `/auth/*` now requires a session, the review endpoints
+included. `GET /recipes/{id}/reviews` requires one too even though everything it returns is
+public — nothing there is secret, but an unauthenticated endpoint on a backend bound to
+`0.0.0.0` is exactly what this warning was about, and the app has no anonymous-browsing story
+to justify the exception. `COOKIE_SECURE` still defaults off for plain-HTTP LAN use, so this
+is a trusted network, not the open internet.
 
-### Checkpoint
+### Checkpoint — not yet met; blocked on the `[learn]` bodies
+
 Register an account with a password, log out, log back in; connect Google as an alternate
 login method; confirm fridge/shopping/recipe data is scoped to your account (even though
 you're the only user, verify the scoping actually works — e.g. a fresh second test account
 sees an empty fridge). With two test accounts, confirm a public review written by one is
 visible to the other while a private one is not, and that a recipe only the *other* account
 rated highly never appears in your "Recipes you liked" section.
+
+None of this can run until `src/auth.rs` has real bodies — registration returns 501 and every
+data route 401s against the deny-by-default placeholders. What *has* been verified so far
+(2026-08-13, against the real `fridge.db`, not fixtures):
+
+- All 8 migrations apply cleanly; 16 reviews / 4 fridge items / 1 purchase preserved and
+  correctly unclaimed.
+- Every data route returns 401 unauthenticated — `/items`, `/shopping-list`,
+  `/recipes/liked`, `/reviews`, `/recipes/recommended`, `/items/suggest`,
+  `/shopping-list/suggestions`, `/recipes/{id}/reviews`. `/health` 200, `/auth/me` 200 `null`.
+- Input validation runs *before* the unimplemented hasher (400, not 501), and a valid
+  registration reaches it (501) — so the route is wired end to end.
+- CORS echoes an allowed origin with `allow-credentials: true` and does **not** echo a
+  disallowed one.
+- In-browser: `/fridge` and `/fridge/recipes` redirect to `/login?next=…`; the form's error
+  path surfaces the backend message; no console errors.
+
+**When running the checkpoint, note the first registration is load-bearing** — it claims all
+22 unclaimed rows in one transaction. Good real-data check: the "Recipes you liked" list
+should be identical immediately before and after that first login. If it comes back empty, the
+claim didn't run, because `Review::is_by` deliberately reports a NULL `user_id` as belonging
+to nobody once a viewer exists.
 
 ---
 

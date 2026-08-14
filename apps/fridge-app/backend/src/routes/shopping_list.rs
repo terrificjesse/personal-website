@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::models::{AddItemRequest, AddShoppingListItemRequest, ShoppingListItem, ShoppingListStatus};
 use crate::purchase_history;
 use crate::recommend::{self, Suggestion};
+use crate::routes::auth::CurrentUser;
 use crate::routes::items;
 
 const SELECT_COLUMNS: &str = "id, name, quantity, unit, is_grocery, added_manually, status, \
@@ -17,17 +18,24 @@ const SELECT_COLUMNS: &str = "id, name, quantity, unit, is_grocery, added_manual
 
 pub async fn list_shopping_list(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<ShoppingListItem>>, StatusCode> {
-    Ok(Json(fetch_all(&pool).await?))
+    Ok(Json(fetch_all(&pool, &user.id).await?))
 }
 
-/// All shopping-list rows, most recently added first. Shared by `GET /shopping-list` and
-/// the recipe-recommendation endpoint, which needs current shopping-list contents as input
-/// to `recommend_recipes::recommend_recipes` — same reasoning as `items::fetch_all`.
-pub(crate) async fn fetch_all(pool: &SqlitePool) -> Result<Vec<ShoppingListItem>, StatusCode> {
+/// One account's shopping-list rows, most recently added first. Shared by
+/// `GET /shopping-list` and the recipe-recommendation endpoint, which needs current
+/// shopping-list contents as input to `recommend_recipes::recommend_recipes` — same
+/// reasoning, and same required `user_id`, as `items::fetch_all`.
+pub(crate) async fn fetch_all(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<ShoppingListItem>, StatusCode> {
     sqlx::query_as::<_, ShoppingListItem>(&format!(
-        "SELECT {SELECT_COLUMNS} FROM shopping_list_items ORDER BY added_at DESC"
+        "SELECT {SELECT_COLUMNS} FROM shopping_list_items \
+         WHERE user_id = ? ORDER BY added_at DESC"
     ))
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -41,6 +49,7 @@ struct MergeCandidate {
 
 pub async fn add_shopping_list_item(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<AddShoppingListItemRequest>,
 ) -> Result<(StatusCode, Json<ShoppingListItem>), StatusCode> {
     let name = req.name.trim().to_lowercase();
@@ -52,11 +61,15 @@ pub async fn add_shopping_list_item(
     // (`items::upsert_fridge_item`), just without an expiration tolerance to worry about.
     // A purchased row never absorbs a new add: reviving a "done" row's quantity behind the
     // scenes would be more confusing than just starting a fresh pending row for it.
+    //
+    // Scoped by `user_id` for the same reason `items::upsert_fridge_item`'s merge query is —
+    // merging across accounts would fold one person's row into another's destructively.
     let existing = sqlx::query_as::<_, MergeCandidate>(
         "SELECT id FROM shopping_list_items \
-         WHERE name = ? AND unit = ? AND status = ? \
+         WHERE user_id = ? AND name = ? AND unit = ? AND status = ? \
          ORDER BY added_at ASC LIMIT 1",
     )
+    .bind(&user.id)
     .bind(&name)
     .bind(&req.unit)
     .bind(ShoppingListStatus::Pending)
@@ -96,8 +109,8 @@ pub async fn add_shopping_list_item(
 
     sqlx::query(
         "INSERT INTO shopping_list_items \
-         (id, name, quantity, unit, is_grocery, added_manually, status, foodkeeper_product_id, added_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, quantity, unit, is_grocery, added_manually, status, foodkeeper_product_id, added_at, user_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
@@ -108,6 +121,7 @@ pub async fn add_shopping_list_item(
     .bind(status)
     .bind(req.foodkeeper_product_id)
     .bind(added_at)
+    .bind(&user.id)
     .execute(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -129,10 +143,14 @@ pub async fn add_shopping_list_item(
 
 pub async fn remove_shopping_list_item(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let result = sqlx::query("DELETE FROM shopping_list_items WHERE id = ?")
+    // Ownership in the WHERE clause — see `items::remove_item` for why this is a filter
+    // rather than a check-then-delete.
+    let result = sqlx::query("DELETE FROM shopping_list_items WHERE id = ? AND user_id = ?")
         .bind(&id)
+        .bind(&user.id)
         .execute(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -151,12 +169,16 @@ pub async fn remove_shopping_list_item(
 /// history, per PLAN.md's Phase 2 scope.
 pub async fn mark_purchased(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ShoppingListItem>, StatusCode> {
+    // Scoped, so a row belonging to another account 404s here rather than being marked
+    // purchased *and* folded into this caller's fridge below.
     let item = sqlx::query_as::<_, ShoppingListItem>(&format!(
-        "SELECT {SELECT_COLUMNS} FROM shopping_list_items WHERE id = ?"
+        "SELECT {SELECT_COLUMNS} FROM shopping_list_items WHERE id = ? AND user_id = ?"
     ))
     .bind(&id)
+    .bind(&user.id)
     .fetch_optional(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -169,12 +191,13 @@ pub async fn mark_purchased(
             unit: item.unit.clone(),
             foodkeeper_product_id: item.foodkeeper_product_id,
         };
-        items::upsert_fridge_item(&pool, &add_req).await?;
+        items::upsert_fridge_item(&pool, &user.id, &add_req).await?;
     }
 
-    sqlx::query("UPDATE shopping_list_items SET status = ? WHERE id = ?")
+    sqlx::query("UPDATE shopping_list_items SET status = ? WHERE id = ? AND user_id = ?")
         .bind(ShoppingListStatus::Purchased)
         .bind(&id)
+        .bind(&user.id)
         .execute(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -192,11 +215,12 @@ pub async fn mark_purchased(
 
 pub async fn suggestions(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<Suggestion>>, StatusCode> {
-    let history = purchase_history::list_all(&pool)
+    let history = purchase_history::list_for_user(&pool, &user.id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let fridge = items::fetch_all(&pool).await?;
+    let fridge = items::fetch_all(&pool, &user.id).await?;
 
     Ok(Json(recommend::suggest_shopping_items(&history, &fridge)))
 }

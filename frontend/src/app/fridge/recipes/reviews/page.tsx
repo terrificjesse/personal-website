@@ -3,18 +3,20 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchReviews, type ReviewWithRecipe } from "@/lib/reviewsApi";
+import { useApiError } from "@/lib/useApiError";
 
 export default function ReviewHistoryPage() {
   const [reviews, setReviews] = useState<ReviewWithRecipe[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const handleApiError = useApiError();
 
   useEffect(() => {
     fetchReviews()
       .then(setReviews)
-      .catch(() => setError("Couldn't reach the fridge API. Is the backend running on :8080?"))
+      .catch((err) => setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?")))
       .finally(() => setLoading(false));
-  }, []);
+  }, [handleApiError]);
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">

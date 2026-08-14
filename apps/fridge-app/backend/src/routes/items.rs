@@ -10,6 +10,10 @@ use uuid::Uuid;
 use crate::expiration::estimate_expiration;
 use crate::models::{AddItemRequest, FridgeItem};
 use crate::purchase_history;
+use crate::routes::auth::CurrentUser;
+
+const SELECT_COLUMNS: &str = "id, canonical_name, quantity, unit, added_at, \
+     estimated_expiration, foodkeeper_product_id";
 
 /// How far apart two expiration dates can be and still count as the same batch.
 ///
@@ -20,19 +24,26 @@ const MERGE_EXPIRATION_TOLERANCE_DAYS: i64 = 3;
 
 pub async fn list_items(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<FridgeItem>>, StatusCode> {
-    Ok(Json(fetch_all(&pool).await?))
+    Ok(Json(fetch_all(&pool, &user.id).await?))
 }
 
-/// All fridge items, most recently added first. Shared by `GET /items` and the
+/// One account's fridge items, most recently added first. Shared by `GET /items` and the
 /// shopping-list suggestions endpoint, which needs current fridge contents as input to
 /// `recommend::suggest_shopping_items`.
-pub(crate) async fn fetch_all(pool: &SqlitePool) -> Result<Vec<FridgeItem>, StatusCode> {
-    sqlx::query_as::<_, FridgeItem>(
-        "SELECT id, canonical_name, quantity, unit, added_at, estimated_expiration, \
-         foodkeeper_product_id \
-         FROM fridge_items ORDER BY added_at DESC",
-    )
+///
+/// `user_id` is required rather than optional: an unscoped variant of this function would be
+/// one accidental call away from serving another account's fridge, and there is no caller
+/// that legitimately wants every account's items at once.
+pub(crate) async fn fetch_all(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<FridgeItem>, StatusCode> {
+    sqlx::query_as::<_, FridgeItem>(&format!(
+        "SELECT {SELECT_COLUMNS} FROM fridge_items WHERE user_id = ? ORDER BY added_at DESC"
+    ))
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -40,9 +51,10 @@ pub(crate) async fn fetch_all(pool: &SqlitePool) -> Result<Vec<FridgeItem>, Stat
 
 pub async fn add_item(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Json(req): Json<AddItemRequest>,
 ) -> Result<(StatusCode, Json<FridgeItem>), StatusCode> {
-    let (status, item) = upsert_fridge_item(&pool, &req).await?;
+    let (status, item) = upsert_fridge_item(&pool, &user.id, &req).await?;
     Ok((status, Json(item)))
 }
 
@@ -54,6 +66,7 @@ pub async fn add_item(
 /// produced it, never twice.
 pub(crate) async fn upsert_fridge_item(
     pool: &SqlitePool,
+    user_id: &str,
     req: &AddItemRequest,
 ) -> Result<(StatusCode, FridgeItem), StatusCode> {
     // Name resolution happens before the request gets here: the user picks from the
@@ -70,10 +83,15 @@ pub(crate) async fn upsert_fridge_item(
     // Same name and unit only makes a row *eligible* to merge — the expiration still has to
     // line up, or adding fresh milk would silently join a carton that's about to turn.
     // Units must match too: 2 count + 1 litre is not 3 of anything.
+    //
+    // The `user_id` filter is not optional here: without it one account's milk would merge
+    // into another's, which is a data leak dressed up as a quantity update — and unlike a
+    // read leak it would be destructive, since the two rows become one.
     let existing = sqlx::query_as::<_, MergeCandidate>(
         "SELECT id, estimated_expiration FROM fridge_items \
-         WHERE canonical_name = ? AND unit = ?",
+         WHERE user_id = ? AND canonical_name = ? AND unit = ?",
     )
+    .bind(user_id)
     .bind(&canonical_name)
     .bind(&req.unit)
     .fetch_all(pool)
@@ -82,7 +100,7 @@ pub(crate) async fn upsert_fridge_item(
 
     if let Some(target) = find_merge_target(&existing, estimated_expiration) {
         let result = merge_into_existing(pool, target, req, estimated_expiration).await?;
-        purchase_history::record(pool, &canonical_name, req.quantity, added_at)
+        purchase_history::record(pool, user_id, &canonical_name, req.quantity, added_at)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok(result);
@@ -91,8 +109,8 @@ pub(crate) async fn upsert_fridge_item(
     let id = Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO fridge_items (id, canonical_name, quantity, unit, added_at, estimated_expiration, foodkeeper_product_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO fridge_items (id, canonical_name, quantity, unit, added_at, estimated_expiration, foodkeeper_product_id, user_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&canonical_name)
@@ -101,11 +119,12 @@ pub(crate) async fn upsert_fridge_item(
     .bind(added_at)
     .bind(estimated_expiration)
     .bind(req.foodkeeper_product_id)
+    .bind(user_id)
     .execute(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    purchase_history::record(pool, &canonical_name, req.quantity, added_at)
+    purchase_history::record(pool, user_id, &canonical_name, req.quantity, added_at)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -154,6 +173,9 @@ fn find_merge_target(
 }
 
 /// Folds the new quantity into an existing row and returns the updated item.
+///
+/// No `user_id` filter needed: `target` can only have come from the ownership-scoped query in
+/// `upsert_fridge_item`, so the id is already known to belong to the caller.
 async fn merge_into_existing(
     pool: &SqlitePool,
     target: &MergeCandidate,
@@ -184,11 +206,9 @@ async fn merge_into_existing(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let item = sqlx::query_as::<_, FridgeItem>(
-        "SELECT id, canonical_name, quantity, unit, added_at, estimated_expiration, \
-         foodkeeper_product_id \
-         FROM fridge_items WHERE id = ?",
-    )
+    let item = sqlx::query_as::<_, FridgeItem>(&format!(
+        "SELECT {SELECT_COLUMNS} FROM fridge_items WHERE id = ?"
+    ))
     .bind(&target.id)
     .fetch_one(pool)
     .await
@@ -200,10 +220,17 @@ async fn merge_into_existing(
 
 pub async fn remove_item(
     State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let result = sqlx::query("DELETE FROM fridge_items WHERE id = ?")
+    // `user_id` in the WHERE clause, not a check-then-delete: ids come straight from the URL,
+    // so without it any signed-in account could delete any row whose id it can name. Folding
+    // ownership into the statement also makes "not yours" and "doesn't exist" the same
+    // outcome — a 404 either way, which is the right answer, since confirming that an id
+    // exists but belongs to someone else is itself a small leak.
+    let result = sqlx::query("DELETE FROM fridge_items WHERE id = ? AND user_id = ?")
         .bind(&id)
+        .bind(&user.id)
         .execute(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

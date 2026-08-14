@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_FRIDGE_API_URL ?? "http://127.0.0.1:8080";
+import { apiFetch } from "./apiClient";
 
 export type FridgeItem = {
   id: string;
@@ -38,7 +38,7 @@ export async function fetchSuggestions(
   const params = new URLSearchParams({ q: query });
   if (opts.limit !== undefined) params.set("limit", String(opts.limit));
 
-  const res = await fetch(`${API_BASE}/items/suggest?${params}`, {
+  const res = await apiFetch(`/items/suggest?${params}`, {
     cache: "no-store",
     signal: opts.signal,
   });
@@ -47,13 +47,13 @@ export async function fetchSuggestions(
 }
 
 export async function fetchItems(): Promise<FridgeItem[]> {
-  const res = await fetch(`${API_BASE}/items`, { cache: "no-store" });
+  const res = await apiFetch(`/items`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to fetch items: ${res.status}`);
   return res.json();
 }
 
 export async function addItem(input: AddItemInput): Promise<FridgeItem> {
-  const res = await fetch(`${API_BASE}/items`, {
+  const res = await apiFetch(`/items`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
@@ -63,6 +63,6 @@ export async function addItem(input: AddItemInput): Promise<FridgeItem> {
 }
 
 export async function removeItem(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/items/${id}`, { method: "DELETE" });
+  const res = await apiFetch(`/items/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`Failed to remove item: ${res.status}`);
 }

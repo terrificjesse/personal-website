@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 
 use crate::foodkeeper::Catalog;
 use crate::nlp::{Candidate, Suggestion, SuggestionSource, suggest_item_names};
+use crate::routes::auth::CurrentUser;
 
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 25;
@@ -28,12 +29,13 @@ pub struct SuggestQuery {
 pub async fn suggest_items(
     State(pool): State<SqlitePool>,
     State(catalog): State<Arc<Catalog>>,
+    CurrentUser(user): CurrentUser,
     Query(params): Query<SuggestQuery>,
 ) -> Result<Json<Vec<Suggestion>>, StatusCode> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let query = params.q.trim();
 
-    let fridge_names = fetch_fridge_names(&pool).await?;
+    let fridge_names = fetch_fridge_names(&pool, &user.id).await?;
 
     if query.is_empty() {
         // Empty-query state: most recently added items. Most fridge additions are repeats,
@@ -104,16 +106,24 @@ pub async fn suggest_items(
     Ok(Json(suggest_item_names(query, &candidates, limit)))
 }
 
-/// Distinct fridge item names, most recently added first, each carrying the FoodKeeper id
-/// it was last added with (if any).
-async fn fetch_fridge_names(pool: &SqlitePool) -> Result<Vec<(String, Option<i64>)>, StatusCode> {
+/// One account's distinct fridge item names, most recently added first, each carrying the
+/// FoodKeeper id it was last added with (if any).
+///
+/// The scoping is what keeps the typeahead from being a read oracle over other accounts'
+/// fridges — the dropdown would happily surface another user's item names, which is a leak
+/// even though nothing about it looks like one.
+async fn fetch_fridge_names(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<(String, Option<i64>)>, StatusCode> {
     // SQLite guarantees that with a bare MAX() aggregate, the non-aggregated columns come
     // from the row that produced the maximum — so this yields each name's newest row.
     // `added_at` is stored as RFC 3339 TEXT, which sorts correctly lexicographically.
     let rows = sqlx::query_as::<_, (String, Option<i64>, String)>(
         "SELECT canonical_name, foodkeeper_product_id, MAX(added_at) AS latest \
-         FROM fridge_items GROUP BY canonical_name ORDER BY latest DESC",
+         FROM fridge_items WHERE user_id = ? GROUP BY canonical_name ORDER BY latest DESC",
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

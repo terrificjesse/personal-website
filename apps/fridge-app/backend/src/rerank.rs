@@ -392,6 +392,17 @@ mod tests {
         }
     }
 
+    /// A public review by somebody else. `fetch_visible_to` puts these in the same slice as
+    /// the viewer's own (that's the point of the slice), so anything here has to be told
+    /// apart with `Review::is_by` rather than by where it came from.
+    fn review_by_stranger(recipe_id: &str, rating: i64, days_ago: i64) -> Review {
+        Review {
+            user_id: Some("someone-else".to_string()),
+            is_public: true,
+            ..review_at(recipe_id, rating, days_ago)
+        }
+    }
+
     fn position_of(results: &[RankedRecipe], id: &str) -> Option<usize> {
         results.iter().position(|r| r.recipe.id == id)
     }
@@ -596,5 +607,110 @@ mod tests {
     #[test]
     fn no_candidates_means_no_results() {
         assert_eq!(rerank_recommendations(&[], &[], None), Vec::new());
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Viewer scoping. Added in Phase 5 — these fail against the Phase 4 implementation,
+    // which takes `_viewer` in both `score_recipe` and `is_favorite_eligible` and ignores it
+    // in each. Every test above this point builds reviews with `review_at`, which hardcodes
+    // `user_id: Some(VIEWER)`, so none of them can tell a scoped implementation from an
+    // unscoped one — the fixture, not the assertion, is what let this through.
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_strangers_rave_does_not_lift_a_recipe_in_your_ranking() {
+        // "mine" has one recent 4★ from the viewer. "theirs" has a weak 4★ of the viewer's
+        // own plus a stranger's glowing, very recent 5★ — enough to overtake "mine" if the
+        // crowd's reviews are pooled into the base score.
+        //
+        // Note this is about the *current* model, not a permanent ban on crowd signal:
+        // PLAN.md's Phase 5 explicitly wants a global term in here eventually. What it must
+        // not be is an accident. When you add deliberate weighting, revisit this test and
+        // decide what it should say then — but a stranger silently outranking your own
+        // history is not that feature.
+        let candidates = vec![recipe("theirs"), recipe("mine")];
+        let reviews = vec![
+            review_at("theirs", 4, 300),
+            review_by_stranger("theirs", 5, 1),
+            review_at("mine", 4, 30),
+        ];
+
+        let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
+
+        assert_ranks_above(&results, "mine", "theirs");
+    }
+
+    #[test]
+    fn a_strangers_high_ratings_do_not_make_a_recipe_your_favorite() {
+        // The quality gate reads an unweighted mean, so an unscoped `is_favorite_eligible`
+        // averages strangers in. Here the viewer's own opinion of "borrowed" is a flat 3★
+        // (mean 3.0, well under FAVORITE_MIN_MEAN_RATING); pooling three strangers' 5★s
+        // pulls the mean to 4.5 and it clears the gate on other people's say-so.
+        //
+        // The fixture has to clear two hurdles before it tests anything, and getting either
+        // wrong makes this pass vacuously — which the first draft of it did:
+        //
+        // 1. **"borrowed" must rank at or below FAVORITE_SLOTS[0]**, or the rank gate rejects
+        //    it and the quality gate is never consulted. Its 5★s are therefore ancient: decay
+        //    drives their base-score contribution to roughly zero even when pooled, while the
+        //    eligibility mean is deliberately *not* decayed and stays at 4.5. Age is the only
+        //    lever that separates the two gates like this.
+        // 2. **No other candidate may be eligible**, or the random selection among eligible
+        //    recipes might simply not pick "borrowed" and the assertion would hold by luck.
+        //    So `own0..own9` each carry a 4★ and a 3★: mean 3.5, under the gate, while their
+        //    max-based base score still sits well above "borrowed".
+        let mut candidates: Vec<Recipe> = (0..10).map(|i| recipe(&format!("own{i}"))).collect();
+        candidates.push(recipe("borrowed"));
+
+        let mut reviews = Vec::new();
+        for i in 0..10 {
+            let days_ago = i as i64 + 1;
+            reviews.push(review_at(&format!("own{i}"), 4, days_ago));
+            reviews.push(review_at(&format!("own{i}"), 3, days_ago));
+        }
+        reviews.push(review_at("borrowed", 3, 200));
+        for days_ago in [3000, 3001, 3002] {
+            reviews.push(review_by_stranger("borrowed", 5, days_ago));
+        }
+
+        let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
+
+        let borrowed = results
+            .iter()
+            .find(|ranked| ranked.recipe.id == "borrowed")
+            .expect("borrowed must still appear — this function never drops");
+
+        assert_ne!(
+            borrowed.reason,
+            RankReason::Favorite,
+            "you rate this 3★; other people's 5★s must not make it one of *your* favorites"
+        );
+    }
+
+    #[test]
+    fn a_recipe_only_strangers_have_reviewed_still_ranks() {
+        // The empty-after-filter case, which scoping makes reachable for the first time.
+        // Membership (`liked_recipe_ids`) means a real candidate always has at least one
+        // review of the viewer's own, but this function must not depend on a guarantee made
+        // in another file — the permutation contract is unconditional.
+        //
+        // Worth writing because the obvious implementation of the quality gate divides by
+        // the review count, and an empty slice makes that `0.0 / 0.0` — NaN, which compares
+        // false against everything and is only accidentally the right answer.
+        // The stranger's rating is deliberately *higher* than the viewer's own. Equal ratings
+        // would leave the two recipes on near-identical scores under an unscoped
+        // implementation, and which one sorted first would come down to microseconds of
+        // difference in fixture construction time — a coin flip, not a result.
+        let candidates = vec![recipe("mine"), recipe("only_theirs")];
+        let reviews = vec![
+            review_at("mine", 4, 10),
+            review_by_stranger("only_theirs", 5, 10),
+        ];
+
+        let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
+
+        assert_eq!(results.len(), 2, "must not drop a candidate it has no opinion on");
+        assert!(position_of(&results, "only_theirs").is_some());
+        assert_ranks_above(&results, "mine", "only_theirs");
     }
 }

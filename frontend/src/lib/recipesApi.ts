@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_FRIDGE_API_URL ?? "http://127.0.0.1:8080";
+import { apiFetch } from "./apiClient";
 
 export type RecipeIngredient = {
   name: string;
@@ -43,7 +43,7 @@ export async function fetchRecommendedRecipes(query: RecipeQuery = {}): Promise<
   if (query.mealType) params.set("mealType", query.mealType);
 
   const search = params.toString();
-  const res = await fetch(`${API_BASE}/recipes/recommended${search ? `?${search}` : ""}`, {
+  const res = await apiFetch(`/recipes/recommended${search ? `?${search}` : ""}`, {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`Failed to fetch recommended recipes: ${res.status}`);

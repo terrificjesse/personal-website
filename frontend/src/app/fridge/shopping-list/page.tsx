@@ -14,6 +14,7 @@ import {
 } from "@/lib/shoppingListApi";
 import { AddShoppingItemForm } from "./AddShoppingItemForm";
 import { SuggestedItemsPanel } from "./SuggestedItemsPanel";
+import { useApiError } from "@/lib/useApiError";
 
 export default function ShoppingListPage() {
   const [items, setItems] = useState<ShoppingListItem[]>([]);
@@ -21,6 +22,7 @@ export default function ShoppingListPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const handleApiError = useApiError();
 
   useEffect(() => {
     let cancelled = false;
@@ -32,9 +34,9 @@ export default function ShoppingListPage() {
         setSuggestions(suggestionData);
         setError(null);
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
-        setError("Couldn't reach the fridge API. Is the backend running on :8080?");
+        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -43,7 +45,7 @@ export default function ShoppingListPage() {
     return () => {
       cancelled = true;
     };
-  }, [reloadKey]);
+  }, [reloadKey, handleApiError]);
 
   async function handleAdd(input: AddShoppingListItemInput) {
     await addShoppingListItem(input);

@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 use crate::models::{Recipe, Review, LIKED_RATING_THRESHOLD, SUPPRESSED_RATING_THRESHOLD};
 use crate::recommend_recipes::{self, RecipeFilters, RecommendedRecipe};
 use crate::rerank::{self, RankedRecipe};
+use crate::routes::auth::CurrentUser;
 use crate::routes::{items, reviews, shopping_list};
 use crate::themealdb::Catalog;
 
@@ -65,14 +66,14 @@ fn liked_recipe_ids<'a>(reviews: &'a [Review], viewer: Option<&str>) -> HashSet<
 pub async fn recommended(
     State(pool): State<SqlitePool>,
     State(catalog): State<Arc<Catalog>>,
+    user: CurrentUser,
     Query(filters): Query<RecipeFilters>,
 ) -> Result<Json<Vec<RecommendedRecipe>>, StatusCode> {
-    let fridge = items::fetch_all(&pool).await?;
-    let shopping_list = shopping_list::fetch_all(&pool).await?;
+    let fridge = items::fetch_all(&pool, &user.0.id).await?;
+    let shopping_list = shopping_list::fetch_all(&pool, &user.0.id).await?;
 
-    let viewer = reviews::current_viewer();
-    let own_reviews = reviews::fetch_for_viewer(&pool, viewer.as_deref()).await?;
-    let suppressed = suppressed_recipe_ids(&own_reviews, viewer.as_deref());
+    let own_reviews = reviews::fetch_for_viewer(&pool, user.viewer()).await?;
+    let suppressed = suppressed_recipe_ids(&own_reviews, user.viewer());
 
     let mut recommended = recommend_recipes::recommend_recipes(
         catalog.recipes(),
@@ -99,10 +100,10 @@ pub async fn recommended(
 pub async fn liked(
     State(pool): State<SqlitePool>,
     State(catalog): State<Arc<Catalog>>,
+    user: CurrentUser,
 ) -> Result<Json<Vec<RankedRecipe>>, StatusCode> {
-    let viewer = reviews::current_viewer();
-    let visible_reviews = reviews::fetch_visible_to(&pool, viewer.as_deref()).await?;
-    let liked = liked_recipe_ids(&visible_reviews, viewer.as_deref());
+    let visible_reviews = reviews::fetch_visible_to(&pool, user.viewer()).await?;
+    let liked = liked_recipe_ids(&visible_reviews, user.viewer());
 
     let candidates: Vec<Recipe> = catalog
         .recipes()
@@ -114,7 +115,7 @@ pub async fn liked(
     Ok(Json(rerank::rerank_recommendations(
         &candidates,
         &visible_reviews,
-        viewer.as_deref(),
+        user.viewer(),
     )))
 }
 

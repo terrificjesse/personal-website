@@ -6,12 +6,14 @@ import { addItem, fetchItems, removeItem, type AddItemInput, type FridgeItem } f
 import { AddItemForm } from "./AddItemForm";
 import { ExpirationBadge } from "./ExpirationBadge";
 import { GroceryListPopup } from "./GroceryListPopup";
+import { useApiError } from "@/lib/useApiError";
 
 export default function FridgePage() {
   const [items, setItems] = useState<FridgeItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const handleApiError = useApiError();
 
   useEffect(() => {
     let cancelled = false;
@@ -22,9 +24,9 @@ export default function FridgePage() {
         setItems(data);
         setError(null);
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
-        setError("Couldn't reach the fridge API. Is the backend running on :8080?");
+        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -33,7 +35,7 @@ export default function FridgePage() {
     return () => {
       cancelled = true;
     };
-  }, [reloadKey]);
+  }, [reloadKey, handleApiError]);
 
   async function handleAdd(input: AddItemInput) {
     await addItem(input);

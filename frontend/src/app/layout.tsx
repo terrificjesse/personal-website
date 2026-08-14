@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
+import { SessionNav } from "./SessionNav";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -41,6 +42,7 @@ export default function RootLayout({
                 {tab.label}
               </Link>
             ))}
+            <SessionNav />
           </nav>
         </header>
         <main className="flex-1">{children}</main>

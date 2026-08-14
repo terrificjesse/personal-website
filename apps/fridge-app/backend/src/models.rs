@@ -186,6 +186,78 @@ impl Review {
     }
 }
 
+/// An account. Added in Phase 5; see `migrations/0007_create_users_and_sessions.sql`.
+///
+/// `password_hash` is `Option` because an account created through Google has no password
+/// until one is set. That `None` must read as "password login is unavailable for this
+/// account", never as "no password required" — `routes::auth::login` maps it to the same
+/// `InvalidCredentials` as a wrong password.
+///
+/// The hash never leaves the backend: `Serialize` is deliberately *not* derived here, so a
+/// handler can't return a `User` by accident. `AuthenticatedUser` in `routes/auth.rs` is the
+/// serializable public view.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct User {
+    pub id: String,
+    /// Stored lowercased and trimmed — `normalize_email` is the single place that decides
+    /// what "the same email" means, so registration and login can't disagree about it.
+    pub email: String,
+    pub password_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Normalizes an email for storage and lookup: trimmed and lowercased.
+///
+/// Both registration and login run addresses through this, so `Jesse@Example.com` and
+/// `jesse@example.com` are one account rather than two. Deliberately *not* doing anything
+/// cleverer (stripping `+tags`, collapsing gmail's dots): those rules differ per provider,
+/// and guessing wrong silently merges accounts that should be distinct.
+pub fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// One live session. The token itself is never stored — `token_hash` is what a lookup
+/// compares against. See `auth::validate_session`.
+// Scaffolding: nothing constructs this until `issue_session`/`validate_session` have bodies.
+// Delete the attribute once they do.
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Session {
+    pub id: String,
+    pub user_id: String,
+    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// An external identity (Google today) linked to a local account.
+// Scaffolding: `routes::auth` writes this table with plain SQL today and never reads a row
+// back into this struct. It exists so a future "which providers are linked?" query has a
+// type to land in. Delete the attribute — or the struct — once you know which.
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OAuthIdentity {
+    pub id: String,
+    pub user_id: String,
+    pub provider: String,
+    /// The provider's stable id — Google's `sub`, not the email. See
+    /// `migrations/0007_create_users_and_sessions.sql`.
+    pub provider_account_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
 /// A rating at or above this counts as "liked" for `GET /recipes/liked` — the plain
 /// membership filter for the "recipes you liked" section (Phase 4). This is a simple
 /// threshold, not the learned part of Phase 4; ordering *within* the liked set is

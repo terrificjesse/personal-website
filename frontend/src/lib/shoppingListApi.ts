@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_FRIDGE_API_URL ?? "http://127.0.0.1:8080";
+import { apiFetch } from "./apiClient";
 
 export type ShoppingListStatus = "pending" | "purchased";
 
@@ -33,7 +33,7 @@ export type ShoppingSuggestion = {
 };
 
 export async function fetchShoppingList(): Promise<ShoppingListItem[]> {
-  const res = await fetch(`${API_BASE}/shopping-list`, { cache: "no-store" });
+  const res = await apiFetch(`/shopping-list`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to fetch shopping list: ${res.status}`);
   return res.json();
 }
@@ -41,7 +41,7 @@ export async function fetchShoppingList(): Promise<ShoppingListItem[]> {
 export async function addShoppingListItem(
   input: AddShoppingListItemInput,
 ): Promise<ShoppingListItem> {
-  const res = await fetch(`${API_BASE}/shopping-list`, {
+  const res = await apiFetch(`/shopping-list`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
@@ -51,7 +51,7 @@ export async function addShoppingListItem(
 }
 
 export async function removeShoppingListItem(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/shopping-list/${id}`, { method: "DELETE" });
+  const res = await apiFetch(`/shopping-list/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`Failed to remove shopping list item: ${res.status}`);
 }
 
@@ -60,14 +60,14 @@ export async function removeShoppingListItem(id: string): Promise<void> {
  * (same insert/merge path as adding directly), so it can show up there immediately.
  */
 export async function markPurchased(id: string): Promise<ShoppingListItem> {
-  const res = await fetch(`${API_BASE}/shopping-list/${id}/purchase`, { method: "POST" });
+  const res = await apiFetch(`/shopping-list/${id}/purchase`, { method: "POST" });
   if (!res.ok) throw new Error(`Failed to mark item purchased: ${res.status}`);
   return res.json();
 }
 
 /** Always returns [] until `suggest_shopping_items` is implemented (see backend CLAUDE.md). */
 export async function fetchShoppingSuggestions(): Promise<ShoppingSuggestion[]> {
-  const res = await fetch(`${API_BASE}/shopping-list/suggestions`, { cache: "no-store" });
+  const res = await apiFetch(`/shopping-list/suggestions`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to fetch suggestions: ${res.status}`);
   return res.json();
 }

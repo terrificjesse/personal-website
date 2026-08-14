@@ -1,6 +1,5 @@
 import type { Recipe } from "./recipesApi";
-
-const API_BASE = process.env.NEXT_PUBLIC_FRIDGE_API_URL ?? "http://127.0.0.1:8080";
+import { apiFetch } from "./apiClient";
 
 export type Review = {
   id: string;
@@ -34,7 +33,7 @@ export type SubmitReviewInput = {
 export const MAX_NOTES_LENGTH = 2000;
 
 export async function submitReview(input: SubmitReviewInput): Promise<Review> {
-  const res = await fetch(`${API_BASE}/reviews`, {
+  const res = await apiFetch(`/reviews`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
@@ -45,7 +44,7 @@ export async function submitReview(input: SubmitReviewInput): Promise<Review> {
 
 /** Full review history, most recently cooked first. */
 export async function fetchReviews(): Promise<ReviewWithRecipe[]> {
-  const res = await fetch(`${API_BASE}/reviews`, { cache: "no-store" });
+  const res = await apiFetch(`/reviews`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to fetch reviews: ${res.status}`);
   return res.json();
 }
@@ -76,7 +75,7 @@ export type RankedRecipe = {
  * rating can influence the *order* here but can never add a recipe to the list.
  */
 export async function fetchLikedRecipes(): Promise<RankedRecipe[]> {
-  const res = await fetch(`${API_BASE}/recipes/liked`, { cache: "no-store" });
+  const res = await apiFetch(`/recipes/liked`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to fetch liked recipes: ${res.status}`);
   return res.json();
 }
@@ -88,7 +87,7 @@ export async function fetchLikedRecipes(): Promise<RankedRecipe[]> {
  * reviews you marked public yourself.
  */
 export async function fetchRecipeReviews(recipeId: string): Promise<Review[]> {
-  const res = await fetch(`${API_BASE}/recipes/${encodeURIComponent(recipeId)}/reviews`, {
+  const res = await apiFetch(`/recipes/${encodeURIComponent(recipeId)}/reviews`, {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`Failed to fetch recipe reviews: ${res.status}`);
