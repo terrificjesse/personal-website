@@ -208,6 +208,22 @@ pub const SUPPRESSED_RATING_THRESHOLD: i64 = 2;
 pub const MIN_RATING: i64 = 1;
 pub const MAX_RATING: i64 = 5;
 
+/// The midpoint of the rating scale — "fine, neither good nor bad."
+///
+/// Derived rather than written as `3.0` so it stays correct if the scale ever changes. Used
+/// by `rerank.rs` to re-center ratings before applying recency decay: on the raw 1–5 scale a
+/// decayed rating shrinks toward `0`, which is *below* the scale entirely, making "old" and
+/// "hated" indistinguishable. Centered, it shrinks toward "no signal," which is the honest
+/// reading of an old review.
+///
+/// This is the scale's midpoint, not necessarily the right center for every model — centering
+/// on the user's own mean rating is a defensible alternative if most of their ratings cluster
+/// high.
+// Remove this attribute once `rerank.rs` uses the constant — same scaffolding note as the
+// `FAVORITE_*` constants there.
+#[allow(dead_code)]
+pub const NEUTRAL_RATING: f64 = (MIN_RATING + MAX_RATING) as f64 / 2.0;
+
 /// Cap on `Review.notes`. Nothing enforced this before; once reviews are world-readable an
 /// unbounded free-text field reachable by `POST` is a liability, so the limit lands with the
 /// schema rather than after it.

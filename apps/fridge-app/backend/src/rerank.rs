@@ -10,36 +10,48 @@
 //! output must be a permutation of the input (`every_candidate_appears_exactly_once` pins
 //! this down).
 //!
-//! ## Throwbacks
+//! ## Favorites
 //!
 //! Two jobs, deliberately kept apart rather than folded into one score: the base ranking
-//! answers *"what am I into lately"* (recency-weighted), and throwbacks answer *"what did I
-//! genuinely love and forget about"* (time-independent). An aggressive half-life is what
-//! makes the base ranking feel current, and it's also what buries old favourites — so rather
-//! than compromising the decay constant, eligible old favourites are **moved** into
-//! `THROWBACK_SLOTS` and labelled `RankReason::Throwback`.
+//! answers *"what am I into lately"* (recency-weighted), and favorites answer *"what do I
+//! reliably rate highly"* (time-independent). Highly-rated recipes are **moved** into
+//! `FAVORITE_SLOTS` and labelled `RankReason::Favorite`, so the section cycles through your
+//! best recipes instead of showing the same recency-ordered list every time.
 //!
-//! Eligibility needs *both* gates. `THROWBACK_MIN_MEAN_RATING` is the quality half;
-//! `THROWBACK_MIN_AGE_DAYS` is what makes it a throwback rather than just a good recipe.
-//! Without the age gate your current favourites get labelled nostalgia.
+//! This started life as a "throwback" mechanism gated on *age* — surfacing old favourites the
+//! decay had buried. That gate was dropped (2026-08-13): recent recipes are welcome here too,
+//! the goal being rotation rather than nostalgia. The name changed with it, since an amber
+//! "Throwback" badge on something cooked last week is simply false.
 //!
-//! Moved, never copied — a recipe must not appear twice, once ranked and once as a throwback.
+//! ### Eligibility still needs two gates
+//!
+//! `FAVORITE_MIN_MEAN_RATING` is the quality half — an unweighted mean, deliberately
+//! time-independent, computed in `is_favorite_eligible`.
+//!
+//! The second gate is **rank**, and it cannot live in `is_favorite_eligible` — that function
+//! only sees one recipe's reviews and knows nothing about position. It belongs in
+//! `rerank_recommendations`, after the base sort: a recipe already ranked above
+//! `FAVORITE_SLOTS[0]` must not be selected, because "moving" it into a slot would push it
+//! *down*. Without this, the mechanism can take your top result, demote it three places, and
+//! badge it — the age gate used to make that impossible for free, since old favourites always
+//! sat near the bottom.
+//!
+//! Moved, never copied — a recipe must not appear twice, once ranked and once as a favorite.
 //! That's the same class of bug the liked/suppressed split had (see
 //! `routes/recipes.rs::liked_recipe_ids`).
 //!
 //! ### On randomness
 //!
-//! Picking randomly among eligible throwbacks is intended, but `thread_rng` inside this
-//! function would make the page reshuffle on every reload and leave the behavior untestable.
-//! Seed it instead — deriving a seed from the current *date* gives throwbacks that rotate
-//! daily, stay put within a session, and can be pinned to a fixed value in tests. Hashing
-//! `(recipe_id, seed)` and taking the lowest hashes is a perfectly good selection without
-//! pulling in the `rand` crate; ask before adding a dependency (root `CLAUDE.md`).
+//! Picking randomly among eligible favorites is intended, but an unseeded generator
+//! (`rand::rng()`) reshuffles the list on every page load and leaves the behavior untestable
+//! — you can never reproduce a ranking you're trying to debug. Seed it instead:
+//! `StdRng::seed_from_u64(..)` with a seed derived from the current *date* gives favorites
+//! that rotate daily, stay put within a session, and can be pinned to a fixed value in tests.
 //!
-//! Note that `THROWBACK_SLOTS` starts at index 3, so nothing is injected into lists shorter
+//! Note that `FAVORITE_SLOTS` starts at index 3, so nothing is injected into lists shorter
 //! than four — which is why none of the small-fixture ordering tests below are disturbed by
-//! this feature. `throwbacks_land_only_in_their_slots_and_only_when_eligible` is the one that
-//! exercises it, with ten candidates.
+//! this feature. `favorites_land_only_in_their_slots_and_only_when_eligible` is the one that
+//! exercises it, with eleven candidates.
 //!
 //! Suppressing badly-rated recipes is deliberately **not** this function's job — it happens
 //! on the general-recommendations path instead (`SUPPRESSED_RATING_THRESHOLD`, applied in
@@ -95,9 +107,13 @@
 //! `recommend_recipes.rs` — this is the fourth scoring function here, so treat a green
 //! `cargo test` as necessary, not sufficient.
 
+use rand::seq::IndexedRandom;
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::models::{Recipe, Review};
+use crate::models::{NEUTRAL_RATING, Recipe, Review};
 
 /// Why a recipe is sitting where it is in the ranking. Lives here rather than `models.rs`
 /// for the same reason `RecipeFilters` lives in `recommend_recipes.rs` — it describes this
@@ -112,10 +128,10 @@ use crate::models::{Recipe, Review};
 pub enum RankReason {
     /// Ranked normally, by recency-weighted rating.
     Liked,
-    /// Injected at one of `THROWBACK_SLOTS` — an old favourite the decay would otherwise
+    /// Injected at one of `FAVORITE_SLOTS` — an old favourite the decay would otherwise
     /// have buried. The frontend badges these; without the label an old recipe near the top
     /// just looks like the ranking is broken.
-    Throwback,
+    Favorite,
 }
 
 /// A ranked recipe plus why it's there, so the frontend can explain the placement without
@@ -126,25 +142,41 @@ pub struct RankedRecipe {
     pub reason: RankReason,
 }
 
-/// Positions throwbacks are injected at, as 0-based indices into the final list.
+/// Positions favorites are injected at, as 0-based indices into the final list.
 ///
 /// Fixed slots rather than a ratio: predictable placement means a user learns where to look,
 /// and it keeps the interleaving trivially debuggable. Slots beyond the end of a short list
-/// are simply skipped — with only two or three liked recipes there's nothing to throw back to.
-#[allow(dead_code)]
-pub const THROWBACK_SLOTS: [usize; 3] = [3, 5, 7];
-
-/// Minimum mean rating for a recipe to be eligible as a throwback.
+/// are simply skipped — with only two or three liked recipes there's nothing to rotate.
 ///
-/// Quality gate only — pair it with `THROWBACK_MIN_AGE_DAYS`, or "throwback" degenerates into
-/// "good recipe" and your current favourites get labelled as nostalgia.
+/// `FAVORITE_SLOTS[0]` doubles as the rank gate: a recipe already ranked above it is
+/// ineligible, since moving it into a slot would demote it. Derive that bound from here
+/// rather than repeating `3`.
 #[allow(dead_code)]
-pub const THROWBACK_MIN_MEAN_RATING: f64 = 4.0;
+pub const FAVORITE_SLOTS: [usize; 3] = [3, 5, 7];
 
-/// How long since the last cook before a recipe counts as a throwback. This is the gate that
-/// makes the concept mean anything — tune it against how often you actually cook.
+/// Minimum mean rating (inclusive) for a recipe to be eligible as a favorite.
+///
+/// Unweighted mean, on purpose — see the module doc. Inclusive matters: ratings are integers,
+/// so a recipe you've only ever given 4★ has a mean of exactly 4.0, and a `>` comparison would
+/// silently exclude a large share of what this is meant to surface.
+///
+/// Quality gate only. The rank gate that stops this from demoting your top results lives in
+/// `rerank_recommendations`, since eligibility by position can't be judged from one recipe's
+/// reviews alone.
 #[allow(dead_code)]
-pub const THROWBACK_MIN_AGE_DAYS: f64 = 90.0;
+pub const FAVORITE_MIN_MEAN_RATING: f64 = 4.0;
+
+/// Days until a review counts half as much in the **base** ranking.
+///
+/// Only affects `score_recipe` — never favorite eligibility, which is deliberately
+/// time-independent.
+///
+/// Checked against all four ordering tests at 60, 120 and 180: none of them pin this down, so
+/// it's a free parameter to tune by feel. Shorter makes the list feel current at the cost of
+/// forgetting quickly (at 60 a 5★ is worth 0.07 after a year); longer keeps favourites alive
+/// (at 120 that same review is still 0.62 after six months).
+#[allow(dead_code)]
+pub const DECAY_HALFLIFE: f64 = 120.0;
 
 /// Reorders `candidates` — all of which the viewer has already rated highly — using
 /// `reviews`, the full visible review history, and labels each result with why it landed
@@ -154,14 +186,172 @@ pub const THROWBACK_MIN_AGE_DAYS: f64 = 90.0;
 /// `Review::is_by` to separate your own feedback from the crowd's.
 ///
 /// Returns a permutation of `candidates`: reorder and label freely, but never add or drop —
-/// throwbacks are *moved* to their slots, not duplicated, so a recipe never appears twice.
+/// favorites are *moved* to their slots, not duplicated, so a recipe never appears twice.
 /// This function's body is what you implement.
 pub fn rerank_recommendations(
-    _candidates: &[Recipe],
-    _reviews: &[Review],
-    _viewer: Option<&str>,
+    candidates: &[Recipe],
+    reviews: &[Review],
+    viewer: Option<&str>,
 ) -> Vec<RankedRecipe> {
-    Vec::new()
+    let mut map: HashMap<&str, Vec<&Review>> = HashMap::new();
+    for review in reviews {
+        map.entry(review.recipe_id.as_str())
+            .or_default()
+            .push(review);
+    }
+
+    let now = Utc::now();
+
+    // (score, recipe, favorite-eligible). Eligibility rides along through the sort because
+    // the rank gate below can only be applied once positions are known.
+    //
+    // A candidate with no reviews scores 0.0 rather than being skipped — membership makes
+    // that impossible today, but dropping it would violate the permutation contract.
+    let mut scored: Vec<(f64, Recipe, bool)> = candidates
+        .iter()
+        .map(|candidate| {
+            let own = map
+                .get(candidate.id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (
+                score_recipe(own, viewer, now),
+                candidate.clone(),
+                is_favorite_eligible(own, viewer),
+            )
+        })
+        .collect();
+
+    scored.sort_by(|(a, _, _), (b, _, _)| b.total_cmp(a));
+
+    // The rank gate. Only recipes already sitting at or below the first slot may be promoted
+    // — pulling something from above it into a slot would push it *down* the list.
+    let promotable: Vec<usize> = scored
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, _, eligible))| *eligible && *index >= FAVORITE_SLOTS[0])
+        .map(|(index, _)| index)
+        .collect();
+
+    // Only select as many favorites as can actually be *placed*. A chosen favorite is removed
+    // from the ranking before being re-inserted, so one that can't reach its slot isn't merely
+    // left alone — it's lost, and the permutation contract breaks. With `n` candidates and `k`
+    // removed, slot `j` is reachable only if `FAVORITE_SLOTS[j] < n - k + j`; rearranged below
+    // to keep the usize arithmetic from underflowing.
+    //
+    // Concretely: 8 candidates can hold two favorites, not three — the third would need a
+    // list of at least 9 to reach index 7.
+    let capacity = (0..=FAVORITE_SLOTS.len().min(promotable.len()))
+        .rev()
+        .find(|&k| {
+            FAVORITE_SLOTS
+                .iter()
+                .take(k)
+                .enumerate()
+                .all(|(j, &slot)| slot + k < scored.len() + j)
+        })
+        .unwrap_or(0);
+
+    // Sample indices, not recipes: the chosen ones have to be removed from the ranking
+    // before they can be re-inserted at their slots, or they'd appear twice.
+    let mut chosen: Vec<usize> = promotable
+        .sample(&mut rand::rng(), capacity)
+        .copied()
+        .collect();
+
+    // Remove highest index first so the lower ones stay valid; that yields worst-ranked
+    // first, so reverse to put the best-ranked favorite in the earliest slot.
+    chosen.sort_unstable_by(|a, b| b.cmp(a));
+    let mut favorites: Vec<Recipe> = chosen.iter().map(|&index| scored.remove(index).1).collect();
+    favorites.reverse();
+
+    let ranked: Vec<Recipe> = scored.into_iter().map(|(_, recipe, _)| recipe).collect();
+    interleave_favorites(ranked, favorites)
+}
+
+/// Base score for one recipe, from its own review history. Higher sorts first.
+///
+/// `reviews` is just that recipe's reviews — group before calling. Scope to the viewer's own
+/// with `Review::is_by` (a no-op today, correct once accounts exist).
+///
+/// This is where `DECAY_HALFLIFE` and `NEUTRAL_RATING` belong. See the module doc's table for
+/// which combinations the tests eliminate — the non-obvious one is that normalizing by total
+/// weight cancels a lone review's recency.
+///
+/// `now` is passed in rather than read from the clock so that every recipe in a single
+/// ranking pass is measured against the same instant, and so tests can pin it.
+#[allow(dead_code)]
+fn score_recipe(reviews: &[&Review], _viewer: Option<&str>, now: DateTime<Utc>) -> f64 {
+    reviews.iter().fold(0.0, |acc, review| {
+        let age_days = ((now - review.cooked_at).as_seconds_f64()
+            / Duration::days(1).as_seconds_f64())
+        .max(0.0);
+        let weight = 0.5_f64.powf(age_days / DECAY_HALFLIFE);
+        let contribution = (review.rating as f64 - NEUTRAL_RATING) * weight;
+        f64::max(acc, contribution)
+    })
+}
+
+/// The **quality** gate: is this recipe's unweighted mean rating at or above
+/// `FAVORITE_MIN_MEAN_RATING`?
+///
+/// This is only half of eligibility. The **rank** gate — don't select something already
+/// ranked above `FAVORITE_SLOTS[0]`, or the "move" demotes it — lives in
+/// `rerank_recommendations`, because position isn't knowable from one recipe's reviews.
+///
+/// `reviews` is just that recipe's reviews, scoped to the viewer with `Review::is_by` — once
+/// accounts exist, a stranger's 5★ must not make something *your* favorite.
+///
+/// **Do not apply decay to the mean here.** The base score is recency-weighted precisely so
+/// the list feels current; this gate is what lets a recipe surface regardless of when you last
+/// cooked it. Weight this mean by recency too and it collapses back into the base ranking,
+/// selecting the same recipes that were already on top.
+///
+/// Takes no `now` for that reason — nothing here is time-dependent.
+#[allow(dead_code)]
+fn is_favorite_eligible(reviews: &[&Review], _viewer: Option<&str>) -> bool {
+    let sum = reviews.iter().fold(0.0, |acc, r| acc + r.rating as f64);
+    sum / reviews.len() as f64 >= FAVORITE_MIN_MEAN_RATING
+}
+
+/// Merges the chosen favorites into the base ordering, labelling each entry.
+///
+/// `ranked` must **already exclude** everything in `favorites` — that's what enforces
+/// "moved, never copied," and it's why the partition happens in the caller rather than here.
+/// The result is a permutation of their concatenation: same length, nothing added or dropped
+/// (`every_candidate_appears_exactly_once`).
+///
+/// Slots past the end of a short list are skipped rather than clamped — appending a favorite
+/// to a 3-item list would put it last, which is the opposite of surfacing it.
+#[allow(dead_code)]
+fn interleave_favorites(ranked: Vec<Recipe>, favorites: Vec<Recipe>) -> Vec<RankedRecipe> {
+    let mut result: Vec<RankedRecipe> = ranked
+        .into_iter()
+        .map(|recipe| RankedRecipe {
+            recipe,
+            reason: RankReason::Liked,
+        })
+        .collect();
+
+    // `favorites` arrives already chosen and already removed from `ranked` — selection has to
+    // happen upstream, since only the sampled ones may be taken out of the ranking.
+    for (&slot, favorite) in FAVORITE_SLOTS.iter().zip(favorites) {
+        // Strictly less than: inserting at exactly `len` appends, which buries the favorite
+        // at the bottom instead of surfacing it. Slots ascend, so once one doesn't fit,
+        // neither will the rest.
+        if slot >= result.len() {
+            break;
+        }
+        result.insert(
+            slot,
+            RankedRecipe {
+                recipe: favorite,
+                reason: RankReason::Favorite,
+            },
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -298,7 +488,11 @@ mod tests {
 
         let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
 
-        assert_eq!(results.len(), candidates.len(), "must not add or drop candidates");
+        assert_eq!(
+            results.len(),
+            candidates.len(),
+            "must not add or drop candidates"
+        );
         for candidate in &candidates {
             assert!(
                 position_of(&results, &candidate.id).is_some(),
@@ -331,48 +525,71 @@ mod tests {
     }
 
     #[test]
-    fn throwbacks_land_only_in_their_slots_and_only_when_eligible() {
-        // Ten candidates, so `THROWBACK_SLOTS` (3, 5, 7) actually exist — every other test
-        // here uses two or three, which is why none of them are affected by throwbacks.
+    fn favorites_land_only_in_their_slots_and_only_when_eligible() {
+        // Eleven candidates, so `FAVORITE_SLOTS` (3, 5, 7) actually exist — every other test
+        // here uses two or three, which is why none of them are affected by favorites.
         //
-        // Deliberately structural rather than naming which recipe should be thrown back:
-        // you've chosen to pick randomly among eligible recipes, so asserting a specific
-        // winner would either over-specify the selection or turn flaky. These two invariants
-        // hold whatever selection strategy you land on.
-        let candidates: Vec<Recipe> = (0..10).map(|i| recipe(&format!("r{i}"))).collect();
+        // Deliberately structural rather than naming which recipe should be promoted: you pick
+        // randomly among eligible recipes, so asserting a specific winner would either
+        // over-specify the selection or turn flaky. These invariants hold whatever selection
+        // strategy you land on.
+        //
+        // Fixture, by base score (max centered decayed contribution) descending:
+        //   top0..top4   4★ cooked 1..5 days ago      mean 4.0  -> highest scores, indices 0-4
+        //   low_mean     5★ 300d + two 3★ 5d          mean 3.67 -> middling score
+        //   old0..old4   two 5★, 400d and 430d        mean 5.0  -> lowest scores
+        // Distinct ages within each group so the ordering is deterministic rather than
+        // relying on a stable sort over equal scores.
+        let mut candidates: Vec<Recipe> = (0..5).map(|i| recipe(&format!("top{i}"))).collect();
+        candidates.push(recipe("low_mean"));
+        candidates.extend((0..5).map(|i| recipe(&format!("old{i}"))));
 
-        // Half recent and merely good, half old and loved — so there's something to pick
-        // from and something that must never be picked.
         let mut reviews = Vec::new();
         for i in 0..5 {
-            reviews.push(review_at(&format!("r{i}"), 4, 5));
+            reviews.push(review_at(&format!("top{i}"), 4, i as i64 + 1));
         }
-        for i in 5..10 {
-            reviews.push(review_at(&format!("r{i}"), 5, 400));
-            reviews.push(review_at(&format!("r{i}"), 5, 430));
+        reviews.push(review_at("low_mean", 5, 300));
+        reviews.push(review_at("low_mean", 3, 5));
+        reviews.push(review_at("low_mean", 3, 5));
+        for i in 0..5 {
+            reviews.push(review_at(&format!("old{i}"), 5, 400));
+            reviews.push(review_at(&format!("old{i}"), 5, 430));
         }
 
         let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
 
         // Without this the test passes vacuously against an empty result — there'd be no
-        // throwbacks to find, and the invariants below would check nothing.
+        // favorites to find, and the invariants below would check nothing.
         assert_eq!(results.len(), candidates.len());
 
         for (index, ranked) in results.iter().enumerate() {
-            if ranked.reason == RankReason::Throwback {
-                assert!(
-                    THROWBACK_SLOTS.contains(&index),
-                    "{} was labelled a throwback at index {index}, which is not a throwback slot",
-                    ranked.recipe.id
-                );
-                // Only the r5..r9 group clears both gates (mean 5.0, last cooked 400 days
-                // ago); r0..r4 were cooked this week.
-                assert!(
-                    ranked.recipe.id.trim_start_matches('r').parse::<u32>().unwrap() >= 5,
-                    "{} is recent and shouldn't be eligible as a throwback",
-                    ranked.recipe.id
-                );
+            if ranked.reason != RankReason::Favorite {
+                continue;
             }
+
+            assert!(
+                FAVORITE_SLOTS.contains(&index),
+                "{} was labelled a favorite at index {index}, which is not a favorite slot",
+                ranked.recipe.id
+            );
+
+            // Quality gate: mean 3.67 is below FAVORITE_MIN_MEAN_RATING. Note this recipe
+            // still *has* a 5★ review — it's a legitimate candidate, it just isn't a
+            // favorite, which is exactly the case a max-based base score can't distinguish.
+            assert_ne!(
+                ranked.recipe.id, "low_mean",
+                "low_mean averages 3.67 and shouldn't clear the quality gate"
+            );
+
+            // Rank gate: top0..top2 would sit above the first slot on base score alone, so
+            // "promoting" them into a slot would actually push them *down* the list. The old
+            // age gate used to make this impossible for free; with it gone, position has to
+            // be checked explicitly (see the module doc).
+            assert!(
+                !matches!(ranked.recipe.id.as_str(), "top0" | "top1" | "top2"),
+                "{} already ranks above the first favorite slot — moving it there is a demotion",
+                ranked.recipe.id
+            );
         }
     }
 

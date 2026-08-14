@@ -3,31 +3,36 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-## Current status: Phases 1–3 complete; Phase 4 scaffolded, `rerank_recommendations` open
+## Current status: Phases 1–4 complete
 
-Phase 1 (fridge CRUD, NLP item matching, expiration estimates), Phase 2 (shopping list,
-purchase history, purchase-based recommendations), and Phase 3 (recipe recommendations) are
-all done. All four `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`,
-`recommend_recipes.rs` — were implemented by the user, with Claude reviewing rather than
-writing them. Verified end-to-end in-browser against real fridge/shopping-list/catalog data,
-not just hand-built test fixtures.
+Phases 1–4 are all done. All five `[learn]` pieces — `nlp.rs`, `expiration.rs`,
+`recommend.rs`, `recommend_recipes.rs`, `rerank.rs` — were implemented by the user, with
+Claude reviewing rather than writing them. `cargo test`: **75 passed, 0 failed**, clippy clean.
 
-Phase 4's `[gen]` surface — `Review` data model, `POST /reviews`, `GET /reviews`, `GET
-/recipes/liked`, and the frontend (review form on each recipe card, review history page,
-"Recipes you liked" section) — was scaffolded by Claude and verified end-to-end in-browser:
-submitted a real review through the UI, confirmed it shows up on `GET /reviews`/the review
-history page with the right recipe name/image joined in, and confirmed `GET /recipes/liked`
-correctly identifies the reviewed recipe as liked (rating ≥ `LIKED_RATING_THRESHOLD`) but
-currently returns `[]` because `rerank_recommendations` — the one `[learn]` piece — is still
-the unimplemented stub. `cargo test`: 68 passed, 6 failed, clippy clean; the 6 failures are
-`rerank.rs`'s tests, expected to fail until the user implements it (same situation
-`recommend_recipes.rs`'s tests were in before Phase 3 was implemented). Suppression on the
-general path was verified against the real catalog, not just fixtures: rating a recipe 1★
-drops it from `GET /recipes/recommended` (789 → 788) while preserving Phase 3's ingredient
-ordering, 3★ leaves it in place, and 2★ removes it — the threshold behaves exactly at its
-boundary. The liked-set half of the disjointness fix is covered by unit tests rather than
-end-to-end, since the `rerank` stub returns `[]` and masks any membership change at the
-endpoint; re-check it in-browser once the function is real.
+Phase 4's `[gen]` surface (`Review` model, `POST`/`GET /reviews`, `GET /recipes/liked`, `GET
+/recipes/{id}/reviews`, review form, review-history page, "Recipes you liked" section with
+the Favorite badge) was scaffolded by Claude; `rerank_recommendations` and its two helpers
+are the user's.
+
+**`rerank_recommendations`'s final model:** score each recipe as the **max** over its reviews
+of `(rating - NEUTRAL_RATING) × 0.5^(age_days / DECAY_HALFLIFE)`, sort descending, then move
+up to three eligible recipes into `FAVORITE_SLOTS`. Centering before decaying is what stops
+an old rave from reading as a bad review (on the raw scale a decayed rating shrinks toward 0,
+*below* the scale); max rather than sum is what makes one 5★ beat three 4★s, per the user's
+stated preference. `DECAY_HALFLIFE = 120.0`, chosen by the user; verified none of the four
+ordering tests pin it (60/120/180 all pass), so it's free to tune.
+
+**Verified against real data, not just fixtures** (seeded via `POST /reviews` with backdated
+`cooked_at` — 16 reviews across 10 recipes, still in `fridge.db`):
+
+- The base ranking reproduced the model's predicted order **exactly** across all 8 liked
+  recipes.
+- Suppression: 789 → 787 on `GET /recipes/recommended`; a 5★-then-1★ recipe is correctly
+  absent from *both* the general list and the liked list (the disjointness rule, which had
+  only been unit-tested while the stub masked it).
+- Favorites rotate between requests, always land at slots 3 and 5, and `n == unique == 8`
+  every time.
+- In-browser: 8 cards, amber "Favorite" badge on exactly indices 3 and 5, no console errors.
 
 ### How the three review-driven behaviors are split across the code
 
@@ -41,7 +46,7 @@ Four of its six tests described inputs the live caller could never produce. The 
 | Membership — is this "liked"? | `routes/recipes.rs::liked_recipe_ids`, `LIKED_RATING_THRESHOLD` | `[gen]` threshold |
 | Suppression — drop the disliked | `routes/recipes.rs::suppressed_recipe_ids`, `SUPPRESSED_RATING_THRESHOLD` (≤2, no decay) | `[gen]` filter |
 | Ordering within the liked set | `rerank_recommendations` | **`[learn]`** |
-| Throwback selection + interleaving | `rerank_recommendations` | **`[learn]`** |
+| Favorite selection + interleaving | `rerank_recommendations` | **`[learn]`** |
 
 **Suppression takes precedence over liking, and the two sets are disjoint by construction.**
 `liked_recipe_ids` subtracts `suppressed_recipe_ids`. This is not cosmetic: under the
@@ -66,38 +71,59 @@ mediocre 3★ alongside its qualifying 5★, and mixed history is a real case ra
 hypothetical. (Anything ≤2★ can *not* reach it, since that suppresses the recipe outright —
 which is why `rerank.rs`'s mixed-history test uses a 3★.)
 
-### Throwbacks (user's design, 2026-08-12)
+### Favorites — was "throwbacks" until 2026-08-13
 
-An aggressive half-life makes the base ranking feel current but buries old favourites, which
-works against PLAN.md's stated goal of liked recipes *resurfacing*. Rather than compromising
-the decay constant to serve both goals badly, the user's design keeps a short half-life and
-adds a **separate mechanism**: eligible old favourites are moved into fixed slots and
-labelled, so the ranking answers "what am I into lately" while the throwbacks answer "what
-did I love and forget."
+Recency decay makes the base ranking feel current but also flattens it into the same order
+every visit. The user's design adds a **separate mechanism**: highly-rated recipes are moved
+into fixed slots and badged, so the section cycles through your best recipes rather than
+replaying one recency-sorted list.
 
-Scaffolded (`[gen]`, done): `RankedRecipe { recipe, reason }` + `RankReason::{Liked,
-Throwback}` in `rerank.rs`, the `liked` handler's return type, the frontend badge, and three
-constants — `THROWBACK_SLOTS = [3, 5, 7]` (0-based), `THROWBACK_MIN_MEAN_RATING = 4.0`,
-`THROWBACK_MIN_AGE_DAYS = 90.0`. All carry `#[allow(dead_code)]` until the body uses them;
-those attributes are meant to be deleted as each is consumed.
+**Renamed from "throwback."** The original design gated eligibility on *age* — rescuing old
+favourites the decay had buried. The user dropped that gate on 2026-08-13: recent recipes are
+welcome too, the goal being rotation, not nostalgia. The name went with it, because an amber
+"Throwback" badge on something cooked last week is simply false. `RankReason::Favorite`,
+`FAVORITE_*`, `is_favorite_eligible`, `interleave_favorites`, badge text "Favorite."
 
-Selection and interleaving are the user's (`[learn]`). Three things settled while designing it:
+`RankedRecipe { recipe, reason }` + `RankReason::{Liked, Favorite}` live in `rerank.rs`, with
+`FAVORITE_SLOTS = [3, 5, 7]` (0-based) and `FAVORITE_MIN_MEAN_RATING = 4.0`.
+(`FAVORITE_MIN_AGE_DAYS` existed briefly and was deleted with the age gate.) The user added
+`rand = "0.10.2"` for selection and uses `IndexedRandom::sample`, which draws *without*
+replacement — the right primitive, since `choose` in a loop would put the same recipe in
+several slots.
 
-- **Both gates are required.** Mean rating alone makes "throwback" mean "good recipe," and
-  current favourites get badged as nostalgia. The age gate is what makes the concept real.
-- **Move, never copy.** A throwback must not also appear at its natural rank — same
+How it works, and the constraints that shaped it:
+
+- **Two gates, but only one of them lives in `is_favorite_eligible`.** That function does the
+  quality half (unweighted mean ≥ `FAVORITE_MIN_MEAN_RATING`, *inclusive* — ratings are
+  integers, so a strict `>` silently excludes every recipe rated exactly 4★). The other half
+  is a **rank gate** and cannot live there, since one recipe's reviews say nothing about its
+  position: a recipe already ranked above `FAVORITE_SLOTS[0]` must not be selected, because
+  "moving" it into a slot pushes it *down*. The old age gate made that impossible for free —
+  old favourites always sat near the bottom — so dropping it created the need for an explicit
+  positional check in `rerank_recommendations`.
+- **Don't decay the eligibility mean.** It's deliberately time-independent; weight it by
+  recency and it collapses into the base ranking, selecting whatever was already on top.
+- **Move, never copy.** A favorite must not also appear at its natural rank — same
   duplicate-membership bug class as liked/suppressed.
-- **Randomness needs a seed.** The user wants random selection among eligible recipes;
-  `thread_rng` would reshuffle the list on every page load and make the behavior untestable.
-  Seeding from the current date gives daily rotation, session stability, and pinnable tests.
-  Hashing `(recipe_id, seed)` from `std` avoids adding the `rand` crate — **ask before adding
-  it.**
+- **Selection must be capped at what can be *placed*, not at `FAVORITE_SLOTS.len()`.** This
+  is the subtle one, and it cost a real bug (see "Working patterns"). A chosen favorite is
+  *removed* from the ranking before being re-inserted, so a slot that doesn't fit doesn't
+  leave the recipe alone — it loses it. With `n` candidates and `k` chosen, slot `j` is
+  reachable only if `FAVORITE_SLOTS[j] < n - k + j`; `rerank_recommendations` searches
+  downward from `min(3, promotable)` for the largest workable `k`. Concretely, **8 candidates
+  hold two favorites, not three** — the third would need a list of 9 to reach index 7.
+- **Randomness is currently unseeded** (`rand::rng()`). It works, and the rotation is visible
+  between requests, but the list reshuffles on every page load and a surprising ranking can't
+  be reproduced while debugging. `StdRng::seed_from_u64` with a date-derived seed would give
+  daily rotation, session stability, and pinnable tests. Left as the user's call.
 
-Why the existing small ordering tests are unaffected: `THROWBACK_SLOTS` starts at index 3, so
-nothing is injected into lists shorter than four, and every other fixture has two or three
-candidates. `throwbacks_land_only_in_their_slots_and_only_when_eligible` uses ten. It asserts
-structural invariants (throwbacks only at slot indices; only eligible recipes labelled)
-rather than naming a winner, since random selection makes any specific outcome flaky.
+Why the small ordering tests are unaffected: `FAVORITE_SLOTS` starts at index 3, so nothing is
+injected into lists shorter than four, and every other fixture has two or three candidates.
+`favorites_land_only_in_their_slots_and_only_when_eligible` uses eleven, with distinct ages so
+the base order is deterministic rather than relying on stable-sort tie behaviour. It asserts
+structural invariants — favorites only at slot indices, a below-threshold recipe never
+labelled, and the top-three never promoted (the rank gate) — rather than naming a winner,
+since random selection makes any specific outcome flaky.
 
 ### The multi-review model is deliberate — do not "simplify" it
 
@@ -226,22 +252,28 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   `fetch_visible_to` (own + everyone's public, feeds `rerank_recommendations`); picking the
   wrong one is how a stranger's review would leak into a personal view. `current_viewer()` is
   the Phase 5 auth seam — see "Current status".
-- `src/rerank.rs` — **[learn] stub, not yet implemented.** `rerank_recommendations(candidates:
-  &[Recipe], reviews: &[Review], viewer: Option<&str>) -> Vec<Recipe>`, placeholder always
-  returns `[]`. Its only caller is `routes/recipes.rs::liked`. Orders, never drops. The
-  `viewer` param exists so the body can tell personal from global feedback via
-  `Review::is_by`; see the module doc for why those must not be pooled into one average.
+- `src/rerank.rs` — **[learn] implemented.** `rerank_recommendations(candidates: &[Recipe],
+  reviews: &[Review], viewer: Option<&str>) -> Vec<RankedRecipe>`, plus helpers `score_recipe`,
+  `is_favorite_eligible`, `interleave_favorites`. Its only caller is
+  `routes/recipes.rs::liked`. **Orders and labels, never drops** — the output is a permutation
+  of the input. See "Current status" for the scoring model and the Favorites section for the
+  slot mechanics.
+
   Seven tests, all describing inputs the live caller can actually produce. The four ordering
   tests were **checked against the candidate models rather than assumed** — they eliminate
   sum, mean, max, recency-weighted sum, *and* recency-weighted mean, while at least two
-  distinct models satisfy all four, so the spec is constraining without forcing one answer.
-  The non-obvious exclusion is recency-weighted **mean**: normalizing by total weight cancels
-  a lone review's weight, so it ties a 5★ from last week against one from a year ago and
-  fails `more_recent_review_breaks_a_rating_tie`. (An earlier version of this file wrongly
+  distinct models satisfy all four, so the spec constrains without forcing one answer. The
+  non-obvious exclusion is recency-weighted **mean**: normalizing by total weight cancels a
+  lone review's weight, so it ties a 5★ from last week against one from a year ago and fails
+  `more_recent_review_breaks_a_rating_tie`. (An earlier version of this file wrongly
   recommended exactly that model — the table in `rerank.rs`'s module doc is the corrected
   reference.) `a_single_five_star_outranks_a_repeatedly_cooked_four_star` encodes the user's
   explicit preference (2026-08-12) for peak quality over cooking frequency; it's marked
   in-comment as an *option*, safe to invert.
+
+  `favorites_land_only_in_their_slots_and_only_when_eligible` uses 11 candidates and does
+  **not** exercise the slot-capacity boundary — see "Working patterns" for the bug that hid
+  behind exactly that gap.
 
 ## Frontend (`frontend/src/app/fridge/`)
 
@@ -282,11 +314,9 @@ writing frontend code — this version has breaking changes vs. older Next.
   recipes page, fetching `GET /recipes/liked` (now `RankedRecipe[]`). Deliberately a separate,
   simpler card rather than reusing `RecipeCard` — the liked endpoint carries no
   `matched_ingredient_count`/`total_ingredient_count`, since that's a Phase-3-specific concept
-  `RecipeCard` depends on. `reason === "throwback"` renders an amber badge beside the title;
-  verified in both light and dark mode against mock data, since the live endpoint returns `[]`
-  until `rerank_recommendations` exists. Always shows the empty state until then, even after
-  submitting a qualifying review — confirmed in-browser that this is the stub, not a wiring
-  bug (see "Current status").
+  `RecipeCard` depends on. `reason === "favorite"` renders an amber badge beside the title,
+  verified in both light and dark mode. Confirmed in-browser against the real seeded fixture:
+  8 cards, badge on exactly indices 3 and 5, no console errors.
 - `recipes/reviews/page.tsx` — review history page (`/fridge/recipes/reviews`), lists every
   `GET /reviews` row most-recently-cooked-first. Plain read-only list, no edit/delete —
   PLAN.md's Phase 4 checkpoint only asks that history be "browsable."
@@ -325,16 +355,30 @@ writing frontend code — this version has breaking changes vs. older Next.
 - `data/themealdb/meals.json` is a 2026-08-10 snapshot; TheMealDB adds recipes over time.
   Re-run the letter-sweep fetch (see the README) if the catalog starts feeling stale.
 
-## Working patterns from Phase 1–3 scoring bugs
+## Working patterns from Phase 1–4 scoring bugs
 
-Relevant again for Phase 4's `rerank_recommendations` — same category of `[learn]` scoring
-function. Enforce numeric invariants by construction, name and derive constants instead of
-repeating magic literals, give any continuous score an explicit threshold, and check a
-branch is reachable before writing it. Above all: **don't trust a green test suite without
-checking against real data.** Three scoring functions in this project have now shipped
-passing tests while ranking real data wrong (`nlp.rs` once, `recommend_recipes.rs` twice) —
-every one of those bugs was invisible to `cargo test` and obvious the moment the real
-catalog/fridge contents ran through the function. Full detail in git history if wanted.
+Enforce numeric invariants by construction, name and derive constants instead of repeating
+magic literals, give any continuous score an explicit threshold (`>` vs `>=` on
+`FAVORITE_MIN_MEAN_RATING` silently excluded every recipe rated exactly 4★ until it was
+caught), and check a branch is reachable before writing it.
+
+Above all: **don't trust a green test suite without checking against real data.** Four
+scoring functions have now shipped passing tests while getting real data wrong — `nlp.rs`
+once, `recommend_recipes.rs` twice, and `rerank.rs` once. Every one was invisible to
+`cargo test` and obvious the moment real catalog/fridge/review data ran through it.
+
+Phase 4's instance is worth remembering because of *why* the test missed it. The
+favorite-capacity bug dropped a recipe whenever the chosen count exceeded what the slots could
+hold; `favorites_land_only_in_their_slots_and_only_when_eligible` uses 11 candidates, where
+all three slots fit comfortably, so it stayed green. The real fixture had 8 — and 8 candidates
+can only hold two favorites. **A fixture sized for the happy path can't exercise the boundary
+the code actually trips on.** When a function's behavior depends on collection size, test at a
+size where the resource runs out, not just a comfortable one.
+
+Two Rust-specific traps from the same session: `^` is XOR, not exponentiation (`powf` is what
+you want, and on integers `^` compiles and silently computes nonsense), and `b.total_cmp(b)`
+compares a value with itself — the sort became a no-op, announced only by an
+`unused variable: a` warning.
 
 ## Git / GitHub
 
@@ -343,17 +387,20 @@ Repo root, branch `main`, remote `origin` →
 
 ## Next up
 
-Phase 4's `[gen]` scaffolding is done, including the Phase-5-ready review-ownership schema and
-the suppression filter (see "Current status"). **The only thing left in Phase 4 is
-implementing `rerank_recommendations`** in `src/rerank.rs`, against the seven tests already
-there.
+**Phase 5 — authentication.** See `docs/PLAN.md`, including the "Global review aggregator"
+section, whose schema (`user_id` / `is_public` / `hidden`, `GET /recipes/{id}/reviews`,
+visibility-scoped reads, `reviews::current_viewer()` as the auth seam) is already in place
+from Phase 4 and just needs wiring to real sessions.
 
-Scope it honestly: with one user and a pre-filtered candidate set, this is ~20–30 lines
-(group `reviews` by `recipe_id`, fold each group into a score, sort). The user reached this
-conclusion themselves and agreed not to stretch it — the genuinely interesting version of the
-problem arrives in Phase 5 with auth, a real second population, and small-sample statistics.
-Don't inflate it. The personal-vs-global branch can stay trivial until Phase 5 gives it
-something to weigh.
+Two loose ends carried over from Phase 4, neither blocking:
+
+- **`score_recipe` ignores `viewer`** (its parameter is `_viewer`) while `is_favorite_eligible`
+  honours it. Inert today — `is_by(None)` is true for every review — but once accounts exist
+  the base score would silently include strangers' reviews while eligibility wouldn't. Worth
+  making consistent as the first thing Phase 5 touches.
+- **Unseeded `rand::rng()`** in `rerank_recommendations` (see the Favorites section).
+
+`docs/TODO.md` holds three deferred ideas; none of them block Phase 5.
 
 Once it's real, worth a real-data pass in-browser (seed several reviews across a few recipes —
 `POST /reviews` accepts an explicit `cooked_at`, so backdate them the way Phase 2's purchase

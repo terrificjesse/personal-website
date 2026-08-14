@@ -149,20 +149,41 @@ section); disliked ones stop appearing; review history is browsable.
 - [gen] Frontend: review form after marking a recipe "cooked," a review history page, and
   a second recommendation section ("Recipes you liked") separate from Phase 3's general
   recommendations.
-- [learn] **The actual re-ranking algorithm** is the centerpiece learning goal of this
-  phase. Claude stubs `fn rerank_recommendations(candidates: &[Recipe], reviews: &[Review])
-  -> Vec<Recipe>` with tests describing desired behavior (liked recipe ranks higher on
-  repeat suggestion, disliked recipe suppressed, unreviewed recipe unaffected). You
-  implement it. This is intentionally the deepest algorithmic phase — good things to
-  research before writing code: explicit-feedback recommenders, simple weighted scoring
-  (rating × recency decay) as a first pass, and only reach for anything ML-flavored
-  (e.g. a basic collaborative-filtering-style similarity score, if you add multiple users
-  later) once the simple version feels limiting. Claude can discuss these approaches with
-  you and review your implementation, but default to not writing it for you.
+- [learn] **The actual re-ranking algorithm** — **done.** Implemented by the user as
+  `fn rerank_recommendations(candidates: &[Recipe], reviews: &[Review], viewer: Option<&str>)
+  -> Vec<RankedRecipe>` in `apps/fridge-app/backend/src/rerank.rs`. Final model: score each
+  recipe as the **max** over its reviews of `(rating - NEUTRAL_RATING) × 0.5^(age_days /
+  DECAY_HALFLIFE)`, sort descending. Centering before decaying stops an old rave from reading
+  as a bad review (raw ratings decay toward 0, which is *below* the 1–5 scale); max rather
+  than sum encodes the user's stated preference for peak quality over cooking frequency.
 
-### Checkpoint
-Rate a recipe highly, confirm it appears in the "liked" section on next recommendation;
-rate one poorly, confirm it drops out of general recommendations.
+  Two behaviors moved *out* of this function mid-phase, both `[gen]`: membership
+  (`liked_recipe_ids`) and suppression (`suppressed_recipe_ids`) now live on the route
+  handlers. Suppression is a filter, which composes with Phase 3's ingredient ranking,
+  whereas a second *ordering* would fight it. See `apps/fridge-app/CLAUDE.md` for the full
+  split and reasoning.
+
+- [learn] **Favorites** — added mid-phase at the user's request, not in the original plan.
+  The base ranking is deterministic, so the liked section showed the same order every visit.
+  Favorites move up to three highly-rated recipes (unweighted mean ≥ 4.0) into fixed slots
+  `[3, 5, 7]`, badged in the UI so an out-of-order entry reads as intentional rather than
+  broken. Began as an age-gated "throwback" mechanism; when the age gate was dropped in
+  favor of pure rotation, a **rank gate** replaced it — never promote something already
+  ranked above the first slot, or the "move" is a demotion.
+
+### Checkpoint — met 2026-08-13
+
+Verified against real seeded data (16 reviews across 10 recipes, backdated via
+`POST /reviews`), not just hand-built fixtures:
+
+- Rate a recipe highly → it appears in the "Recipes you liked" section. ✅
+- Rate one poorly (≤2★) → it drops out of general recommendations: 789 → 787. ✅
+- A recipe rated 5★ then 1★ is absent from *both* lists — liked and suppressed are disjoint
+  by construction. ✅
+- The base ranking reproduced the model's predicted order exactly across all 8 liked recipes.
+- In-browser: 8 cards, "Favorite" badge on exactly the expected slots, no console errors.
+
+`cargo test`: 75 passed, 0 failed, clippy clean.
 
 ---
 

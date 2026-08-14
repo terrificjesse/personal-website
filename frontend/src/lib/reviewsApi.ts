@@ -54,11 +54,11 @@ export async function fetchReviews(): Promise<ReviewWithRecipe[]> {
  * Why a recipe landed where it did in the liked ranking.
  *
  * - `liked` — ranked normally, by recency-weighted rating.
- * - `throwback` — an old favourite deliberately lifted into a fixed slot, which the recency
+ * - `favorite` — an old favourite deliberately lifted into a fixed slot, which the recency
  *   decay would otherwise have buried. These are badged: without the label an old recipe
  *   near the top just reads as a broken ranking.
  */
-export type RankReason = "liked" | "throwback";
+export type RankReason = "liked" | "favorite";
 
 export type RankedRecipe = {
   recipe: Recipe;
