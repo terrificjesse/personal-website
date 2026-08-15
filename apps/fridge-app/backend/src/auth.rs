@@ -52,14 +52,12 @@
 //! on email. Emails change and can be reassigned; `sub` is stable and unique forever. Linking
 //! on email is how OAuth integrations grow account-takeover bugs.
 
-use std::default;
-
 use argon2::{
     PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{self, SaltString, rand_core::OsRng},
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::{RngExt, fill};
+use rand::fill;
 use sha2::Digest;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -275,8 +273,18 @@ pub async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<IssuedSes
 ///    an error tends to turn into a 500 where a 401 belongs.
 ///
 /// Placeholder returns `Ok(None)`: unimplemented means every request is unauthenticated.
-pub async fn validate_session(_pool: &SqlitePool, _token: &str) -> Result<Option<User>, AuthError> {
-    Ok(None)
+pub async fn validate_session(pool: &SqlitePool, token: &str) -> Result<Option<User>, AuthError> {
+    let now = Utc::now();
+    let token_hash = session_token_hash(token);
+    Ok(sqlx::query_as::<_, User>(
+        "SELECT u.id, u.email, u.password_hash, u.created_at
+    FROM sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND s.expires_at > ?",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// **[learn]** Ends the session identified by `token`.
@@ -290,7 +298,12 @@ pub async fn validate_session(_pool: &SqlitePool, _token: &str) -> Result<Option
 ///
 /// Placeholder returns `Ok(())`: it revokes nothing, but a logout that *reports* failure
 /// would push callers toward retry logic that doesn't help.
-pub async fn revoke_session(_pool: &SqlitePool, _token: &str) -> Result<(), AuthError> {
+pub async fn revoke_session(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
+    let token_hash = session_token_hash(token);
+    sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+        .bind(token_hash)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -638,5 +651,272 @@ mod tests {
             !url.contains("redirect_uri=http://"),
             "redirect_uri must be percent-encoded, not spliced in raw"
         );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Sessions, against a real database
+    //
+    // `issue_session`, `validate_session` and `revoke_session` need a live pool, so none of
+    // the pure-function tests above can reach them. They are also the three functions that
+    // decide who every request is, which makes "untested" the wrong state for them to be in.
+    //
+    // These use an in-memory SQLite database built from the real migrations, so the schema
+    // under test is the same one production runs — including the UNIQUE and NOT NULL
+    // constraints, which a hand-built fixture table would quietly omit.
+    // ------------------------------------------------------------------------------------
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    const TEST_USER_ID: &str = "test-user-1";
+
+    /// A fresh in-memory database with the migrations applied and one account in it.
+    ///
+    /// **`max_connections(1)` is load-bearing.** Each connection to `sqlite::memory:` gets its
+    /// own private database, so a pool of the usual size would run the migrations on one
+    /// connection and then hand the test a different, empty one. The symptom is
+    /// "no such table" on a pool that definitely just migrated.
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply");
+
+        sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
+            .bind(TEST_USER_ID)
+            .bind("jesse@example.com")
+            .bind("$argon2id$not-a-real-hash")
+            .bind(Utc::now())
+            .execute(&pool)
+            .await
+            .expect("test user should insert");
+
+        pool
+    }
+
+    /// Writes a session row directly, bypassing `issue_session`, so a test can control
+    /// `expires_at`. Takes the plaintext token and hashes it the same way the real path does.
+    async fn insert_session_expiring(pool: &SqlitePool, token: &str, expires_at: DateTime<Utc>) {
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(TEST_USER_ID)
+        .bind(session_token_hash(token))
+        .bind(Utc::now())
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .expect("session row should insert");
+    }
+
+    #[tokio::test]
+    async fn a_freshly_issued_session_validates_to_its_own_user() {
+        // The round trip, and the single most important thing in this file: whatever
+        // `issue_session` writes must be findable by `validate_session` from the token alone.
+        // If the two disagree about hashing, encoding, or which column to search, everything
+        // else here is irrelevant because nobody can stay logged in.
+        let pool = test_pool().await;
+
+        let session = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+        let user = validate_session(&pool, &session.token)
+            .await
+            .expect("validate");
+
+        let user = user.expect("a session issued one line ago must validate");
+        assert_eq!(user.id, TEST_USER_ID);
+        assert_eq!(user.email, "jesse@example.com");
+    }
+
+    #[tokio::test]
+    async fn validate_returns_the_user_not_the_session() {
+        // Guards the `SELECT *` collision: `sessions` and `users` both have `id` and
+        // `created_at`, and `FromRow` matches by column name. A join that doesn't name its
+        // columns can hand back a `User` whose `id` is really a session id — which fails
+        // silently, attributing every request to an account that doesn't exist.
+        let pool = test_pool().await;
+
+        let session = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+        let session_id: String = sqlx::query_scalar("SELECT id FROM sessions LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("session row should exist");
+
+        let user = validate_session(&pool, &session.token)
+            .await
+            .expect("validate")
+            .expect("session should be live");
+
+        assert_eq!(
+            user.id, TEST_USER_ID,
+            "id must come from users, not sessions"
+        );
+        assert_ne!(
+            user.id, session_id,
+            "this is the session's id, not the user's"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plaintext_token_is_never_stored() {
+        // The property the whole storage design rests on. If a database leak yields working
+        // cookie values, hashing bought nothing — so this checks the token appears in *no*
+        // text column of the row, not merely that `token_hash` happens to differ from it.
+        let pool = test_pool().await;
+
+        let session = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+
+        let matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1 OR user_id = ?1 OR token_hash = ?1",
+        )
+        .bind(&session.token)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+
+        assert_eq!(
+            matches, 0,
+            "the plaintext session token must not appear anywhere in the sessions table"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_does_not_validate() {
+        // The check that is easy to omit because nothing visibly breaks when you do — the
+        // app works perfectly, sessions simply never end. Inserted directly so the row is
+        // genuinely stale rather than merely close to expiry.
+        let pool = test_pool().await;
+        let token = generate_session_token();
+
+        insert_session_expiring(&pool, &token, Utc::now() - Duration::days(1)).await;
+
+        let user = validate_session(&pool, &token).await.expect("validate");
+
+        assert!(
+            user.is_none(),
+            "an expired session must not authenticate anyone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_expiring_in_the_future_still_validates() {
+        // The other side of the boundary, so a `validate_session` that rejects *everything*
+        // can't pass the test above by accident.
+        let pool = test_pool().await;
+        let token = generate_session_token();
+
+        insert_session_expiring(&pool, &token, Utc::now() + Duration::minutes(1)).await;
+
+        let user = validate_session(&pool, &token).await.expect("validate");
+
+        assert!(
+            user.is_some(),
+            "a session with time left must still authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_none_not_an_error() {
+        // Signed-out is the most common state this function sees. Reporting it as `Err`
+        // turns every anonymous request into a 500 where a 401 belongs, and breaks
+        // `MaybeUser` — which `GET /auth/me` depends on to answer "nobody".
+        let pool = test_pool().await;
+
+        let result = validate_session(&pool, "not-a-real-token-at-all").await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "an unrecognised token is the ordinary signed-out case, not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_session_stops_validating() {
+        // What makes logout real. Clearing the cookie only asks the browser to forget the
+        // token; deleting the row is what stops a token already copied elsewhere from working.
+        let pool = test_pool().await;
+
+        let session = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+        assert!(
+            validate_session(&pool, &session.token)
+                .await
+                .expect("validate")
+                .is_some(),
+            "precondition: the session must be live before we revoke it"
+        );
+
+        revoke_session(&pool, &session.token).await.expect("revoke");
+
+        let user = validate_session(&pool, &session.token)
+            .await
+            .expect("validate");
+        assert!(user.is_none(), "a revoked session must stop authenticating");
+    }
+
+    #[tokio::test]
+    async fn revoking_one_session_leaves_the_others_alive() {
+        // Signing out on your laptop must not sign you out on your phone. This is the test
+        // that catches `DELETE FROM sessions WHERE user_id = ?` — which passes the test
+        // above perfectly well and logs you out everywhere.
+        let pool = test_pool().await;
+
+        let laptop = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+        let phone = issue_session(&pool, TEST_USER_ID).await.expect("issue");
+
+        revoke_session(&pool, &laptop.token).await.expect("revoke");
+
+        assert!(
+            validate_session(&pool, &laptop.token)
+                .await
+                .expect("validate")
+                .is_none(),
+            "the revoked session should be gone"
+        );
+        assert!(
+            validate_session(&pool, &phone.token)
+                .await
+                .expect("validate")
+                .is_some(),
+            "revoking one session must not end the user's other sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_an_unknown_token_succeeds() {
+        // Idempotency. Logging out twice, or with a token that was never valid, is a success
+        // — the caller can't tell the difference and has nothing useful to do with it.
+        let pool = test_pool().await;
+
+        assert!(revoke_session(&pool, "never-existed").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn purging_removes_expired_sessions_but_not_live_ones() {
+        // Housekeeping, and deliberately not a security control — `validate_session` rejects
+        // expired rows on its own whether or not this has ever run.
+        let pool = test_pool().await;
+        let stale = generate_session_token();
+        let live = generate_session_token();
+
+        insert_session_expiring(&pool, &stale, Utc::now() - Duration::days(1)).await;
+        insert_session_expiring(&pool, &live, Utc::now() + Duration::days(1)).await;
+
+        let purged = purge_expired_sessions(&pool).await.expect("purge");
+
+        assert_eq!(
+            purged, 1,
+            "exactly the expired row should have been deleted"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(remaining, 1, "the live session must survive the purge");
     }
 }
