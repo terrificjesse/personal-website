@@ -243,9 +243,7 @@ pub fn session_token_hash(token: &str) -> String {
 /// Placeholder returns `Err(NotImplemented)`: minting again.
 pub async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<IssuedSession, AuthError> {
     let now = Utc::now();
-    let expires_at = now
-        .checked_add_days(chrono::Days::new(SESSION_DURATION_DAYS as u64))
-        .unwrap();
+    let expires_at = session_expiry_from(now);
     let token = generate_session_token();
     let hash = session_token_hash(&token);
     sqlx::query("INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
