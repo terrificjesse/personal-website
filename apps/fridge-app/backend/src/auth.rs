@@ -57,7 +57,7 @@ use argon2::{
     password_hash::{self, SaltString, rand_core::OsRng},
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::fill;
+use rand::{fill, random};
 use sha2::Digest;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -316,7 +316,6 @@ pub async fn purge_expired_sessions(pool: &SqlitePool) -> Result<u64, AuthError>
         .bind(Utc::now())
         .execute(pool)
         .await?;
-
     Ok(result.rows_affected())
 }
 
@@ -431,7 +430,9 @@ pub async fn exchange_google_code(
 /// Placeholder is `todo!()`: it mints a credential, so it fails loudly rather than returning
 /// a fixed string that would make every CSRF check pass.
 pub fn generate_oauth_state() -> String {
-    todo!("auth::generate_oauth_state — CSPRNG, same requirements as generate_session_token")
+    let mut random = [0, 32];
+    fill(&mut random);
+    hex::encode(random)
 }
 
 #[cfg(test)]
