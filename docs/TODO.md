@@ -176,3 +176,57 @@ reads a boolean instead of recomputing membership itself.
 - Any fix here should reuse `recommend_recipes.rs`'s existing membership check rather than
   writing a second implementation of "is this ingredient available" — that's the whole
   problem this entry is about; doubling it a third time would be worse.
+
+---
+
+## Pepper the session token hash (HMAC instead of plain SHA-256)
+
+**Status:** deferred — revisit if the database ever ends up somewhere the app server isn't:
+an off-box backup, a read replica, a managed database, or a restore handed to someone else
+**Area:** `apps/fridge-app/backend/src/auth.rs` (`session_token_hash`)
+**Added:** 2026-08-14
+
+`session_token_hash` reduces a session token to a plain fast digest (SHA-256) before it goes
+in `sessions.token_hash`, so a leaked table yields digests rather than a pile of live
+sessions. Replacing that with `HMAC-SHA256(server_key, token)` adds a second requirement: an
+attacker who reads the table *also* needs a key that was never stored in it. Same idea as a
+password "pepper," applied to sessions.
+
+**Why not now:** the entire benefit depends on the key living somewhere the database doesn't,
+and right now it wouldn't. Both sit on one machine, and the key would go in the same `.env`
+as `DATABASE_URL` — so anyone who can read the database file can almost certainly read the
+key beside it, and the pepper defends against nothing while adding real rotation complexity.
+The threat it actually addresses is a **database leak that isn't a full host compromise**,
+and this deployment has no way to produce one yet.
+
+Worth being clear about what this is and isn't: the token is already 256 bits of CSPRNG
+output, so hashing it was never about brute-force resistance — there's no dictionary to
+attack. Peppering makes leak containment deeper. It does not change the category of problem
+being solved.
+
+**Sketch:** `hmac` crate over the existing `sha2`, keyed from a new `SESSION_TOKEN_PEPPER`
+env var (documented in `.env.example`). The key must be high-entropy random bytes, not a
+passphrase. The function stays deterministic and stays fast — it's still called on every
+request by `validate_session`.
+
+Because the digest is the lookup key (`WHERE token_hash = ?`), changing the key invalidates
+every existing row. Two options: accept that rotation logs everyone out (entirely fine for
+this app), or store a key id per session row and verify against the matching key, which is
+what you'd need if forced logout were ever unacceptable.
+
+**Watch out for:**
+- **Losing the key logs everyone out.** Acceptable here; make sure that's still true before
+  shipping it somewhere it isn't.
+- **Don't store the pepper next to the database.** If it lands in the same `.env` on the same
+  box, you've rebuilt exactly the situation that made this a "later" — it's theatre with
+  extra steps.
+- **One key, one purpose.** Don't reuse it for cookie signing, CSRF, or anything else; shared
+  keys turn one leak into several.
+- **Don't let "make it stronger" become Argon2 here.** `session_token_hash` must stay fast —
+  `validate_session` runs on every single request, so a memory-hard KDF would add its full
+  cost to every page load and hand anyone a trivial DoS. The fast/slow split between this and
+  `hash_password` is deliberate; see that function's doc comment.
+- **Peppering `hash_password` is a separate decision with a much larger blast radius.** Same
+  key-management question, but losing the key there makes every password permanently
+  unverifiable, with no reset path that doesn't go through email. Don't fold the two changes
+  into one commit on the assumption that the reasoning carries over.

@@ -34,8 +34,9 @@
 //!
 //! **Sessions.** The cookie carries an opaque random token; `sessions.token_hash` carries a
 //! hash of it (see `migrations/0007`). Worth thinking through: how many bits of entropy make
-//! a token unguessable, why the token must come from a CSPRNG (`rand::rngs::OsRng`) rather
-//! than the `rand::rng()` used for favorite selection in `rerank.rs`, and why a *fast* hash
+//! a token unguessable, why the token must come from a CSPRNG (`rand::rngs::SysRng`, or
+//! `rand::rng()` — both are cryptographically secure; a *seeded* generator is the thing to
+//! avoid) rather than something reproducible, and why a *fast* hash
 //! is correct here even though a slow one is correct for passwords — a 256-bit random token
 //! has no dictionary to attack, so the reason to hash it is leak containment, not brute-force
 //! resistance.
@@ -51,8 +52,17 @@
 //! on email. Emails change and can be reassigned; `sub` is stable and unique forever. Linking
 //! on email is how OAuth integrations grow account-takeover bugs.
 
+use std::default;
+
+use argon2::{
+    PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{self, SaltString, rand_core::OsRng},
+};
 use chrono::{DateTime, Duration, Utc};
+use rand::{RngExt, fill};
+use sha2::Digest;
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use crate::models::User;
 
@@ -131,6 +141,11 @@ impl From<sqlx::Error> for AuthError {
 // Passwords — [learn]
 // ---------------------------------------------------------------------------------------
 
+impl From<password_hash::Error> for AuthError {
+    fn from(err: password_hash::Error) -> Self {
+        AuthError::Hashing(err.to_string())
+    }
+}
 /// **[learn]** Hashes a plaintext password for storage in `users.password_hash`.
 ///
 /// Return the full PHC string (`$argon2id$v=19$m=...,t=...,p=...$<salt>$<hash>`), not raw
@@ -144,11 +159,11 @@ impl From<sqlx::Error> for AuthError {
 /// Validation of length bounds belongs to the caller (`routes/auth::register`), not here —
 /// this function's job is the hash, and a hasher that silently enforces policy is a hasher
 /// you can't reuse for a password-change flow with different rules.
-///
-/// Placeholder returns `Err(NotImplemented)`: this mints a credential, so it fails loudly
-/// rather than producing something that looks like a hash.
-pub fn hash_password(_plaintext: &str) -> Result<String, AuthError> {
-    Err(AuthError::NotImplemented("auth::hash_password"))
+pub fn hash_password(plaintext: &str) -> Result<String, AuthError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(argon2::Argon2::default()
+        .hash_password(plaintext.as_bytes(), &salt)?
+        .to_string())
 }
 
 /// **[learn]** Checks `plaintext` against a stored PHC hash.
@@ -159,10 +174,13 @@ pub fn hash_password(_plaintext: &str) -> Result<String, AuthError> {
 ///
 /// Do not compare with `==`. `PasswordVerifier::verify_password` does a constant-time
 /// comparison; a naive equality check on the digest leaks information through timing.
-///
-/// Placeholder returns `Ok(false)`: unimplemented means nobody gets in.
-pub fn verify_password(_plaintext: &str, _phc_hash: &str) -> Result<bool, AuthError> {
-    Ok(false)
+pub fn verify_password(plaintext: &str, phc_hash: &str) -> Result<bool, AuthError> {
+    let parsed = PasswordHash::new(phc_hash)?;
+    match argon2::Argon2::default().verify_password(plaintext.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(password_hash::Error::Password) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -182,16 +200,21 @@ pub struct IssuedSession {
 
 /// **[learn]** Generates a new opaque session token.
 ///
-/// Must come from the OS CSPRNG (`rand::rngs::OsRng`), **not** from `rand::rng()` — the
-/// generator `rerank.rs` uses for favorite selection is seeded for reproducibility, which is
-/// exactly the property a session token must not have. Aim for at least 128 bits of entropy,
-/// 256 is cheap; encode as hex or URL-safe base64 so it survives a cookie value unescaped.
+/// Must come from a CSPRNG — either `rand::rngs::SysRng` (straight to the OS) or
+/// `rand::rng()` (`ThreadRng`, which implements `TryCryptoRng` and is equally fine here). The
+/// thing to avoid is a *seeded* generator such as `StdRng::seed_from_u64`, which is
+/// reproducible by design — exactly the property a session token must not have, and the
+/// change being considered for favorite selection in `rerank.rs`.
 ///
-/// Placeholder is `todo!()`: this mints a credential, and a placeholder that returned a fixed
-/// string would be a hardcoded session token.
+/// Aim for at least 128 bits of entropy, 256 is cheap; encode as hex or URL-safe base64 so
+/// it survives a cookie value unescaped. Prefer a fixed-width encoding: a decimal integer's
+/// length varies with its value, so the length floor asserted below can fail on an unlucky
+/// draw.
 #[allow(dead_code)]
 pub fn generate_session_token() -> String {
-    todo!("auth::generate_session_token — see the module doc on CSPRNG choice and entropy")
+    let mut random: [u8; 32] = [0; 32];
+    fill(&mut random);
+    hex::encode(random)
 }
 
 /// **[learn]** Hashes a session token for storage and lookup in `sessions.token_hash`.
@@ -204,11 +227,11 @@ pub fn generate_session_token() -> String {
 ///
 /// Must be deterministic — unlike `hash_password`, no salt. The lookup is
 /// `WHERE token_hash = ?`, so the same token has to produce the same output every time.
-///
-/// Placeholder is `todo!()`: a fixed return value would collapse every session onto one row.
 #[allow(dead_code)]
-pub fn session_token_hash(_token: &str) -> String {
-    todo!("auth::session_token_hash — deterministic, unsalted, fast; see the module doc")
+pub fn session_token_hash(token: &str) -> String {
+    let mut hash = sha2::Sha256::default();
+    hash.update(token.as_bytes());
+    hex::encode(hash.finalize())
 }
 
 /// **[learn]** Creates a session row for `user_id` and returns the token to put in the cookie.
@@ -218,11 +241,25 @@ pub fn session_token_hash(_token: &str) -> String {
 /// that constant's doc for why.
 ///
 /// Placeholder returns `Err(NotImplemented)`: minting again.
-pub async fn issue_session(
-    _pool: &SqlitePool,
-    _user_id: &str,
-) -> Result<IssuedSession, AuthError> {
-    Err(AuthError::NotImplemented("auth::issue_session"))
+pub async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<IssuedSession, AuthError> {
+    let now = Utc::now();
+    let expires_at = now
+        .checked_add_days(chrono::Days::new(SESSION_DURATION_DAYS as u64))
+        .unwrap();
+    let token = generate_session_token();
+    let hash = session_token_hash(&token);
+    sqlx::query("INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(hash)
+        .bind(now)
+        .bind(expires_at)
+        .execute(pool)
+        .await?;
+    Ok(IssuedSession {
+        token: token,
+        expires_at: expires_at,
+    })
 }
 
 /// **[learn]** Resolves a session token to its user, or `None` if there's no live session.
@@ -240,10 +277,7 @@ pub async fn issue_session(
 ///    an error tends to turn into a 500 where a 401 belongs.
 ///
 /// Placeholder returns `Ok(None)`: unimplemented means every request is unauthenticated.
-pub async fn validate_session(
-    _pool: &SqlitePool,
-    _token: &str,
-) -> Result<Option<User>, AuthError> {
+pub async fn validate_session(_pool: &SqlitePool, _token: &str) -> Result<Option<User>, AuthError> {
     Ok(None)
 }
 
@@ -383,7 +417,8 @@ pub async fn exchange_google_code(
 /// callback. You may well implement this by delegating to that function; the separate name is
 /// so that changing session-token policy later doesn't silently change CSRF policy too.
 ///
-/// Placeholder is `todo!()`, matching `generate_session_token`.
+/// Placeholder is `todo!()`: it mints a credential, so it fails loudly rather than returning
+/// a fixed string that would make every CSRF check pass.
 pub fn generate_oauth_state() -> String {
     todo!("auth::generate_oauth_state — CSPRNG, same requirements as generate_session_token")
 }
@@ -520,7 +555,10 @@ mod tests {
 
     #[test]
     fn different_session_tokens_hash_differently() {
-        assert_ne!(session_token_hash("token-one"), session_token_hash("token-two"));
+        assert_ne!(
+            session_token_hash("token-one"),
+            session_token_hash("token-two")
+        );
     }
 
     #[test]
@@ -550,7 +588,10 @@ mod tests {
         let second = generate_oauth_state();
 
         assert_ne!(first, second);
-        assert!(first.len() >= 32, "oauth state {first:?} is too short to be unguessable");
+        assert!(
+            first.len() >= 32,
+            "oauth state {first:?} is too short to be unguessable"
+        );
     }
 
     #[test]
@@ -563,10 +604,16 @@ mod tests {
 
         let url = google_authorize_url(&config, "test-state-value");
 
-        assert!(url.starts_with("https://"), "the authorize URL must be https");
+        assert!(
+            url.starts_with("https://"),
+            "the authorize URL must be https"
+        );
         assert!(url.contains("accounts.google.com"));
         assert!(url.contains("test-client-id"));
-        assert!(url.contains("test-state-value"), "state must reach Google or CSRF checking is theatre");
+        assert!(
+            url.contains("test-state-value"),
+            "state must reach Google or CSRF checking is theatre"
+        );
         assert!(url.contains("response_type=code"));
         // The secret is for the server-side token exchange only. Putting it on a URL the
         // browser follows would publish it to history, logs and the Referer header.

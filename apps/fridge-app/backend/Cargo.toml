@@ -22,8 +22,14 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 csv = "1.4.0"
 strsim = "0.11.1"
 rand = "0.10.2"
-argon2 = "0.5.3"
+# `std` is load-bearing, not decorative: it chains argon2/std -> password-hash/std ->
+# rand_core/std -> rand_core/getrandom, which is the only thing that makes `OsRng` exist.
+# The default feature set gives you `SaltString::generate` but no RNG to hand it.
+# It also gets `impl std::error::Error for password_hash::Error` thrown in.
+argon2 = { version = "0.5.3", features = ["std"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form", "http2", "charset"] }
 dotenvy = "0.15.7"
 time = "0.3.55"
+sha2 = "0.11.0"
+hex = "0.4.3"
