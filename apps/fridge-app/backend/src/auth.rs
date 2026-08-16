@@ -255,10 +255,7 @@ pub async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<IssuedSes
         .bind(expires_at)
         .execute(pool)
         .await?;
-    Ok(IssuedSession {
-        token: token,
-        expires_at: expires_at,
-    })
+    Ok(IssuedSession { token, expires_at })
 }
 
 /// **[learn]** Resolves a session token to its user, or `None` if there's no live session.
@@ -368,7 +365,7 @@ impl GoogleOAuthConfig {
 /// `subject` is Google's `sub` claim and the **only** field safe to link an account on — see
 /// the module doc. `email` is here for display and for first-time account creation; treat it
 /// as a mutable attribute of the identity, never as the identity itself.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoogleIdentity {
     pub subject: String,
     pub email: String,
@@ -434,11 +431,15 @@ impl From<reqwest::Error> for AuthError {
 ///
 /// Placeholder returns `Err(NotImplemented)`: it establishes an identity, so it fails loudly.
 ///
-///
 #[derive(Deserialize)]
-pub struct TokenData {
-    pub access_token: String,
-    pub id_token: String,
+struct TokenData {
+    access_token: String,
+}
+#[derive(Deserialize)]
+struct UserData {
+    sub: String,
+    email: String,
+    email_verified: bool,
 }
 pub async fn exchange_google_code(
     config: &GoogleOAuthConfig,
@@ -467,12 +468,23 @@ pub async fn exchange_google_code(
     let data: TokenData = res.json().await?;
 
     let res = client
-        .get("https://oauth2.googleapis.com/v3/userinfo")
+        .get("https://openidconnect.googleapis.com/v1/userinfo")
         .bearer_auth(data.access_token)
         .send()
         .await?;
 
-    Ok(res.json::<GoogleIdentity>().await?)
+    if !res.status().is_success() {
+        let msg = res.text().await?;
+        return Err(AuthError::OAuthExchangeFailed(msg));
+    };
+
+    let user_data = res.json::<UserData>().await?;
+
+    Ok(GoogleIdentity {
+        subject: user_data.sub,
+        email: user_data.email,
+        email_verified: user_data.email_verified,
+    })
 }
 
 /// **[learn]** Generates the OAuth `state` value.
