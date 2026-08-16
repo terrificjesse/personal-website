@@ -52,12 +52,14 @@
 //! on email. Emails change and can be reassigned; `sub` is stable and unique forever. Linking
 //! on email is how OAuth integrations grow account-takeover bugs.
 
+use serde::Deserialize;
+
 use argon2::{
     PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{self, SaltString, rand_core::OsRng},
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::{fill, random};
+use rand::fill;
 use reqwest::Url;
 use sha2::Digest;
 use sqlx::SqlitePool;
@@ -366,7 +368,7 @@ impl GoogleOAuthConfig {
 /// `subject` is Google's `sub` claim and the **only** field safe to link an account on — see
 /// the module doc. `email` is here for display and for first-time account creation; treat it
 /// as a mutable attribute of the identity, never as the identity itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GoogleIdentity {
     pub subject: String,
     pub email: String,
@@ -401,6 +403,12 @@ pub fn google_authorize_url(config: &GoogleOAuthConfig, state: &str) -> String {
     url.expect("Bad URL").to_string()
 }
 
+impl From<reqwest::Error> for AuthError {
+    fn from(err: reqwest::Error) -> Self {
+        AuthError::OAuthExchangeFailed(err.to_string())
+    }
+}
+
 /// **[learn]** Exchanges an authorization `code` for the user's Google identity.
 ///
 /// Server-side POST to Google's token endpoint with `code`, `client_id`, `client_secret`,
@@ -425,11 +433,46 @@ pub fn google_authorize_url(config: &GoogleOAuthConfig, state: &str) -> String {
 /// implementation bug.
 ///
 /// Placeholder returns `Err(NotImplemented)`: it establishes an identity, so it fails loudly.
+///
+///
+#[derive(Deserialize)]
+pub struct TokenData {
+    pub access_token: String,
+    pub id_token: String,
+}
 pub async fn exchange_google_code(
-    _config: &GoogleOAuthConfig,
-    _code: &str,
+    config: &GoogleOAuthConfig,
+    code: &str,
 ) -> Result<GoogleIdentity, AuthError> {
-    Err(AuthError::NotImplemented("auth::exchange_google_code"))
+    let client = reqwest::Client::new();
+
+    let params = [
+        ("client_id", &config.client_id),
+        ("redirect_uri", &config.redirect_uri),
+        ("client_secret", &config.client_secret),
+        ("grant_type", &"authorization_code".to_string()),
+        ("code", &code.to_string()),
+    ];
+
+    let res = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&params)
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let msg = res.text().await?;
+        return Err(AuthError::OAuthExchangeFailed(msg));
+    };
+
+    let data: TokenData = res.json().await?;
+
+    let res = client
+        .get("https://oauth2.googleapis.com/v3/userinfo")
+        .bearer_auth(data.access_token)
+        .send()
+        .await?;
+
+    Ok(res.json::<GoogleIdentity>().await?)
 }
 
 /// **[learn]** Generates the OAuth `state` value.
