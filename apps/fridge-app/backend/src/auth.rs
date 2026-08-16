@@ -58,6 +58,7 @@ use argon2::{
 };
 use chrono::{DateTime, Duration, Utc};
 use rand::{fill, random};
+use reqwest::Url;
 use sha2::Digest;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -385,8 +386,19 @@ pub struct GoogleIdentity {
 ///
 /// Placeholder is `todo!()`: returning a wrong-but-plausible URL would fail at Google with an
 /// error that's much harder to trace back to here.
-pub fn google_authorize_url(_config: &GoogleOAuthConfig, _state: &str) -> String {
-    todo!("auth::google_authorize_url — see the module doc for the five-step flow")
+pub fn google_authorize_url(config: &GoogleOAuthConfig, state: &str) -> String {
+    let base = String::from("https://accounts.google.com/o/oauth2/v2/auth");
+    let url = Url::parse_with_params(
+        &base,
+        [
+            ("client_id", &config.client_id),
+            ("redirect_uri", &config.redirect_uri),
+            ("response_type", &"code".to_string()),
+            ("scope", &"openid email".to_string()),
+            ("state", &state.to_string()),
+        ],
+    );
+    url.expect("Bad URL").to_string()
 }
 
 /// **[learn]** Exchanges an authorization `code` for the user's Google identity.
@@ -430,7 +442,7 @@ pub async fn exchange_google_code(
 /// Placeholder is `todo!()`: it mints a credential, so it fails loudly rather than returning
 /// a fixed string that would make every CSRF check pass.
 pub fn generate_oauth_state() -> String {
-    let mut random = [0, 32];
+    let mut random = [0; 32];
     fill(&mut random);
     hex::encode(random)
 }
