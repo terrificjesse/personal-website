@@ -187,7 +187,7 @@ Verified against real seeded data (16 reviews across 10 recipes, backdated via
 
 ---
 
-## Phase 5 — Authentication
+## Phase 5 — Authentication — **complete 2026-08-15**
 
 **Goal:** Password-based accounts, optional Google OAuth. Single user in practice, but
 built for real.
@@ -205,14 +205,31 @@ built for real.
     than asking the browser to forget. The `sessions` row stores a *hash* of the token.
   - **Route protection is per-handler, via the `CurrentUser` extractor**, not a middleware
     list — a route's signature is the authority on whether it needs a session.
-- [learn] **The actual auth implementation** — password hashing/verification (e.g. with
-  `argon2`), session issuance and validation, and the Google OAuth flow — is flagged as a
-  learning area. You implement it; Claude reviews and helps debug rather than writing it
-  wholesale. This is the highest-stakes learning area to get hands-on with, since auth
-  bugs are the most common source of real vulnerabilities — take the time.
-- [you] Register a Google Cloud OAuth client ID/secret yourself (Claude cannot create
-  external accounts or credentials on your behalf); store secrets in `.env`, never commit
-  them.
+- [learn] **The actual auth implementation** — **done**, written by the user with Claude
+  reviewing and debugging. Ten functions in `src/auth.rs`:
+  - **Passwords** — `hash_password` / `verify_password` via **Argon2id** (crate defaults:
+    19 MiB, t=2, p=1, matching OWASP's minimum). PHC string in one `TEXT` column, fresh salt
+    per call. `verify_password` discriminates `Error::Password` (→ `Ok(false)`, a wrong
+    password) from every other variant (→ `Err`, a corrupt stored hash) — one test pins each
+    direction.
+  - **Sessions** — opaque 32-byte CSPRNG token, hex-encoded, **SHA-256'd before storage** so a
+    database leak yields digests rather than live sessions. Expiry checked in SQL; absent and
+    expired both return `Ok(None)`; logout deletes the row by `token_hash`, so one device's
+    sign-out doesn't end the others.
+  - **Google OAuth** — authorize URL built with `Url::parse_with_params` (percent-encoding is
+    the whole job), token exchange POSTed form-encoded per RFC 6749 §4.1.3, status checked
+    before deserializing so Google's `invalid_grant` body survives into the error. Identity
+    read from the **UserInfo** endpoint rather than the ID token — sound because that response
+    arrives directly from Google over TLS with no untrusted intermediary, which is the
+    reasoning to be able to state rather than the shortcut to take silently.
+- [you] **Done.** Google Cloud OAuth client registered; `GOOGLE_CLIENT_ID`,
+  `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` in `.env` (gitignored).
+
+  Two setup traps worth recording: copying `.env.example` verbatim leaves every line
+  commented, so `dotenvy` sets nothing and the backend reports `Google OAuth not configured`;
+  and `GOOGLE_REDIRECT_URI` must use the **same host you browse on** — `localhost` and
+  `127.0.0.1` are different hosts to the cookie jar, so a mismatch means the OAuth state
+  cookie isn't sent to the callback and the flow fails the CSRF check.
 
 ### Global review aggregator (added Phase 4, activates here)
 
@@ -260,7 +277,7 @@ public — nothing there is secret, but an unauthenticated endpoint on a backend
 to justify the exception. `COOKIE_SECURE` still defaults off for plain-HTTP LAN use, so this
 is a trusted network, not the open internet.
 
-### Checkpoint — not yet met; blocked on the `[learn]` bodies
+### Checkpoint — met 2026-08-15
 
 Register an account with a password, log out, log back in; connect Google as an alternate
 login method; confirm fridge/shopping/recipe data is scoped to your account (even though
@@ -269,27 +286,42 @@ sees an empty fridge). With two test accounts, confirm a public review written b
 visible to the other while a private one is not, and that a recipe only the *other* account
 rated highly never appears in your "Recipes you liked" section.
 
-None of this can run until `src/auth.rs` has real bodies — registration returns 501 and every
-data route 401s against the deny-by-default placeholders. What *has* been verified so far
-(2026-08-13, against the real `fridge.db`, not fixtures):
+All of it verified, over HTTP and in-browser, against **copies of the real `fridge.db`** — not
+hand-built fixtures. Copies rather than the original because the first registration
+permanently claims the 22 pre-auth rows, and that slot belongs to the user's own account.
 
-- All 8 migrations apply cleanly; 16 reviews / 4 fridge items / 1 purchase preserved and
-  correctly unclaimed.
-- Every data route returns 401 unauthenticated — `/items`, `/shopping-list`,
-  `/recipes/liked`, `/reviews`, `/recipes/recommended`, `/items/suggest`,
-  `/shopping-list/suggestions`, `/recipes/{id}/reviews`. `/health` 200, `/auth/me` 200 `null`.
-- Input validation runs *before* the unimplemented hasher (400, not 501), and a valid
-  registration reaches it (501) — so the route is wired end to end.
-- CORS echoes an allowed origin with `allow-credentials: true` and does **not** echo a
-  disallowed one.
-- In-browser: `/fridge` and `/fridge/recipes` redirect to `/login?next=…`; the form's error
-  path surfaces the backend message; no console errors.
+- Register → `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000`, 64-hex token. Log out → session
+  row deleted, old cookie 401s. Log back in → 200. ✅
+- First registration logs `claimed 22 pre-auth rows`; the claim runs exactly once. ✅
+- The plaintext session token appears in **no** column of `sessions` — only its SHA-256 digest. ✅
+- **A fresh second account sees an empty fridge**: 0 items, 0 reviews, 0 liked. Suppression is
+  per-account too — acct1 sees 787 recipes, acct2 all 789. ✅
+- A public review by acct2 is visible to acct1; the private one is not. ✅
+- A recipe only acct2 rated highly never enters acct1's liked list. ✅
+- **Google**: consent screen → callback → identity linked on the `sub` claim (21 digits, not an
+  email), no duplicate account created. ✅
+- In-browser: `/fridge` redirects to `/login?next=…`, registration lands signed in with the
+  claimed fridge rendered, liked section shows 8 with the Favorite badge on a real slot, sign
+  out returns to `/login`. No console errors. ✅
 
-**When running the checkpoint, note the first registration is load-bearing** — it claims all
-22 unclaimed rows in one transaction. Good real-data check: the "Recipes you liked" list
-should be identical immediately before and after that first login. If it comes back empty, the
-claim didn't run, because `Review::is_by` deliberately reports a NULL `user_id` as belonging
-to nobody once a viewer exists.
+Liked count (8) and general-recommendation count (787) match the Phase 4 checkpoint exactly —
+the strongest available evidence that the backfill and viewer threading changed nothing they
+shouldn't have.
+
+`cargo test`: **113 passed, 0 failed**, clippy clean.
+
+**Two bugs this checkpoint caught that the test suite could not**, both in scaffolding, both in
+paths that had never executed:
+
+1. `google_callback` added the state-removal cookie *before* reading the incoming state.
+   `CookieJar::add` writes into the same map `get` reads, so every callback compared against an
+   empty string and returned `OAuthStateMismatch` regardless of configuration.
+2. `claim_unowned_rows` was wired only into password registration. Creating the first account
+   via **Google** skipped it, stranding all 22 pre-auth rows permanently with no UI able to
+   reach them. Now `claim_if_first_account`, called from both creation paths.
+
+Neither was reachable before Google OAuth was configured — which is exactly why the checkpoint
+is written as a real-data exercise rather than a test-suite target.
 
 ---
 
@@ -297,5 +329,19 @@ to nobody once a viewer exists.
 
 Not planned in detail yet: additional site tabs beyond the fridge app, deployment
 (Vercel for `frontend/`, a small VPS or fly.io for the Rust backend + DB are reasonable
-starting points), and whether Postgres replaces SQLite if you started there. Revisit once
-Phase 5 is stable.
+starting points), and whether Postgres replaces SQLite if you started there.
+
+**Before deploying anywhere reachable from the internet**, three things that are deliberately
+dev-shaped right now:
+
+- `COOKIE_SECURE` defaults to **off** so cookies work over plain HTTP on a LAN. It must be on
+  behind HTTPS, or session cookies travel in the clear.
+- If the frontend and backend end up on genuinely different hosts (not just different ports),
+  `SameSite=Lax` stops working and you need `SameSite=None; Secure` — which requires HTTPS on
+  both ends. Same-host deployment avoids the problem entirely.
+- Rate limiting on `POST /auth/login` and `POST /reviews`, neither of which exists. A login
+  endpoint with no throttle plus Argon2's cost is also a cheap denial-of-service target.
+
+The four deferred `[learn]` items above (small-sample statistics, personal-vs-global weighting,
+collaborative filtering) all wait on a real multi-user corpus. Building them against a single
+account means inventing the data they're meant to respond to.

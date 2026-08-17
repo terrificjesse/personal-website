@@ -279,17 +279,20 @@ pub fn rerank_recommendations(
 /// weight cancels a lone review's recency.
 ///
 /// `now` is passed in rather than read from the clock so that every recipe in a single
-/// ranking pass is measured against the same instant, and so tests can pin it.
+/// ranking pass is mseasured against the same instant, and so tests can pin it.
 #[allow(dead_code)]
-fn score_recipe(reviews: &[&Review], _viewer: Option<&str>, now: DateTime<Utc>) -> f64 {
-    reviews.iter().fold(0.0, |acc, review| {
-        let age_days = ((now - review.cooked_at).as_seconds_f64()
-            / Duration::days(1).as_seconds_f64())
-        .max(0.0);
-        let weight = 0.5_f64.powf(age_days / DECAY_HALFLIFE);
-        let contribution = (review.rating as f64 - NEUTRAL_RATING) * weight;
-        f64::max(acc, contribution)
-    })
+fn score_recipe(reviews: &[&Review], viewer: Option<&str>, now: DateTime<Utc>) -> f64 {
+    reviews
+        .iter()
+        .filter(|r| r.is_by(viewer))
+        .fold(0.0, |acc, review| {
+            let age_days = ((now - review.cooked_at).as_seconds_f64()
+                / Duration::days(1).as_seconds_f64())
+            .max(0.0);
+            let weight = 0.5_f64.powf(age_days / DECAY_HALFLIFE);
+            let contribution = (review.rating as f64 - NEUTRAL_RATING) * weight;
+            f64::max(acc, contribution)
+        })
 }
 
 /// The **quality** gate: is this recipe's unweighted mean rating at or above
@@ -308,10 +311,10 @@ fn score_recipe(reviews: &[&Review], _viewer: Option<&str>, now: DateTime<Utc>) 
 /// selecting the same recipes that were already on top.
 ///
 /// Takes no `now` for that reason — nothing here is time-dependent.
-#[allow(dead_code)]
-fn is_favorite_eligible(reviews: &[&Review], _viewer: Option<&str>) -> bool {
-    let sum = reviews.iter().fold(0.0, |acc, r| acc + r.rating as f64);
-    sum / reviews.len() as f64 >= FAVORITE_MIN_MEAN_RATING
+fn is_favorite_eligible(reviews: &[&Review], viewer: Option<&str>) -> bool {
+    let filtered: Vec<&&Review> = reviews.iter().filter(|r| r.is_by(viewer)).collect();
+    let sum = filtered.iter().fold(0.0, |acc, r| acc + r.rating as f64);
+    sum / filtered.len() as f64 >= FAVORITE_MIN_MEAN_RATING
 }
 
 /// Merges the chosen favorites into the base ordering, labelling each entry.
@@ -709,7 +712,11 @@ mod tests {
 
         let results = rerank_recommendations(&candidates, &reviews, Some(VIEWER));
 
-        assert_eq!(results.len(), 2, "must not drop a candidate it has no opinion on");
+        assert_eq!(
+            results.len(),
+            2,
+            "must not drop a candidate it has no opinion on"
+        );
         assert!(position_of(&results, "only_theirs").is_some());
         assert_ranks_above(&results, "mine", "only_theirs");
     }

@@ -349,14 +349,7 @@ pub async fn register(
         });
     }
 
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&mut *tx)
-        .await?;
-
-    if user_count == 1 {
-        let claimed = claim_unowned_rows(&mut tx, &id).await?;
-        println!("first account registered — claimed {claimed} pre-auth rows for {email}");
-    }
+    claim_if_first_account(&mut tx, &id, &email).await?;
 
     tx.commit().await?;
 
@@ -373,6 +366,37 @@ pub async fn register(
         jar.add(session_cookie(session.token)),
         (StatusCode::CREATED, Json(AuthenticatedUser::from(&user))),
     ))
+}
+
+/// Runs the pre-auth backfill if `user_id` is the account that just became the *first* one.
+///
+/// **Call this from every path that creates an account.** There are two — password
+/// registration and Google sign-in for an unrecognised identity — and the backfill originally
+/// lived only in the first. The consequence was silent and permanent: signing in with Google
+/// on a fresh database created the first account, skipped the claim, and stranded every
+/// pre-auth row as unclaimed forever, with no UI able to see or recover them.
+///
+/// Hence one helper called from both sites rather than the check inlined at each. A third
+/// account-creation path added later should call this too; that's much easier to notice with
+/// a named function than with a `SELECT COUNT(*)` copied into one handler.
+///
+/// Must run inside the same transaction as the `INSERT INTO users`, so "account created" and
+/// "rows claimed" either both happen or neither does.
+async fn claim_if_first_account(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    email: &str,
+) -> Result<(), AuthError> {
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut **tx)
+        .await?;
+
+    if user_count == 1 {
+        let claimed = claim_unowned_rows(tx, user_id).await?;
+        println!("first account created — claimed {claimed} pre-auth rows for {email}");
+    }
+
+    Ok(())
 }
 
 /// Assigns every pre-auth row to `user_id`.
@@ -538,6 +562,14 @@ pub async fn google_callback(
 ) -> Result<(CookieJar, Redirect), AuthError> {
     let config = config.ok_or(AuthError::OAuthNotConfigured)?;
 
+    // Read the incoming state **before** clearing it. `CookieJar::add` inserts into the same
+    // map `get` reads from, so adding the removal cookie first would shadow the browser's
+    // value with the empty one — `get` would return `Some("")` and every callback would fail
+    // the check below. Capture, then clear.
+    let expected = jar
+        .get(GOOGLE_STATE_COOKIE_NAME)
+        .map(|c| c.value().to_string());
+
     // The state cookie is spent either way — success, failure, or the user backing out.
     let jar = jar.add(expired_oauth_state_cookie());
 
@@ -547,9 +579,6 @@ pub async fn google_callback(
 
     // Compare before touching anything else. A callback whose state doesn't match the cookie
     // is not a failed sign-in to retry — it's a request this server never started.
-    let expected = jar
-        .get(GOOGLE_STATE_COOKIE_NAME)
-        .map(|c| c.value().to_string());
     match (query.state.as_deref(), expected.as_deref()) {
         (Some(received), Some(stored)) if received == stored && !stored.is_empty() => {}
         _ => return Err(AuthError::OAuthStateMismatch),
@@ -648,6 +677,10 @@ async fn resolve_google_identity(
     .bind(created_at)
     .execute(&mut *tx)
     .await?;
+
+    // Google sign-in can be what creates the very first account, in which case it owns the
+    // pre-auth backfill exactly as password registration would.
+    claim_if_first_account(&mut tx, &user_id, &email).await?;
 
     tx.commit().await?;
 

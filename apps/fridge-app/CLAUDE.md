@@ -7,28 +7,21 @@ Trimmed 2026-08-13 after Phase 4. Decisions are recorded here as *rules*; the re
 them is in git history and in each module's own doc comment. When a module doc and this file
 disagree, the module doc wins — it's closer to the code.
 
-## Current status: Phases 1–4 complete; Phase 5 scaffolded, `[learn]` bodies pending
+## Current status: Phases 1–5 complete (2026-08-15)
 
-All five `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`,
-`rerank.rs` — were implemented by the user, with Claude reviewing rather than writing them.
-Every phase was verified against real data in-browser, not just fixtures.
+All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`,
+`rerank.rs`, `auth.rs` — were implemented by the user, with Claude reviewing rather than
+writing them. Every phase was verified against real data, not just fixtures.
 
-**Phase 5 (authentication) is in progress.** Everything around the auth core is built and
-verified: migrations, `users`/`sessions`/`oauth_identities`, the `CurrentUser` extractor, all
-routes, per-account scoping of every data query, and the frontend session plumbing. What
-remains is the `[learn]` half in `src/auth.rs` — password hashing/verification, session
-issuance/validation, and the Google OAuth flow — which the user writes.
+`cargo test`: **113 passed, 0 failed**, clippy clean.
 
-`cargo test`: **84 passed, 19 failed**. Every failure describes unwritten `[learn]` work and
-is expected:
+Phase 5 delivered password auth (Argon2id), server-side revocable sessions, per-account
+scoping of every data query, Google OAuth sign-in and linking, and the frontend session
+plumbing. See "Phase 5 verification" below for what was actually exercised against real data.
 
-- 16 in `auth.rs` — the password/session/OAuth tests, failing against deny-by-default
-  placeholders.
-- 3 in `rerank.rs` — the viewer-scoping tests added in Phase 5; see "Known gap" below.
-
-Clippy is clean. Until the `auth.rs` bodies exist, **the app cannot be signed into**:
-registration returns 501 and every data route returns 401. That's the designed state, not a
-regression.
+**Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
+statistics; weighting personal vs. global feedback in `rerank`), rate limiting on
+`POST /reviews`, and a moderation path for `hidden`.
 
 ### Scoring models, in one place
 
@@ -225,9 +218,22 @@ Deliberate choices worth not "fixing":
   *frontend* at the LAN URL** rather than pointing the API at it. The env var still overrides,
   for a real deployment where the two are genuinely different hosts — but that needs
   `SameSite=None; Secure` and therefore HTTPS on both ends.
+- **One host, everywhere. `localhost` and `127.0.0.1` are different hosts** to both the cookie
+  jar and Google. This has bitten twice: once via `NEXT_PUBLIC_FRIDGE_API_URL` (above), once
+  via `GOOGLE_REDIRECT_URI`. In the OAuth case the state cookie is set on whichever host
+  `/auth/google/start` was reached on, and Google then redirects to `GOOGLE_REDIRECT_URI` — if
+  those hosts differ the cookie isn't sent and the callback fails the state check. Keep
+  `GOOGLE_REDIRECT_URI`, `FRONTEND_ORIGIN`, and the host you actually browse on identical.
+  Register both variants in Google Cloud Console if you like; only `.env` has to be consistent.
 - Backend binds `0.0.0.0` on purpose. Every data route now requires a session, but
   `COOKIE_SECURE` defaults to off (plain HTTP on a LAN), so still trusted networks only.
 - `apps/fridge-app/backend/.env.example` documents every env var; `.env` is gitignored.
+  **Copying it verbatim leaves every line commented out** — the file is written as
+  documentation. `dotenvy` then sets nothing and the backend logs `Google OAuth not
+  configured`. Uncomment what you fill in.
+- **Verify auth changes against a copy of `fridge.db`, not the real one.** The first
+  registration permanently claims the pre-auth rows; a throwaway test account would take them.
+  `cp fridge.db /tmp/x.db` then `DATABASE_URL="sqlite:///tmp/x.db?mode=rwc" cargo run`.
 - Repo root `.claude/launch.json` (`cwd: frontend`) is this project's dev-preview config; an
   unrelated `/Users/jesseli/projects/meal/.claude/launch.json` also exists — not this project.
 - `fridge.db` currently holds 16 seeded reviews across 10 recipes (backdated `cooked_at`), 4
@@ -247,7 +253,50 @@ Deliberate choices worth not "fixing":
 - `favorites_land_only_in_their_slots_and_only_when_eligible` uses 11 candidates, where all
   three slots fit — it can't exercise the slot-capacity boundary. A fixture at ≤8 would.
 
-## Working patterns from Phase 1–4 scoring bugs
+## Working patterns from Phase 1–5
+
+### Rust cannot check the inside of a string (Phase 5's dominant lesson)
+
+Every Phase 5 bug that survived compilation lived in a string literal — a contract with
+something *outside* the program that the type system has no visibility into:
+
+| Contract | Symptom | How to check it in five seconds |
+|---|---|---|
+| SQL passed to `sqlx::query` | `row value misused`, `syntax error near "."` | paste into `sqlite3 fridge.db` |
+| A URL | `404`, or a serde "missing field" error | `curl -i` it — **404 means wrong, 401 means right-but-unauthenticated** |
+| JSON field names | `missing field 'subject'` | Google's discovery doc / `claims_supported` |
+
+`sqlx::query` does not parse its argument; `Client::post` does not validate its URL; serde
+cannot know what the server actually sends. Three separate SQL strings and two wrong URLs
+compiled cleanly this phase.
+
+**When an error message doesn't fit the code you're staring at, suspect the string.** "Missing
+field `subject`" was a wrong URL. "Row value misused" was a stray pair of parentheses in SQL.
+
+### Untested code is where the bugs live
+
+Phase 5's four worst bugs were all in paths that had **never executed** — the OAuth callback,
+the Google account-creation branch, `validate_session`, `exchange_google_code`. `cargo test`
+reported 110 passing while Google sign-in was completely broken, because none of those had a
+test and none could be reached without full OAuth configuration.
+
+Corollary: when a function can't be unit-tested (network, live pool), that is a reason to
+verify it *harder* by hand, not a reason to assume it works. The DB-backed session tests in
+`auth.rs` (`test_pool()`, in-memory SQLite from the real migrations) caught the `validate_session`
+SQL bug on their first run.
+
+### Beware the vacuous pass
+
+A test going green is not evidence unless it *could* have failed. This phase produced three:
+
+- Three password tests passed against a `verify_password` that denied everyone.
+- `a_strangers_high_ratings_do_not_make_a_recipe_your_favorite` passed because its fixture
+  tripped the rank gate before reaching the quality gate it was written to test.
+- `session_tokens_are_unique_across_calls` passed on a 32-bit token.
+
+When a test goes green, ask what would make it red.
+
+### From Phase 1–4 scoring bugs
 
 Enforce numeric invariants by construction. Name and derive constants instead of repeating
 magic literals. Give any continuous score an explicit threshold — `>` vs `>=` on
@@ -275,57 +324,102 @@ a sort a no-op announced only by an `unused variable` warning; `f64` has no `Ord
 Repo root, branch `main`, remote `origin` →
 `git@github.com:terrificjesse/personal-website.git` over SSH (`~/.ssh/id_ed25519`).
 
-## Known gap: `rerank.rs` viewer scoping (user's `[learn]` file — do not edit for them)
+## `rerank.rs` viewer scoping — fixed 2026-08-15
 
-A Phase 4 note here claimed `score_recipe` ignores `viewer` while `is_favorite_eligible`
-honours it. **That was wrong in a way that matters: neither one honours it.** Both take
-`_viewer`, neither calls `Review::is_by`, and the caller doesn't pre-filter either — `map` in
-`rerank_recommendations` is built from the whole `reviews` slice. So it isn't an inconsistency
-between two functions; both are unscoped, and `is_favorite_eligible`'s doc comment describes
-scoping the code doesn't do.
+A Phase 4 note here claimed `score_recipe` ignored `viewer` while `is_favorite_eligible`
+honoured it. **That was wrong in a way that mattered: neither honoured it.** Both took
+`_viewer`, neither called `Review::is_by`, and the caller didn't pre-filter — so both pooled
+strangers' reviews into the viewer's own.
 
-Three tests were added in Phase 5 to pin the required behavior. All three fail today:
+Both now filter internally with `is_by(viewer)`, matching the `routes/recipes.rs` precedent
+(helpers scope themselves rather than trusting callers). `score_recipe` still receives the
+**full** per-recipe slice so the deferred personal-vs-global weighting has the crowd available
+— do not move that filter up to the grouping site in `rerank_recommendations`.
+
+Why it hid through Phase 4: every pre-existing test builds reviews via `review_at`, which
+hardcodes `user_id: Some(VIEWER)`. No fixture in the file could tell a scoped implementation
+from an unscoped one. Three tests were added to close that:
 
 - `a_strangers_rave_does_not_lift_a_recipe_in_your_ranking`
 - `a_recipe_only_strangers_have_reviewed_still_ranks`
 - `a_strangers_high_ratings_do_not_make_a_recipe_your_favorite` — **this one initially passed,
   vacuously.** Its first fixture put the stranger's 5★s *recently*, which made the recipe rank
   first, so the **rank gate** rejected it before the quality gate was ever consulted. Ageing
-  those reviews to 3000 days drops the base score without touching the undecayed eligibility
-  mean, and it then fails for the right reason. Same lesson as the Phase 4 favorite-capacity
-  bug: a fixture sized for the happy path can't reach the boundary the code trips on.
+  them to 3000 days drops the decayed base score without touching the undecayed eligibility
+  mean. Same lesson as the Phase 4 favorite-capacity bug: a fixture sized for the happy path
+  can't reach the boundary the code trips on.
 
-Note the whole reason this went unnoticed through Phase 4 is that every pre-existing test in
-`rerank.rs` builds reviews via `review_at`, which hardcodes `user_id: Some(VIEWER)` — no
-fixture there could tell a scoped implementation from an unscoped one.
+**Still worth doing:** `is_favorite_eligible`'s `sum / len` has no explicit empty guard. It
+returns the right answer via `0.0/0.0 = NaN` comparing false, which is accidental — and
+fragile, since `NaN < x` is *also* false, so the negated form would be silently wrong.
 
-What the fix should be (agreed, not yet written): scope **inside** both functions with
-`is_by`, matching the precedent already recorded above for `routes/recipes.rs` — the helpers
-scope internally rather than trusting callers. Keep passing `score_recipe` the *full*
-per-recipe slice so the Phase 5 `[learn]` personal-vs-global weighting still has the crowd's
-reviews to work with. Also guard `is_favorite_eligible`'s `sum / reviews.len()` against an
-empty slice explicitly: scoping makes empty reachable for the first time, and `0.0/0.0` is
-NaN, which compares false against everything and is only accidentally the right answer.
+Also still stale: six `#[allow(dead_code)]` in `rerank.rs`, one on `NEUTRAL_RATING` in
+`models.rs`, and the `TODO(you)` in `rerank.rs`'s module doc still describing the body as an
+empty-list placeholder. They produce no warnings *because* the attributes suppress them —
+delete and let the compiler say which were real.
 
-Stale scaffolding to delete in the same pass: every `#[allow(dead_code)]` in `rerank.rs` (all
-seven items are now used), the one on `NEUTRAL_RATING` in `models.rs`, and the `TODO(you)` in
-`rerank.rs`'s module doc still describing the body as an empty-list placeholder.
+## Phase 5 verification (2026-08-15)
+
+Run against **copies** of `fridge.db`, never the real one — the first registration permanently
+claims the 22 pre-auth rows, and that slot belongs to the user's own account.
+
+Password/session half, over HTTP and in-browser:
+
+- Register → `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000`, 64-hex token; `claimed 22
+  pre-auth rows`; logout deletes the row and the old cookie 401s.
+- Plaintext token appears in **no** column of `sessions` — only the SHA-256 digest.
+- **A fresh second account sees an empty fridge**: 0 items, 0 reviews, 0 liked. Suppression is
+  per-account (acct1 787 recipes, acct2 789).
+- Public review visible to the other account; private one not; another account's 5★ never
+  enters your liked list.
+- In-browser: `/fridge` redirects to `/login?next=…`, registration lands signed in, liked
+  section renders 8 with the Favorite badge on a real slot, logout returns to `/login`.
+
+`rerank` scoping, with a discriminating case per function:
+
+- **`score_recipe`** — acct2 wrote 32 fresh public 5★ across all 8 of acct1's liked recipes
+  (acct1's visible slice: 48 reviews). acct1's **top-3 did not move** across three samples.
+  Positions 0–2 are the right invariant to check: `FAVORITE_SLOTS[0]` is 3, so nothing can be
+  promoted above index 3 and those slots are pure base-score order.
+- **`is_favorite_eligible`** — recipe `53380` (Apple cake) has own-mean **3.67** but pooled-mean
+  **4.43**, and sits at index 4, so it passes the rank gate and is genuinely promotable. Across
+  20 samples it was **never badged**. Confirming it was promotable matters — otherwise the rank
+  gate would reject it first and the check would prove nothing.
+
+Liked count (8) and general-recommendation count (787) both match the Phase 4 checkpoint
+exactly, which is the best evidence the backfill and viewer threading changed nothing they
+shouldn't have.
+
+## Two scaffolding bugs Claude introduced in Phase 5
+
+Both were in `[gen]` code, both invisible to the test suite, both in paths that had never
+executed. Recorded because the *shape* recurs.
+
+1. **The OAuth state check could never pass.** `google_callback` added the removal cookie
+   before reading the incoming state — and `CookieJar::add` writes into the same map `get`
+   reads from, so `get` returned the empty value just inserted. `expected` was always
+   `Some("")`, so **every** callback returned `OAuthStateMismatch` regardless of config. Fix:
+   capture the incoming value first, then clear.
+2. **Google sign-in could strand the pre-auth rows forever.** `claim_unowned_rows` was wired
+   only into password registration. Creating the first account *via Google* skipped it, leaving
+   all 22 rows unclaimed and unreachable with no UI able to recover them. Fix:
+   `claim_if_first_account`, called from **both** account-creation paths inside their
+   transactions.
 
 ## Next up
 
-1. **Implement the `[learn]` bodies in `src/auth.rs`** — 16 failing tests describe them.
-2. **Fix the `rerank.rs` scoping** above — 2 failing tests describe it.
-3. Then run PLAN.md's Phase 5 checkpoint against real data, in-browser. Note the first
-   registration is load-bearing: it claims all 22 unclaimed rows, and the liked list should be
-   identical before and after that first login.
+Nothing blocking. In rough priority:
 
-Other loose ends, neither blocking:
+1. **Register the real account on `fridge.db`.** It is still 0 users / 16 unclaimed reviews.
+   That run claims the 22 rows for good — check the liked list reads 8 immediately after.
+2. **`is_favorite_eligible` empty guard** and the stale-attribute sweep above.
+3. **Unseeded `rand::rng()`** in `rerank_recommendations` — now confirmed live: four calls to
+   `/recipes/liked` with zero data change produced four different favorite pairs. Reloading the
+   recipes page makes badges jump, which reads as broken rather than as rotation.
+   `StdRng::seed_from_u64` with a date-derived seed gives daily rotation, stability within a
+   session, and pinnable tests.
+4. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
+   `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — verified
+   against the committed versions.
 
-- **Unseeded `rand::rng()`** in `rerank_recommendations` — the list reshuffles on every page
-  load and a surprising ranking can't be reproduced while debugging. `StdRng::seed_from_u64`
-  with a date-derived seed would give daily rotation plus pinnable tests.
-- **Two pre-existing lint errors** in the frontend (`react-hooks/set-state-in-effect` in
-  `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — verified
-  against the committed versions.
-
-`docs/TODO.md` holds three deferred ideas; none block Phase 5.
+`docs/TODO.md` holds four deferred ideas.
