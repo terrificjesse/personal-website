@@ -42,11 +42,20 @@
 //!
 //! ### On randomness
 //!
-//! Picking randomly among eligible favorites is intended, but an unseeded generator
-//! (`rand::rng()`) reshuffles the list on every page load and leaves the behavior untestable
-//! — you can never reproduce a ranking you're trying to debug. Seed it instead:
-//! `StdRng::seed_from_u64(..)` with a seed derived from the current *date* gives favorites
-//! that rotate daily, stay put within a session, and can be pinned to a fixed value in tests.
+//! Selection among eligible favorites is random but **seeded by the day**:
+//! `StdRng::seed_from_u64(now.num_days_from_ce() as u64)`. So the choice is stable for every
+//! request within a UTC day and changes at midnight — rotation, rather than a reshuffle on
+//! every page load. It was briefly unseeded (`rand::rng()`), which made the badges jump
+//! between reloads and meant a ranking you were debugging could never be reproduced.
+//!
+//! Seed from the `now` this function already computes, not a second `Utc::now()` — one clock
+//! read per pass, the same reasoning that makes `score_recipe` take `now` as a parameter.
+//!
+//! Two things this does **not** give you. Seeded random is not true rotation: a recipe can be
+//! picked several days running by chance, and another can go weeks unseen — there's no
+//! coverage guarantee. And the function is still not deterministic *in tests*, because `now`
+//! is read internally; promoting it to a parameter would make the whole thing pinnable and
+//! let a test assert which recipes get badged instead of only structural invariants.
 //!
 //! Note that `FAVORITE_SLOTS` starts at index 3, so nothing is injected into lists shorter
 //! than four — which is why none of the small-fixture ordering tests below are disturbed by
@@ -99,18 +108,11 @@
 //! That last one is the subtle one, and worth internalizing before you start: normalizing by
 //! total weight is exactly what throws away the information the tie-break test is asking
 //! about. At least two different models do satisfy all four; finding one is the exercise.
-//!
-//! TODO(you): replace the body of `rerank_recommendations`. The tests below describe the
-//! required behavior — they will fail against the current placeholder (which always returns
-//! an empty list) until you implement real scoring. See the "Working patterns" section of
-//! `apps/fridge-app/CLAUDE.md` for the pitfalls that bit `nlp.rs`, `recommend.rs`, and
-//! `recommend_recipes.rs` — this is the fourth scoring function here, so treat a green
-//! `cargo test` as necessary, not sufficient.
 
-use rand::seq::IndexedRandom;
+use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use serde::Serialize;
 
 use crate::models::{NEUTRAL_RATING, Recipe, Review};
@@ -118,11 +120,6 @@ use crate::models::{NEUTRAL_RATING, Recipe, Review};
 /// Why a recipe is sitting where it is in the ranking. Lives here rather than `models.rs`
 /// for the same reason `RecipeFilters` lives in `recommend_recipes.rs` — it describes this
 /// function's output, not a stored entity.
-// `dead_code` here and on the three constants below is scaffolding, not intent: nothing
-// constructs a `RankReason` or reads the thresholds until `rerank_recommendations` has a
-// body. Delete these attributes as you start using each one — if any is still unused when
-// you're finished, that's a real signal, not noise.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankReason {
@@ -151,7 +148,6 @@ pub struct RankedRecipe {
 /// `FAVORITE_SLOTS[0]` doubles as the rank gate: a recipe already ranked above it is
 /// ineligible, since moving it into a slot would demote it. Derive that bound from here
 /// rather than repeating `3`.
-#[allow(dead_code)]
 pub const FAVORITE_SLOTS: [usize; 3] = [3, 5, 7];
 
 /// Minimum mean rating (inclusive) for a recipe to be eligible as a favorite.
@@ -163,7 +159,6 @@ pub const FAVORITE_SLOTS: [usize; 3] = [3, 5, 7];
 /// Quality gate only. The rank gate that stops this from demoting your top results lives in
 /// `rerank_recommendations`, since eligibility by position can't be judged from one recipe's
 /// reviews alone.
-#[allow(dead_code)]
 pub const FAVORITE_MIN_MEAN_RATING: f64 = 4.0;
 
 /// Days until a review counts half as much in the **base** ranking.
@@ -175,7 +170,6 @@ pub const FAVORITE_MIN_MEAN_RATING: f64 = 4.0;
 /// it's a free parameter to tune by feel. Shorter makes the list feel current at the cost of
 /// forgetting quickly (at 60 a 5★ is worth 0.07 after a year); longer keeps favourites alive
 /// (at 120 that same review is still 0.62 after six months).
-#[allow(dead_code)]
 pub const DECAY_HALFLIFE: f64 = 120.0;
 
 /// Reorders `candidates` — all of which the viewer has already rated highly — using
@@ -252,10 +246,11 @@ pub fn rerank_recommendations(
         })
         .unwrap_or(0);
 
+    let seed = now.num_days_from_ce() as u64;
     // Sample indices, not recipes: the chosen ones have to be removed from the ranking
     // before they can be re-inserted at their slots, or they'd appear twice.
     let mut chosen: Vec<usize> = promotable
-        .sample(&mut rand::rng(), capacity)
+        .sample(&mut StdRng::seed_from_u64(seed), capacity)
         .copied()
         .collect();
 
@@ -280,7 +275,6 @@ pub fn rerank_recommendations(
 ///
 /// `now` is passed in rather than read from the clock so that every recipe in a single
 /// ranking pass is mseasured against the same instant, and so tests can pin it.
-#[allow(dead_code)]
 fn score_recipe(reviews: &[&Review], viewer: Option<&str>, now: DateTime<Utc>) -> f64 {
     reviews
         .iter()
@@ -313,6 +307,9 @@ fn score_recipe(reviews: &[&Review], viewer: Option<&str>, now: DateTime<Utc>) -
 /// Takes no `now` for that reason — nothing here is time-dependent.
 fn is_favorite_eligible(reviews: &[&Review], viewer: Option<&str>) -> bool {
     let filtered: Vec<&&Review> = reviews.iter().filter(|r| r.is_by(viewer)).collect();
+    if filtered.is_empty() {
+        return false;
+    }
     let sum = filtered.iter().fold(0.0, |acc, r| acc + r.rating as f64);
     sum / filtered.len() as f64 >= FAVORITE_MIN_MEAN_RATING
 }
@@ -326,7 +323,6 @@ fn is_favorite_eligible(reviews: &[&Review], viewer: Option<&str>) -> bool {
 ///
 /// Slots past the end of a short list are skipped rather than clamped — appending a favorite
 /// to a 3-item list would put it last, which is the opposite of surfacing it.
-#[allow(dead_code)]
 fn interleave_favorites(ranked: Vec<Recipe>, favorites: Vec<Recipe>) -> Vec<RankedRecipe> {
     let mut result: Vec<RankedRecipe> = ranked
         .into_iter()

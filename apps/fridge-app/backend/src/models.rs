@@ -291,9 +291,6 @@ pub const MAX_RATING: i64 = 5;
 /// This is the scale's midpoint, not necessarily the right center for every model — centering
 /// on the user's own mean rating is a defensible alternative if most of their ratings cluster
 /// high.
-// Remove this attribute once `rerank.rs` uses the constant — same scaffolding note as the
-// `FAVORITE_*` constants there.
-#[allow(dead_code)]
 pub const NEUTRAL_RATING: f64 = (MIN_RATING + MAX_RATING) as f64 / 2.0;
 
 /// Cap on `Review.notes`. Nothing enforced this before; once reviews are world-readable an

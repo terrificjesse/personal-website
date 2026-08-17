@@ -33,6 +33,11 @@ statistics; weighting personal vs. global feedback in `rerank`), rate limiting o
   rave from reading as a bad review (raw ratings decay toward 0, *below* the 1–5 scale); max
   rather than sum encodes the user's preference for peak quality over cooking frequency.
   `DECAY_HALFLIFE = 120.0` is a free parameter — verified none of the ordering tests pin it.
+  Favorite selection is random but **seeded by the day** (`num_days_from_ce()`), so the badges
+  are stable for every request within a UTC day and rotate at midnight. Verified 2026-08-15:
+  six consecutive calls returned identical favorites, where unseeded they changed every time.
+  Note this is seeded random, not true rotation — no coverage guarantee, so a recipe can
+  repeat or be skipped for a stretch.
 
 ### The three review-driven behaviors, and where each lives
 
@@ -413,12 +418,7 @@ Nothing blocking. In rough priority:
 1. **Register the real account on `fridge.db`.** It is still 0 users / 16 unclaimed reviews.
    That run claims the 22 rows for good — check the liked list reads 8 immediately after.
 2. **`is_favorite_eligible` empty guard** and the stale-attribute sweep above.
-3. **Unseeded `rand::rng()`** in `rerank_recommendations` — now confirmed live: four calls to
-   `/recipes/liked` with zero data change produced four different favorite pairs. Reloading the
-   recipes page makes badges jump, which reads as broken rather than as rotation.
-   `StdRng::seed_from_u64` with a date-derived seed gives daily rotation, stability within a
-   session, and pinnable tests.
-4. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
+3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — verified
    against the committed versions.
 
