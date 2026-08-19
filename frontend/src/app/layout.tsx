@@ -19,7 +19,10 @@ export const metadata: Metadata = {
   description: "A small multi-tab personal project site.",
 };
 
-const tabs = [{ href: "/fridge", label: "Fridge" }];
+const tabs = [
+  { href: "/fridge", label: "Fridge" },
+  { href: "/blog", label: "Blog" },
+];
 
 export default function RootLayout({
   children,

@@ -11,6 +11,11 @@ export default function Home() {
             Fridge
           </Link>
         </li>
+        <li>
+          <Link href="/blog" className="underline underline-offset-4">
+            Blog
+          </Link>
+        </li>
       </ul>
     </div>
   );

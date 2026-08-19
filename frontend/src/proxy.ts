@@ -62,11 +62,18 @@ export default function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Only the fridge tab is behind auth. The site shell (`/`) stays public — it's a personal
-  // project site whose landing page has nothing user-specific on it, and future tabs get to
-  // make their own call rather than inheriting the fridge app's.
+  // The fridge tab and the blog editor are behind auth. The site shell (`/`) and the public
+  // blog (`/blog`, `/blog/[slug]`) stay open — a personal project site's landing pages have
+  // nothing user-specific on them, and future tabs get to make their own call rather than
+  // inheriting the fridge app's.
+  //
+  // Note this only gates on the cookie *existing*, same limitation as everywhere else in this
+  // file — it cannot tell an admin account from an ordinary signed-in one. That check is
+  // `RequireAdmin` on the backend; `/blog/admin/page.tsx` also checks `is_admin` from
+  // `/auth/me` so a signed-in non-admin sees a message instead of the editor UI, but neither
+  // of those is what stops a non-admin from writing a post — the backend is.
   //
   // `/login` and `/register` are deliberately **not** matched. They must always render, or a
   // stale cookie locks the user out of the only page that could fix it.
-  matcher: ["/fridge/:path*"],
+  matcher: ["/fridge/:path*", "/blog/admin/:path*"],
 };

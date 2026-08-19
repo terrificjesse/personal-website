@@ -1,4 +1,3 @@
-
 use serde::Deserialize;
 
 use argon2::{
@@ -38,6 +37,8 @@ pub enum AuthError {
     Database(sqlx::Error),
     Hashing(String),
     NotImplemented(&'static str),
+    /// The requester is authenticated but not allowed to do this — see `require_admin`.
+    Forbidden,
 }
 
 impl From<sqlx::Error> for AuthError {
@@ -69,6 +70,16 @@ pub fn verify_password(plaintext: &str, phc_hash: &str) -> Result<bool, AuthErro
         Err(password_hash::Error::Password) => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Decides whether `user` may access admin-only routes (currently: the blog editor).
+/// Called by the `RequireAdmin` extractor (`routes/auth.rs`) on every admin route, so this is
+/// the single place that decision is made.
+pub fn require_admin(user: &User) -> Result<(), AuthError> {
+    if !user.is_admin {
+        return Err(AuthError::Forbidden);
+    }
+    Ok(())
 }
 
 /// Issues a session to a user
@@ -117,7 +128,7 @@ pub async fn validate_session(pool: &SqlitePool, token: &str) -> Result<Option<U
     let now = Utc::now();
     let token_hash = session_token_hash(token);
     Ok(sqlx::query_as::<_, User>(
-        "SELECT u.id, u.email, u.password_hash, u.created_at
+        "SELECT u.id, u.email, u.password_hash, u.created_at, u.is_admin
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?",
     )
@@ -268,7 +279,6 @@ pub fn generate_oauth_state() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     const PASSWORD: &str = "correct horse battery staple";
 
@@ -446,7 +456,6 @@ mod tests {
             "redirect_uri must be percent-encoded, not spliced in raw"
         );
     }
-
 
     use sqlx::sqlite::SqlitePoolOptions;
 

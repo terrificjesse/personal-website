@@ -154,6 +154,9 @@ pub struct User {
     /// The hashed password for security
     pub password_hash: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Grants access to admin-only features (currently: the blog editor). Not settable
+    /// through any API — see migration `0009_add_user_admin_flag.sql`.
+    pub is_admin: bool,
 }
 
 pub fn normalize_email(email: &str) -> String {
@@ -228,6 +231,64 @@ pub struct AddReviewRequest {
     pub is_public: bool,
 }
 
+/// A blog post. Every post has an author and is either a draft (visible only to admins) or
+/// published (visible to everyone) — see `routes/blog.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BlogPost {
+    pub id: String,
+    pub author_id: String,
+    pub title: String,
+    /// URL-safe identifier, derived from the title at creation time and stable afterwards.
+    pub slug: String,
+    pub body: String,
+    pub published: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBlogPostRequest {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub published: bool,
+}
+
+/// Every field optional: only what's present in the request changes.
+#[derive(Debug, Deserialize)]
+pub struct UpdateBlogPostRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub published: Option<bool>,
+}
+
+pub const MAX_BLOG_TITLE_LENGTH: usize = 200;
+pub const MAX_BLOG_BODY_LENGTH: usize = 100_000;
+
+/// Turns a title into a URL-safe slug: lowercased, runs of non-alphanumeric characters
+/// collapsed to a single hyphen, no leading or trailing hyphen. Not unique by itself — see
+/// `routes/blog.rs::unique_slug` for the collision handling a plain function can't do.
+pub fn slugify(title: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    let mut last_was_hyphen = true; // suppresses a leading hyphen
+
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            slug.push('-');
+            last_was_hyphen = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    slug
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +321,25 @@ mod tests {
     #[test]
     fn a_pre_auth_review_belongs_to_nobody_once_accounts_exist() {
         assert!(!review(None).is_by(Some("me")));
+    }
+
+    #[test]
+    fn slugify_lowercases_and_hyphenates() {
+        assert_eq!(slugify("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_collapses_punctuation_runs_to_one_hyphen() {
+        assert_eq!(slugify("A, B & C -- Ready?"), "a-b-c-ready");
+    }
+
+    #[test]
+    fn slugify_trims_leading_and_trailing_punctuation() {
+        assert_eq!(slugify("  --Fridge Notes!!--  "), "fridge-notes");
+    }
+
+    #[test]
+    fn slugify_of_an_all_punctuation_title_is_empty() {
+        assert_eq!(slugify("!!!"), "");
     }
 }

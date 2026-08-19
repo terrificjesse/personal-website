@@ -1,4 +1,3 @@
-
 use axum::{
     Json,
     extract::{FromRef, FromRequestParts, Query, State},
@@ -27,6 +26,7 @@ pub struct AuthenticatedUser {
     pub id: String,
     pub email: String,
     pub created_at: DateTime<Utc>,
+    pub is_admin: bool,
 }
 
 impl From<&User> for AuthenticatedUser {
@@ -35,6 +35,7 @@ impl From<&User> for AuthenticatedUser {
             id: user.id.clone(),
             email: user.email.clone(),
             created_at: user.created_at,
+            is_admin: user.is_admin,
         }
     }
 }
@@ -50,6 +51,12 @@ impl CurrentUser {
 
 #[derive(Debug, Clone)]
 pub struct MaybeUser(pub Option<User>);
+
+/// Like `CurrentUser`, but also requires `auth::require_admin` to pass. A route taking this
+/// instead of `CurrentUser` is, by its signature alone, admin-only — same reasoning as why
+/// every data route already takes `CurrentUser` rather than relying on a middleware list.
+#[derive(Debug, Clone)]
+pub struct RequireAdmin(pub User);
 
 /// Uses the current cookie to validate the session
 async fn user_from_jar(pool: &SqlitePool, jar: &CookieJar) -> Result<Option<User>, AuthError> {
@@ -88,6 +95,20 @@ where
         let MaybeUser(user) = MaybeUser::from_request_parts(parts, state).await?;
 
         user.map(CurrentUser).ok_or(AuthError::InvalidCredentials)
+    }
+}
+
+impl<S> FromRequestParts<S> for RequireAdmin
+where
+    SqlitePool: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
+        auth::require_admin(&user)?;
+        Ok(RequireAdmin(user))
     }
 }
 
@@ -184,6 +205,10 @@ impl IntoResponse for AuthError {
                 eprintln!("auth: {what} is not implemented yet (see src/auth.rs)");
                 (StatusCode::NOT_IMPLEMENTED, "This is not implemented yet")
             }
+            AuthError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "You don't have permission to do that",
+            ),
         };
 
         (status, Json(ErrorBody { error })).into_response()
@@ -264,6 +289,7 @@ pub async fn register(
         email,
         password_hash: Some(password_hash),
         created_at,
+        is_admin: false,
     };
 
     Ok((
@@ -329,7 +355,7 @@ pub async fn login(
     let email = normalize_email(&req.email);
 
     let user: Option<User> = sqlx::query_as::<_, User>(
-        "SELECT id, email, password_hash, created_at FROM users WHERE email = ?",
+        "SELECT id, email, password_hash, created_at, is_admin FROM users WHERE email = ?",
     )
     .bind(&email)
     .fetch_optional(&pool)
@@ -534,7 +560,6 @@ async fn link_google_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn a_short_password_is_rejected() {

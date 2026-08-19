@@ -3,25 +3,23 @@
 Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
-Trimmed 2026-08-13 after Phase 4. Decisions are recorded here as *rules*; the reasoning behind
-them is in git history and in each module's own doc comment. When a module doc and this file
-disagree, the module doc wins — it's closer to the code.
+Trimmed 2026-08-19. Decisions are recorded here as *rules*; the reasoning behind them is in
+git history, in `docs/PLAN.md`'s phase checkpoints, and in each module's own doc comment.
+When a module doc and this file disagree, the module doc wins — it's closer to the code.
 
-## Current status: Phases 1–5 complete (2026-08-15)
+## Current status: Phases 1–5 complete; blog tab added 2026-08-19
 
 All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`,
 `rerank.rs`, `auth.rs` — were implemented by the user, with Claude reviewing rather than
-writing them. Every phase was verified against real data, not just fixtures.
+writing them. Every phase was verified against real data, not just fixtures; the per-phase
+evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **113 passed, 0 failed**, clippy clean.
+`cargo test`: **117 passed, 0 failed**, clippy clean.
 
-Phase 5 delivered password auth (Argon2id), server-side revocable sessions, per-account
-scoping of every data query, Google OAuth sign-in and linking, and the frontend session
-plumbing. See "Phase 5 verification" below for what was actually exercised against real data.
-
-**Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
-statistics; weighting personal vs. global feedback in `rerank`), rate limiting on
-`POST /reviews`, and a moderation path for `hidden`.
+**Still open, none blocking:** `auth::require_admin` is a deliberate `[learn]` stub that denies
+everyone (see "Admin flag & blog"); the deferred `[learn]` items in PLAN.md (small-sample
+rating statistics; weighting personal vs. global feedback in `rerank`); rate limiting on
+`POST /reviews`; and a moderation path for `hidden`.
 
 ### Scoring models, in one place
 
@@ -38,6 +36,14 @@ statistics; weighting personal vs. global feedback in `rerank`), rate limiting o
   six consecutive calls returned identical favorites, where unseeded they changed every time.
   Note this is seeded random, not true rotation — no coverage guarantee, so a recipe can
   repeat or be skipped for a stretch.
+
+**Viewer scoping in `rerank.rs`:** `score_recipe` and `is_favorite_eligible` both filter
+internally with `Review::is_by(viewer)`, matching the `routes/recipes.rs` precedent (helpers
+scope themselves rather than trusting callers). `score_recipe` still receives the **full**
+per-recipe slice so the deferred personal-vs-global weighting has the crowd available — **do
+not move that filter up** to the grouping site in `rerank_recommendations`. Three tests pin
+this (`a_strangers_rave_does_not_lift_a_recipe_in_your_ranking` and neighbors); the older
+fixtures cannot, since `review_at` hardcodes `user_id: Some(VIEWER)`.
 
 ### The three review-driven behaviors, and where each lives
 
@@ -246,6 +252,37 @@ Deliberate choices worth not "fixing":
   currently unclaimed (`user_id IS NULL`)** and stays invisible until the first account
   registers. `fridge.db.pre-phase5-backup` is a copy taken before migrations 0007/0008 ran.
 
+## Admin flag & blog (added 2026-08-19)
+
+`users.is_admin` (migration `0009`) gates access to admin-only features — currently just the
+blog editor. Not settable through any API; grant it to your own account directly:
+`sqlite3 fridge.db "UPDATE users SET is_admin = 1 WHERE email = 'you@example.com';"`.
+
+- **`auth::require_admin(user: &User) -> Result<(), AuthError>` is a `[learn]` stub**,
+  deliberately left denying everyone (`Err(AuthError::Forbidden)`), same convention as the
+  rest of `auth.rs`: a placeholder that *grants* access returns the denying value rather than
+  `todo!()`. Implement the real `user.is_admin` check yourself. Until you do, every
+  `RequireAdmin`-gated route 403s regardless of the flag.
+- `routes::auth::RequireAdmin` is the `[gen]` extractor built on top of it — wraps
+  `CurrentUser`, then calls `require_admin`. Every write route in `routes/blog.rs` takes it
+  instead of `CurrentUser`, same "route signature is the authority" pattern Phase 5 already
+  established.
+- The blog itself (`blog_posts` table, migration `0010`; `src/routes/blog.rs`;
+  `frontend/src/app/blog/`) is a **separate top-level tab**, not part of the fridge app —
+  per the root `CLAUDE.md`'s "each tab is a self-contained mini-project," even though it
+  currently shares this backend and its auth/users table. `GET /blog/posts` and
+  `GET /blog/posts/by-slug/{slug}` are public (via `MaybeUser`, not `CurrentUser`) so signed-out
+  visitors can read published posts; drafts are visible only to an admin. Write routes
+  (`POST /blog/posts`, `PATCH /blog/posts/{id}`, `DELETE /blog/posts/{id}`) are admin-only.
+- `slug` (`models::slugify`, `[gen]`, deterministic) is stored at creation and never rewritten
+  on a title edit, so a published URL stays stable. `routes/blog.rs::unique_slug` appends
+  `-2`, `-3`, ... on collision.
+- Frontend: `frontend/src/proxy.ts`'s matcher now also covers `/blog/admin/:path*` (same
+  cookie-presence-only check as `/fridge`). `/blog/admin/page.tsx` additionally checks
+  `is_admin` from `/auth/me` so a signed-in non-admin sees a message instead of the editor —
+  but that check, like the proxy, is optimistic UI only; `RequireAdmin` on the backend is the
+  actual enforcement.
+
 ## Open technical debt
 
 - `foodkeeper_product_id` on a collapsed name (e.g. `Ham`, 20 CSV rows) is just the first row's
@@ -260,10 +297,10 @@ Deliberate choices worth not "fixing":
 
 ## Working patterns from Phase 1–5
 
-### Rust cannot check the inside of a string (Phase 5's dominant lesson)
-
-Every Phase 5 bug that survived compilation lived in a string literal — a contract with
-something *outside* the program that the type system has no visibility into:
+**Rust cannot check the inside of a string.** Every Phase 5 bug that survived compilation
+lived in a string literal — a contract with something *outside* the program. `sqlx::query`
+does not parse its argument, `Client::post` does not validate its URL, serde cannot know what
+the server actually sends.
 
 | Contract | Symptom | How to check it in five seconds |
 |---|---|---|
@@ -271,155 +308,55 @@ something *outside* the program that the type system has no visibility into:
 | A URL | `404`, or a serde "missing field" error | `curl -i` it — **404 means wrong, 401 means right-but-unauthenticated** |
 | JSON field names | `missing field 'subject'` | Google's discovery doc / `claims_supported` |
 
-`sqlx::query` does not parse its argument; `Client::post` does not validate its URL; serde
-cannot know what the server actually sends. Three separate SQL strings and two wrong URLs
-compiled cleanly this phase.
+When an error message doesn't fit the code you're staring at, suspect the string.
 
-**When an error message doesn't fit the code you're staring at, suspect the string.** "Missing
-field `subject`" was a wrong URL. "Row value misused" was a stray pair of parentheses in SQL.
+**Untested code is where the bugs live.** Phase 5's four worst bugs were all in paths that had
+never executed (OAuth callback, Google account creation, `validate_session`,
+`exchange_google_code`) — `cargo test` reported 110 passing while Google sign-in was
+completely broken. When a function can't be unit-tested (network, live pool), that is a reason
+to verify it *harder* by hand, not to assume it works.
 
-### Untested code is where the bugs live
+**Beware the vacuous pass.** A green test is not evidence unless it *could* have failed. Three
+real examples: three password tests passed against a `verify_password` that denied everyone;
+`a_strangers_high_ratings_do_not_make_a_recipe_your_favorite` passed because its fixture
+tripped the rank gate before reaching the quality gate under test;
+`session_tokens_are_unique_across_calls` passed on a 32-bit token.
 
-Phase 5's four worst bugs were all in paths that had **never executed** — the OAuth callback,
-the Google account-creation branch, `validate_session`, `exchange_google_code`. `cargo test`
-reported 110 passing while Google sign-in was completely broken, because none of those had a
-test and none could be reached without full OAuth configuration.
+**A fixture sized for the happy path can't reach the boundary the code trips on.** The Phase 4
+favorite-capacity bug dropped a recipe when the chosen count exceeded the placeable slots — the
+test used 11 candidates where all three slots fit; real data had 8. When behavior depends on
+collection size, test at a size where the resource runs out.
 
-Corollary: when a function can't be unit-tested (network, live pool), that is a reason to
-verify it *harder* by hand, not a reason to assume it works. The DB-backed session tests in
-`auth.rs` (`test_pool()`, in-memory SQLite from the real migrations) caught the `validate_session`
-SQL bug on their first run.
+**Don't trust a green suite without checking real data.** Four scoring functions shipped
+passing tests while getting real data wrong (`nlp.rs` once, `recommend_recipes.rs` twice,
+`rerank.rs` once) — every one invisible to `cargo test`, obvious on first real input.
 
-### Beware the vacuous pass
-
-A test going green is not evidence unless it *could* have failed. This phase produced three:
-
-- Three password tests passed against a `verify_password` that denied everyone.
-- `a_strangers_high_ratings_do_not_make_a_recipe_your_favorite` passed because its fixture
-  tripped the rank gate before reaching the quality gate it was written to test.
-- `session_tokens_are_unique_across_calls` passed on a 32-bit token.
-
-When a test goes green, ask what would make it red.
-
-### From Phase 1–4 scoring bugs
-
-Enforce numeric invariants by construction. Name and derive constants instead of repeating
-magic literals. Give any continuous score an explicit threshold — `>` vs `>=` on
-`FAVORITE_MIN_MEAN_RATING` silently excluded every recipe rated exactly 4★. Check a branch is
+Also: enforce numeric invariants by construction; name and derive constants rather than
+repeating magic literals; give any continuous score an explicit threshold (`>` vs `>=` on
+`FAVORITE_MIN_MEAN_RATING` silently excluded every recipe rated exactly 4★); check a branch is
 reachable before writing it.
 
-Above all: **don't trust a green test suite without checking against real data.** Four scoring
-functions have shipped passing tests while getting real data wrong — `nlp.rs` once,
-`recommend_recipes.rs` twice, `rerank.rs` once. Every one was invisible to `cargo test` and
-obvious the moment real data ran through it.
-
-Phase 4's is worth remembering for *why* the test missed it: the favorite-capacity bug dropped
-a recipe when the chosen count exceeded what the slots could hold, but the test used 11
-candidates where all three slots fit. The real fixture had 8. **A fixture sized for the happy
-path can't exercise the boundary the code trips on** — when behavior depends on collection
-size, test at a size where the resource runs out.
-
-Rust traps hit in this project: `^` is XOR, not exponentiation (`powf`; on integers `^`
-compiles and silently computes nonsense); `b.total_cmp(b)` compares a value with itself, making
-a sort a no-op announced only by an `unused variable` warning; `f64` has no `Ord`, so use
-`total_cmp` rather than `partial_cmp().unwrap()`; `&Vec<T>` has no `Default` but `&[T]` does.
+Rust traps hit here: `^` is XOR, not exponentiation (`powf`; on integers `^` compiles and
+silently computes nonsense); `b.total_cmp(b)` compares a value with itself, making a sort a
+no-op announced only by an `unused variable` warning; `f64` has no `Ord`, so use `total_cmp`
+rather than `partial_cmp().unwrap()`; `&Vec<T>` has no `Default` but `&[T]` does.
 
 ## Git / GitHub
 
 Repo root, branch `main`, remote `origin` →
 `git@github.com:terrificjesse/personal-website.git` over SSH (`~/.ssh/id_ed25519`).
 
-## `rerank.rs` viewer scoping — fixed 2026-08-15
-
-A Phase 4 note here claimed `score_recipe` ignored `viewer` while `is_favorite_eligible`
-honoured it. **That was wrong in a way that mattered: neither honoured it.** Both took
-`_viewer`, neither called `Review::is_by`, and the caller didn't pre-filter — so both pooled
-strangers' reviews into the viewer's own.
-
-Both now filter internally with `is_by(viewer)`, matching the `routes/recipes.rs` precedent
-(helpers scope themselves rather than trusting callers). `score_recipe` still receives the
-**full** per-recipe slice so the deferred personal-vs-global weighting has the crowd available
-— do not move that filter up to the grouping site in `rerank_recommendations`.
-
-Why it hid through Phase 4: every pre-existing test builds reviews via `review_at`, which
-hardcodes `user_id: Some(VIEWER)`. No fixture in the file could tell a scoped implementation
-from an unscoped one. Three tests were added to close that:
-
-- `a_strangers_rave_does_not_lift_a_recipe_in_your_ranking`
-- `a_recipe_only_strangers_have_reviewed_still_ranks`
-- `a_strangers_high_ratings_do_not_make_a_recipe_your_favorite` — **this one initially passed,
-  vacuously.** Its first fixture put the stranger's 5★s *recently*, which made the recipe rank
-  first, so the **rank gate** rejected it before the quality gate was ever consulted. Ageing
-  them to 3000 days drops the decayed base score without touching the undecayed eligibility
-  mean. Same lesson as the Phase 4 favorite-capacity bug: a fixture sized for the happy path
-  can't reach the boundary the code trips on.
-
-**Still worth doing:** `is_favorite_eligible`'s `sum / len` has no explicit empty guard. It
-returns the right answer via `0.0/0.0 = NaN` comparing false, which is accidental — and
-fragile, since `NaN < x` is *also* false, so the negated form would be silently wrong.
-
-Also still stale: six `#[allow(dead_code)]` in `rerank.rs`, one on `NEUTRAL_RATING` in
-`models.rs`, and the `TODO(you)` in `rerank.rs`'s module doc still describing the body as an
-empty-list placeholder. They produce no warnings *because* the attributes suppress them —
-delete and let the compiler say which were real.
-
-## Phase 5 verification (2026-08-15)
-
-Run against **copies** of `fridge.db`, never the real one — the first registration permanently
-claims the 22 pre-auth rows, and that slot belongs to the user's own account.
-
-Password/session half, over HTTP and in-browser:
-
-- Register → `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000`, 64-hex token; `claimed 22
-  pre-auth rows`; logout deletes the row and the old cookie 401s.
-- Plaintext token appears in **no** column of `sessions` — only the SHA-256 digest.
-- **A fresh second account sees an empty fridge**: 0 items, 0 reviews, 0 liked. Suppression is
-  per-account (acct1 787 recipes, acct2 789).
-- Public review visible to the other account; private one not; another account's 5★ never
-  enters your liked list.
-- In-browser: `/fridge` redirects to `/login?next=…`, registration lands signed in, liked
-  section renders 8 with the Favorite badge on a real slot, logout returns to `/login`.
-
-`rerank` scoping, with a discriminating case per function:
-
-- **`score_recipe`** — acct2 wrote 32 fresh public 5★ across all 8 of acct1's liked recipes
-  (acct1's visible slice: 48 reviews). acct1's **top-3 did not move** across three samples.
-  Positions 0–2 are the right invariant to check: `FAVORITE_SLOTS[0]` is 3, so nothing can be
-  promoted above index 3 and those slots are pure base-score order.
-- **`is_favorite_eligible`** — recipe `53380` (Apple cake) has own-mean **3.67** but pooled-mean
-  **4.43**, and sits at index 4, so it passes the rank gate and is genuinely promotable. Across
-  20 samples it was **never badged**. Confirming it was promotable matters — otherwise the rank
-  gate would reject it first and the check would prove nothing.
-
-Liked count (8) and general-recommendation count (787) both match the Phase 4 checkpoint
-exactly, which is the best evidence the backfill and viewer threading changed nothing they
-shouldn't have.
-
-## Two scaffolding bugs Claude introduced in Phase 5
-
-Both were in `[gen]` code, both invisible to the test suite, both in paths that had never
-executed. Recorded because the *shape* recurs.
-
-1. **The OAuth state check could never pass.** `google_callback` added the removal cookie
-   before reading the incoming state — and `CookieJar::add` writes into the same map `get`
-   reads from, so `get` returned the empty value just inserted. `expected` was always
-   `Some("")`, so **every** callback returned `OAuthStateMismatch` regardless of config. Fix:
-   capture the incoming value first, then clear.
-2. **Google sign-in could strand the pre-auth rows forever.** `claim_unowned_rows` was wired
-   only into password registration. Creating the first account *via Google* skipped it, leaving
-   all 22 rows unclaimed and unreachable with no UI able to recover them. Fix:
-   `claim_if_first_account`, called from **both** account-creation paths inside their
-   transactions.
-
 ## Next up
 
 Nothing blocking. In rough priority:
 
-1. **Register the real account on `fridge.db`.** It is still 0 users / 16 unclaimed reviews.
-   That run claims the 22 rows for good — check the liked list reads 8 immediately after.
-2. **`is_favorite_eligible` empty guard** and the stale-attribute sweep above.
+1. **Implement `auth::require_admin`** — the `[learn]` stub currently denies everyone, so the
+   blog editor is unreachable. See "Admin flag & blog".
+2. **Register the real account on `fridge.db`.** Still 0 users / 16 unclaimed reviews as of
+   2026-08-19. That run claims the 22 rows for good — check the liked list reads 8 immediately
+   after, then grant yourself `is_admin`.
 3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
-   `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — verified
-   against the committed versions.
+   `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
+   2026-08-19.
 
 `docs/TODO.md` holds four deferred ideas.

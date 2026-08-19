@@ -4,6 +4,7 @@ export type AuthenticatedUser = {
   id: string;
   email: string;
   created_at: string;
+  is_admin: boolean;
 };
 
 /** The backend's error body shape (`routes/auth.rs::ErrorBody`). */

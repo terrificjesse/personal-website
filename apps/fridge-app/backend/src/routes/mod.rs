@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod blog;
 pub mod health;
 pub mod items;
 pub mod recipes;
@@ -12,7 +13,7 @@ use axum::{
     Router,
     extract::FromRef,
     http::{HeaderValue, Method, header},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
@@ -119,6 +120,15 @@ pub fn build_router(state: AppState) -> Router {
             get(reviews::list_reviews).post(reviews::submit_review),
         )
         .route("/recipes/{id}/reviews", get(reviews::list_recipe_reviews))
+        .route(
+            "/blog/posts",
+            get(blog::list_posts).post(blog::create_post),
+        )
+        .route("/blog/posts/by-slug/{slug}", get(blog::get_post))
+        .route(
+            "/blog/posts/{id}",
+            patch(blog::update_post).delete(blog::delete_post),
+        )
         .with_state(state)
         .layer(cors)
 }
