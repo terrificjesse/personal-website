@@ -1,48 +1,3 @@
-//! Item name suggestion — flagged as a learning area, see CLAUDE.md.
-//!
-//! Goal: given what the user has typed so far, return the best few known item names to
-//! show in the add-item dropdown, ranked best-first.
-//!
-//! This is a *ranking* problem, not a decide-for-the-user problem. Nothing here is
-//! committed without the user picking it, so returning a mediocre 5th suggestion costs
-//! nothing — tune for recall, not precision.
-//!
-//! Scoring is a banded tier stack. Each tier owns a disjoint score range, and matches on a
-//! candidate's `aliases` sit one `ALIAS_CONST` below the equivalent match on its `name` —
-//! so the ranking is always explainable as "which tier fired, name or alias?":
-//!
-//! | Score       | Tier                                                     |
-//! |-------------|----------------------------------------------------------|
-//! | 1.00        | exact, name                                              |
-//! | 0.90        | exact, alias                                             |
-//! | 0.80 – 0.89 | prefix, name — whole string or any token                  |
-//! | 0.70 – 0.79 | prefix, alias                                            |
-//! | 0.60 – 0.69 | substring, name — "melon" -> "watermelon"                 |
-//! | 0.50 – 0.59 | substring, alias                                          |
-//! | 0.30 – 0.50 | fuzzy, name tokens — Damerau-Levenshtein ("clery")        |
-//!
-//! For the exact/prefix/substring tiers, `BAND_WIDTH * coverage` positions the score within
-//! its band, where coverage is the query's length over the length of *the string that
-//! matched* — the name for name tiers, the matched alias for alias tiers. Since every one
-//! of those matchers is anchored or containment-based, `query.len() <= matched.len()` always
-//! holds, so coverage can't exceed 1.0 and no band can overflow into the one above it.
-//!
-//! Branches are checked in descending score order and return on the first hit, which is
-//! only sound because the bands are disjoint. Adding a tier means putting it in the right
-//! place in that order, not just appending it.
-//!
-//! The fuzzy tier is the exception to all of the above, and the one still under
-//! construction. It is not a predicate: every string has *some* similarity to every other
-//! string, so unlike the tiers above it needs an explicit cutoff or it matches the entire
-//! catalog on every keystroke. Measured against this data, real typos score 0.75–0.875 and
-//! the best unrelated noise scores 0.571, so a similarity threshold around 0.7 separates
-//! them cleanly. It also uses its own width (0.2) rather than `BAND_WIDTH`, which is why
-//! its range is listed as 0.30–0.50 above.
-//!
-//! TODO(you): the fuzzy threshold, and optionally a stemming pass. `plural_matches_-
-//! singular_name` currently passes through fuzzy rather than stemming — a plural isn't
-//! really a typo, so `rust-stemmers = "1.2.0"` is still the semantically right tool if you
-//! want it, but no test will tell you the difference.
 
 use serde::Serialize;
 use strsim::normalized_damerau_levenshtein;
@@ -50,59 +5,51 @@ use strsim::normalized_damerau_levenshtein;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SuggestionSource {
-    /// Already in the fridge. Picking one of these means the user probably meant the
-    /// thing they already have, so it should win ties against the catalog.
+    /// Item present in fridge
     Fridge,
-    /// A known food name from the FoodKeeper catalog.
+    /// Item present in FoodKeeper
     Foodkeeper,
 }
 
-/// Something the user could be typing the name of.
+/// A struct documenting the features of an item
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub name: String,
     pub name_lower: String,
     pub source: SuggestionSource,
-    /// Alternate names worth matching against (FoodKeeper `Keywords`). Empty for fridge
-    /// items. Lowercased and trimmed by the caller.
+    /// Common aliases for the item
     pub aliases: Vec<String>,
     pub foodkeeper_product_id: Option<i64>,
 }
 
-/// One row in the dropdown.
+/// A struct with fields for indicating how relevant an item is based on score
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Suggestion {
     pub name: String,
     pub source: SuggestionSource,
     pub foodkeeper_product_id: Option<i64>,
-    /// 0.0-1.0, higher is better. Serialized so the UI can debug ranking.
+    /// Assigned score
     pub score: f32,
 }
 
-// Band floors. Each tier's scores live between its own floor and the next one up, so a
-// weak prefix match can never outrank a strong substring match. Adjust freely — these are
-// the contract you're designing against, not fixed truth.
+/// A banded recommendation system. Exact matches are the highest band. Prefixes
+/// are the next, then substrings, then fuzzy scoring. The bands do not intersect
+/// so a strong fuzzy score will never outrank a substring score.
 const BAND_EXACT: f32 = 1.00;
 const BAND_PREFIX: f32 = 0.80;
 const BAND_SUBSTRING: f32 = 0.60;
 const BAND_FUZZY: f32 = 0.30;
 
+/// Aliases are a weaker indication of intent, so give a penalty constant to alias matching
 const ALIAS_CONST: f32 = 0.1;
 
-/// How far an exact/prefix/substring match can climb above its band floor, scaled by
-/// coverage.
-///
-/// Must stay strictly below `ALIAS_CONST`, or a top-of-band name match would tie or
-/// overtake the exact-alias match sitting one band above it. The current margin is 0.01.
-/// The fuzzy tier does not use this — it has its own, wider width.
+/// A constraint on the bounds of a band so that bands do not overlap
 const BAND_WIDTH: f32 = 0.09;
 
-/// Anything scoring below this never reaches the dropdown. Nothing auto-highlights, so a
-/// mediocre 5th suggestion costs the user nothing — keep this generous.
+/// Exclude suggestions with a score below this bound:
 const SCORE_FLOOR: f32 = BAND_FUZZY;
 
-/// Trim, lowercase, collapse internal whitespace. Applied to the query once per request;
-/// candidate names and aliases are already lowercased by the time they get here.
+/// Normalizes a string trimming excess whitespace and sending all characters to lowercase
 fn normalize(input: &str) -> String {
     input
         .split_whitespace()
@@ -111,10 +58,8 @@ fn normalize(input: &str) -> String {
         .to_lowercase()
 }
 
-/// Ranked best-first, at most `limit` entries, empty when nothing clears the floor.
-///
-/// `query` is the raw text typed so far. An empty query is *not* this function's job —
-/// the route serves recent items in that case, so returning an empty Vec is correct.
+/// Assigns a score to all of the possible candidates input candidates. Then sorts
+/// by the score and truncates the output vector to the limit.
 pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -> Vec<Suggestion> {
     let query = normalize(query);
     if query.is_empty() {
@@ -134,15 +79,7 @@ pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -
         })
         .collect();
 
-    // Sort before truncating, or "top 5" is just the first 5 in catalog order. The
-    // tie-break has to live on this sort rather than a later one: truncation decides which
-    // candidates survive at all, so a tie-break applied afterwards could only reorder the
-    // survivors, never rescue a fridge item that had already been cut.
-    //
-    // Note the deliberately different argument orders. Score is `b` then `a` — reversed,
-    // for descending. Source is `a` then `b` — not reversed, so the *smaller* variant wins,
-    // and `Fridge` is declared before `Foodkeeper`. `total_cmp` avoids the unwrap that
-    // `partial_cmp` would force, since f32 isn't Ord.
+    // First sorts by score, but then as a tie-break scores fridge before catalog items
     scored.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
@@ -152,22 +89,13 @@ pub fn suggest_item_names(query: &str, candidates: &[Candidate], limit: usize) -
     scored
 }
 
-/// The whole ranking algorithm: how well does `candidate` match `query`?
-///
-/// `query` is already normalized. Returns `None` when nothing matches at all; the caller
-/// applies `SCORE_FLOOR` and handles sorting and truncation. See the module docs for the
-/// band table these branches implement.
-///
-/// The branches run in descending score order and return on the first hit. Three
-/// subtleties worth not re-deriving:
-///
-/// - The token-prefix branches are *not* redundant with the whole-string ones: a token can
-///   start with the query when the whole string doesn't ("cheese" in "cream cheese").
-/// - The substring tier needs no token variant. A token is a contiguous substring of the
-///   whole string, so token containment is entirely subsumed by string containment.
-/// - Fuzzy is the reverse of prefix: whole-string similarity is near-useless against long
-///   multi-word names ("brocolli" vs "broccoli and broccoli raab (rapini)" scores ~0), so
-///   per-token is the primary matcher there rather than the supplement.
+/// The actual score assignment function. Alias matches are given a flat penalty.
+/// Prefix and substring matches are given a scaling factor based on how much of
+/// the actual query the prefix or substring occupies. Prefixes are matched against
+/// all words in a multi-word phrase. Prefixes and substrings are compared against
+/// the canonical name and its aliases. Fuzzy scoring is conducted using a
+/// normalized_damerau_levenshtein function and words that score too low are
+/// dropped due to being too low quality.
 fn score_one(query: &str, candidate: &Candidate) -> Option<f32> {
     if candidate.name_lower == query {
         return Some(BAND_EXACT);
@@ -287,7 +215,6 @@ mod tests {
 
     #[test]
     fn prefix_match_is_found() {
-        // The dominant typeahead case: every keystroke is a truncation of the target.
         let results = suggest_item_names("tom", &candidates(), 5);
         assert!(
             rank_of(&results, "tomatoes").is_some(),
@@ -298,8 +225,6 @@ mod tests {
 
     #[test]
     fn prefix_ranks_by_coverage() {
-        // "tom" covers more of "Tomatoes" than of "Tomato sauce", so it's the likelier
-        // intent. Change this test if you pick a different within-band ordering.
         let results = suggest_item_names("tom", &candidates(), 5);
         let tomatoes = rank_of(&results, "tomatoes").expect("tomatoes should be suggested");
         let sauce = rank_of(&results, "tomato sauce").expect("tomato sauce should be suggested");
@@ -312,7 +237,6 @@ mod tests {
 
     #[test]
     fn token_prefix_matches_multi_word_names() {
-        // Grocery names are mostly multi-word; whole-string prefix alone misses this.
         let results = suggest_item_names("oil", &candidates(), 5);
         assert!(
             rank_of(&results, "olive oil").is_some(),
@@ -349,7 +273,6 @@ mod tests {
 
     #[test]
     fn transposition_still_matches() {
-        // Damerau counts this as one edit; plain Levenshtein counts two.
         let results = suggest_item_names("clery", &candidates(), 5);
         assert!(
             rank_of(&results, "celery").is_some(),
@@ -360,7 +283,6 @@ mod tests {
 
     #[test]
     fn plural_matches_singular_name() {
-        // "Potato" has no plural keyword, so this only passes via stemming.
         let results = suggest_item_names("potatoes", &candidates(), 5);
         assert!(
             rank_of(&results, "potato").is_some(),
@@ -371,8 +293,6 @@ mod tests {
 
     #[test]
     fn keyword_alias_matches() {
-        // The FoodKeeper Keywords column is doing the work here — no string metric gets
-        // from "spaghetti" to "Tomato sauce".
         let results = suggest_item_names("spaghetti", &candidates(), 5);
         assert!(
             rank_of(&results, "tomato sauce").is_some(),
@@ -424,7 +344,6 @@ mod tests {
 
     #[test]
     fn empty_query_returns_nothing() {
-        // The route serves recent items for an empty query; the ranker stays out of it.
         assert!(suggest_item_names("", &candidates(), 5).is_empty());
         assert!(suggest_item_names("   ", &candidates(), 5).is_empty());
     }

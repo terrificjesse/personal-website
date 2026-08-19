@@ -1,13 +1,15 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use chrono::Utc;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::models::{AddItemRequest, AddShoppingListItemRequest, ShoppingListItem, ShoppingListStatus};
+use crate::models::{
+    AddItemRequest, AddShoppingListItemRequest, ShoppingListItem, ShoppingListStatus,
+};
 use crate::purchase_history;
 use crate::recommend::{self, Suggestion};
 use crate::routes::auth::CurrentUser;
@@ -23,10 +25,7 @@ pub async fn list_shopping_list(
     Ok(Json(fetch_all(&pool, &user.id).await?))
 }
 
-/// One account's shopping-list rows, most recently added first. Shared by
-/// `GET /shopping-list` and the recipe-recommendation endpoint, which needs current
-/// shopping-list contents as input to `recommend_recipes::recommend_recipes` — same
-/// reasoning, and same required `user_id`, as `items::fetch_all`.
+// This function creates a query for all fridge rows accessible to the user with user_id:
 pub(crate) async fn fetch_all(
     pool: &SqlitePool,
     user_id: &str,
@@ -41,12 +40,14 @@ pub(crate) async fn fetch_all(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// A pending row `add_shopping_list_item` could fold a new quantity into.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct MergeCandidate {
     id: String,
 }
 
+// Attempts to find if the item already exists in the database for a given user.
+// If so, merge with the existing product.
+// If not, add a fresh ShoppingListItem row.
 pub async fn add_shopping_list_item(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
@@ -57,13 +58,7 @@ pub async fn add_shopping_list_item(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Same name and unit, still pending — same idea as the fridge's add-and-merge
-    // (`items::upsert_fridge_item`), just without an expiration tolerance to worry about.
-    // A purchased row never absorbs a new add: reviving a "done" row's quantity behind the
-    // scenes would be more confusing than just starting a fresh pending row for it.
-    //
-    // Scoped by `user_id` for the same reason `items::upsert_fridge_item`'s merge query is —
-    // merging across accounts would fold one person's row into another's destructively.
+    // Matches the candidate name, user id, the pending status, and the unit type to an existing row in the database:
     let existing = sqlx::query_as::<_, MergeCandidate>(
         "SELECT id FROM shopping_list_items \
          WHERE user_id = ? AND name = ? AND unit = ? AND status = ? \
@@ -77,14 +72,15 @@ pub async fn add_shopping_list_item(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // If a row matches, update the row to reflect the correct unit count
     if let Some(target) = existing {
+        // COALESCE handles the case where a product is merged with and without the dropdown
         sqlx::query(
             "UPDATE shopping_list_items \
              SET quantity = quantity + ?, foodkeeper_product_id = COALESCE(foodkeeper_product_id, ?) \
              WHERE id = ?",
         )
         .bind(req.quantity)
-        // Backfills the catalog id if the existing row was freehand and this add wasn't.
         .bind(req.foodkeeper_product_id)
         .bind(&target.id)
         .execute(&pool)
@@ -99,7 +95,7 @@ pub async fn add_shopping_list_item(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // 200 rather than 201: this updated a row instead of creating one.
+        // successful merge and returns the merged row item:
         return Ok((StatusCode::OK, Json(item)));
     }
 
@@ -146,8 +142,7 @@ pub async fn remove_shopping_list_item(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    // Ownership in the WHERE clause — see `items::remove_item` for why this is a filter
-    // rather than a check-then-delete.
+    // Matches the row id and user id to delete it:
     let result = sqlx::query("DELETE FROM shopping_list_items WHERE id = ? AND user_id = ?")
         .bind(&id)
         .bind(&user.id)
@@ -162,18 +157,12 @@ pub async fn remove_shopping_list_item(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Marks a shopping-list row purchased. For grocery items this also folds the item into
-/// the fridge via `items::upsert_fridge_item` — the same insert/merge path `POST /items`
-/// uses — which is where the purchase gets logged to `purchase_history`. Non-grocery items
-/// (paper towels, etc.) only flip status; they never touch the fridge table or purchase
-/// history, per PLAN.md's Phase 2 scope.
+/// Matches the row id and user id to mark the product purchased:
 pub async fn mark_purchased(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ShoppingListItem>, StatusCode> {
-    // Scoped, so a row belonging to another account 404s here rather than being marked
-    // purchased *and* folded into this caller's fridge below.
     let item = sqlx::query_as::<_, ShoppingListItem>(&format!(
         "SELECT {SELECT_COLUMNS} FROM shopping_list_items WHERE id = ? AND user_id = ?"
     ))
@@ -213,6 +202,7 @@ pub async fn mark_purchased(
     Ok(Json(updated))
 }
 
+// Based on Purchase History and fridge contents, suggest shopping items
 pub async fn suggestions(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,

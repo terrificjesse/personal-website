@@ -30,29 +30,35 @@ const SESSION_COOKIE = "fridge_session";
 /** Signed-out visitors are sent here. */
 const LOGIN_PATH = "/login";
 
-/** Signed-in visitors are bounced off these back into the app. */
-const AUTH_PATHS = ["/login", "/register"];
-
+/**
+ * Only the *absence* of the cookie is acted on, and that asymmetry is deliberate.
+ *
+ * No cookie means definitively not signed in, so redirecting to the login page is safe. A
+ * cookie being *present* means nothing — it may be expired, revoked, or forged, and only the
+ * backend can tell.
+ *
+ * This file used to also bounce visitors *away* from `/login` when a cookie was present, and
+ * that produced a lockout: once a session expired the cookie stayed in the browser, so
+ * `/login` redirected to `/fridge`, `/fridge` loaded and got a 401 from the API, `useApiError`
+ * redirected back to `/login`, and round it went. The login page became unreachable exactly
+ * when it was needed most.
+ *
+ * If the "you're already signed in, go to the app" bounce is ever wanted back, it has to live
+ * somewhere that can check the session is *real* — a client component calling `/auth/me`, the
+ * way `SessionNav` does. Never here.
+ */
 export default function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const hasSession = request.cookies.has(SESSION_COOKIE);
 
-  if (AUTH_PATHS.includes(pathname)) {
-    if (hasSession) {
-      return NextResponse.redirect(new URL("/fridge", request.url));
-    }
+  if (request.cookies.has(SESSION_COOKIE)) {
     return NextResponse.next();
   }
 
-  if (!hasSession) {
-    const login = new URL(LOGIN_PATH, request.url);
-    // Carry where they were headed, so signing in doesn't dump everyone on the same page.
-    // Read back as a *path only* in the login page — see the note there on open redirects.
-    login.searchParams.set("next", pathname);
-    return NextResponse.redirect(login);
-  }
-
-  return NextResponse.next();
+  const login = new URL(LOGIN_PATH, request.url);
+  // Carry where they were headed, so signing in doesn't dump everyone on the same page.
+  // Read back as a *path only* in the login page — see the note there on open redirects.
+  login.searchParams.set("next", pathname);
+  return NextResponse.redirect(login);
 }
 
 export const config = {
@@ -60,7 +66,7 @@ export const config = {
   // project site whose landing page has nothing user-specific on it, and future tabs get to
   // make their own call rather than inheriting the fridge app's.
   //
-  // `/login` and `/register` are matched deliberately, not excluded: the redirect-if-signed-in
-  // branch above needs to run on them.
-  matcher: ["/fridge/:path*", "/login", "/register"],
+  // `/login` and `/register` are deliberately **not** matched. They must always render, or a
+  // stale cookie locks the user out of the only page that could fix it.
+  matcher: ["/fridge/:path*"],
 };

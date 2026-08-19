@@ -1,12 +1,3 @@
-//! Expiration date estimation — flagged as a learning area, see CLAUDE.md.
-//!
-//! Goal: given an item's canonical name and when it was added, estimate an expiration
-//! date. A category → shelf-life lookup table (produce/dairy/meat/pantry + a fallback)
-//! is a reasonable starting point; refine later if you want.
-//!
-//! TODO(you): replace the body of `estimate_expiration`. The tests below describe the
-//! required behavior — they will fail against the current placeholder (which always
-//! returns a flat 7 days) until you implement real category-based logic.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
@@ -35,6 +26,7 @@ struct FoodKeeperRow {
     Freeze_Metric: Option<String>,
 }
 
+// enum for the different labels for refrigeration types in the FoodKeeper catalog
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Storage {
     FridgeFromPurchase,
@@ -80,6 +72,8 @@ impl FoodKeeperRow {
             ),
         ]
     }
+
+    // Finds the first present column in the FoodKeeper catalog to store as the canonical storage method
     fn best_storage(&self) -> Option<(Storage, Option<u32>, Option<&str>)> {
         self.storage_options()
             .into_iter()
@@ -89,11 +83,14 @@ impl FoodKeeperRow {
 
 const PRODUCTS_CSV: &str = include_str!("../data/foodkeeper/products.csv");
 
+// Converts the FoodKeeper catalog to a Vec with its data
 fn parse_foodkeeper() -> Result<Vec<FoodKeeperRow>, csv::Error> {
     let mut rdr = csv::Reader::from_reader(PRODUCTS_CSV.as_bytes());
     rdr.deserialize().collect()
 }
 
+// Based on the FoodKeeper catalog data, assigns an expiration time time to the input item_name.
+// Default is 7 days
 pub fn estimate_expiration(item_name: &str, added_at: DateTime<Utc>) -> DateTime<Utc> {
     let mut time = Duration::days(7);
     let food_data = parse_foodkeeper().expect("parse");
@@ -120,11 +117,6 @@ pub fn estimate_expiration(item_name: &str, added_at: DateTime<Utc>) -> DateTime
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Removed: `produce_gets_a_short_shelf_life` asserted lettuce expires in 3-10 days.
-    // FoodKeeper has two `Lettuce` rows with different shelf lives (iceberg/romaine at
-    // 1-2 weeks, leaf/spinach at 3-7 days), so the assertion depended on which row won —
-    // README gotcha 6. Revisit once `Name_subtitle` disambiguation exists.
 
     #[test]
     fn pantry_items_get_a_long_shelf_life() {

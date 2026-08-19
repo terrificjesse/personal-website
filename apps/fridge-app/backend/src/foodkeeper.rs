@@ -1,31 +1,14 @@
-//! FoodKeeper catalog — the dictionary of known food names that backs item suggestions.
-//!
-//! Read `data/foodkeeper/README.md` before touching this file. The parsing here is shaped
-//! entirely by the data traps documented there; the relevant ones are called out inline.
-//!
-//! The CSV is embedded at compile time rather than read from disk so that the catalog works
-//! regardless of the process's working directory (and is available in unit tests).
 
 use std::collections::BTreeMap;
 
 const PRODUCTS_CSV: &str = include_str!("../data/foodkeeper/products.csv");
 
-/// One distinct food name, collapsed across every CSV row that shares it.
+/// Struct that manages the data fields in a FoodKeeper catalog entry
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
-    /// Display name, trimmed. First-seen casing wins.
     pub name: String,
     pub name_lower: String,
-    /// Lowercased, trimmed, deduped `Keywords` values across all collapsed rows.
-    /// These are alternate names ("spaghetti" for tomato sauce) and are worth matching
-    /// against in addition to `name`.
     pub aliases: Vec<String>,
-    /// Positional row ids (1-based) of every CSV row collapsed into this entry.
-    ///
-    /// README gotcha 6: `Name` is not unique — 661 rows, 468 distinct names, `Ham` alone
-    /// appears 20 times with different shelf lives. Suggestions collapse them so the
-    /// dropdown shows one "Ham"; disambiguating which variant the user meant is a problem
-    /// for `expiration.rs`, which has `Name_subtitle` to work with.
     pub product_ids: Vec<i64>,
 }
 
@@ -34,11 +17,11 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Parses the embedded FoodKeeper CSV. Fails only if the embedded file is malformed,
-    /// which would be a build-time problem, not a runtime one.
+    /// Loading the dataset
     pub fn load() -> anyhow::Result<Self> {
         let mut reader = csv::Reader::from_reader(PRODUCTS_CSV.as_bytes());
 
+        // Finds the indices of different columns with a matching header name
         let headers = reader.headers()?.clone();
         let column = |name: &str| -> anyhow::Result<usize> {
             headers
@@ -49,24 +32,17 @@ impl Catalog {
         let name_col = column("Name")?;
         let keywords_col = column("Keywords")?;
 
-        // Keyed by lowercased name. This also folds together README gotcha 2's casing drift
-        // ("Barbecue Sauce" vs "Barbecue sauce" are separate rows upstream).
+        // Collapses rows with duplicate names into a single entry
         let mut collapsed: BTreeMap<String, CatalogEntry> = BTreeMap::new();
 
         for (index, record) in reader.records().enumerate() {
             let record = record?;
 
-            // README gotcha 7: 17 rows have trailing whitespace in `Name`. Trim before
-            // anything is keyed or indexed, or `milk` silently misses two of its rows.
             let name = record.get(name_col).unwrap_or("").trim();
             if name.is_empty() {
                 continue;
             }
 
-            // README: the mirror dropped the product `ID` column. Rows are in the official
-            // feed's id order (1-661), but nothing in the file asserts that, so this id is
-            // positional by construction. Re-import ids from the official feed if that
-            // assumption ever needs to be load-bearing.
             let product_id = (index + 1) as i64;
 
             let entry = collapsed
@@ -80,8 +56,7 @@ impl Catalog {
 
             entry.product_ids.push(product_id);
 
-            // README gotcha 8: `Keywords` is a ready-made synonym dictionary, with
-            // inconsistent spacing after commas ("Cheese,cheddar, swiss,parmesan").
+            // Combines all of the keywords into a shared keyword bank
             let keywords = record.get(keywords_col).unwrap_or("");
             for keyword in keywords.split(',') {
                 let keyword = keyword.trim().to_lowercase();
@@ -114,8 +89,6 @@ mod tests {
 
     #[test]
     fn collapses_to_distinct_names() {
-        // 661 rows, 468 distinct names per the README — but that count is over raw `Name`
-        // values, and we additionally fold by lowercase, so expect no more than that.
         let catalog = catalog();
         assert!(!catalog.entries().is_empty());
         assert!(catalog.entries().len() <= 468);
@@ -130,7 +103,6 @@ mod tests {
             .find(|e| e.name.eq_ignore_ascii_case("ham"))
             .expect("ham should be in the catalog");
 
-        // README gotcha 6/7: 20 rows once trailing whitespace is trimmed.
         assert_eq!(ham.product_ids.len(), 20);
     }
 

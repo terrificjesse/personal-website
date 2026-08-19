@@ -1,27 +1,3 @@
-//! Recipe recommendations — flagged as a learning area, see CLAUDE.md.
-//!
-//! Goal, per PLAN.md's Phase 3: score/filter the vendored TheMealDB catalog
-//! (`src/themealdb.rs`) by how many of a recipe's `fridge_ingredients` are already
-//! available — in the fridge *or* on the shopping list — so a recipe you're closer to
-//! being able to cook ranks higher. `extra_ingredients` (pantry staples/spices) are
-//! deliberately excluded from the match calculation; PLAN.md doesn't expect a fridge app to
-//! track whether you own salt.
-//!
-//! The user's typed filters (`RecipeFilters.cuisine`, `.meal_type`) are a **hard filter**,
-//! not a scoring input — a recipe that fails the filter must never appear, no matter how
-//! well it would otherwise score. This is what keeps results predictable: PLAN.md is
-//! explicit that a recipe needing none of your current ingredients should still show up if
-//! the filters allow it, so match quality is a ranking signal, not an inclusion gate.
-//!
-//! TODO(you): replace the body of `recommend_recipes`. The tests below describe the
-//! required behavior — they will fail against the current placeholder (which always
-//! returns an empty list) until you implement real scoring. Worth reading before you start:
-//! set-overlap scoring (what fraction of a recipe's `fridge_ingredients` you already have —
-//! similar in spirit to Jaccard similarity), and how to combine a hard filter with a soft
-//! score without letting one leak into the other. See the "Working patterns" section of
-//! `apps/fridge-app/CLAUDE.md` for pitfalls that bit `nlp.rs` and `recommend.rs` and will
-//! likely bite this too (band overflows, unreachable branches, tests passing for the wrong
-//! reason, trusting hand-built fixtures over real data).
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -30,9 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{FridgeItem, Recipe, ShoppingListItem};
 
-/// Hard filters from `GET /recipes/recommended?cuisine=&mealType=`. `#[serde(rename_all =
-/// "camelCase")]` is what maps the `mealType` query param onto `meal_type` here — axum's
-/// `Query` extractor deserializes straight into this struct.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipeFilters {
@@ -40,22 +13,25 @@ pub struct RecipeFilters {
     pub meal_type: Option<String>,
 }
 
-/// A recipe plus enough context for the frontend to explain *why* it's ranked where it is,
-/// without prescribing the ranking formula itself — that's `recommend_recipes`'s job.
+/// Struct for recording the number of ingredients matched in the recipe
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecommendedRecipe {
     pub recipe: Recipe,
-    /// How many of `recipe.fridge_ingredients` matched something in `fridge` or
-    /// `shopping_list`. Informational for the frontend ("6/8 ingredients you have") — not a
-    /// prescription for how `recommend_recipes` should compute its ranking.
     pub matched_ingredient_count: usize,
     pub total_ingredient_count: usize,
 }
 
-/// Recommends recipes from the full catalog, scored by ingredient overlap with `fridge` and
-/// `shopping_list`, hard-filtered by `filters`. See the module doc for what "hard filter"
-/// vs "soft score" means here, and the module boundary — this function's body is what you
-/// implement.
+/// recipes: prefiltered list of nondisliked recipes
+/// fridge: list of fridge items
+/// shopping_list: list of shopping list items
+/// filters: user defined filters for recipe type
+///
+/// Hashes all of the ingredients in the fridge and shopping list. Iterates
+/// through all of the recipes to identify how many ingredients are present in
+/// the set and ensures that the recipes adhers to the filters. Then the
+/// recommendations are sorted by the raw number of missing ingredients in
+/// ascending order, with small ingredient recipes pushed to the back of the
+/// ranking.
 pub fn recommend_recipes(
     recipes: &[Recipe],
     fridge: &[FridgeItem],
@@ -161,8 +137,6 @@ mod tests {
 
     #[test]
     fn recipe_using_more_of_what_you_have_ranks_higher() {
-        // "well_stocked" needs three ingredients you have all three of; "sparse" needs
-        // three ingredients you have only one of. The better match should rank first.
         let recipes = vec![
             recipe(
                 "sparse",
@@ -195,9 +169,6 @@ mod tests {
 
     #[test]
     fn ingredients_on_the_shopping_list_count_as_available_too() {
-        // PLAN.md: recommendations draw on "fridge + shopping list contents," not fridge
-        // alone — an ingredient you're already planning to buy shouldn't be treated as
-        // missing.
         let recipes = vec![recipe("target", "Mexican", "Dinner", &["Avocado", "Lime"])];
         let fridge = vec![fridge_item("Avocado")];
         let shopping_list = vec![shopping_list_item("Lime")];
@@ -214,8 +185,6 @@ mod tests {
 
     #[test]
     fn cuisine_filter_excludes_non_matching_recipes_regardless_of_score() {
-        // "perfect_match" has every ingredient you own but is the wrong cuisine — it must
-        // not appear. "partial_match" is the right cuisine despite matching nothing.
         let recipes = vec![
             recipe("perfect_match", "Japanese", "Dinner", &["Chicken"]),
             recipe("partial_match", "Italian", "Dinner", &["Anchovy"]),
@@ -251,8 +220,6 @@ mod tests {
 
     #[test]
     fn recipe_needing_none_of_your_ingredients_still_appears_if_filters_allow_it() {
-        // Match quality is a ranking signal, not an inclusion gate — PLAN.md is explicit
-        // about this.
         let recipes = vec![recipe(
             "no_overlap",
             "Thai",
@@ -267,8 +234,6 @@ mod tests {
 
     #[test]
     fn extra_ingredients_do_not_affect_matching() {
-        // Every fixture recipe includes "Salt" as an extra_ingredient the fridge never has
-        // — if that leaked into scoring, no recipe could ever be a "perfect" match.
         let recipes = vec![recipe("target", "Greek", "Dinner", &["Feta"])];
         let fridge = vec![fridge_item("Feta")];
 

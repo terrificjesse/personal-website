@@ -1,22 +1,3 @@
-//! Shopping list recommendations — flagged as a learning area, see CLAUDE.md.
-//!
-//! Goal: given purchase history and the current fridge contents, suggest what to add to
-//! the shopping list. PLAN.md names two signals to start from:
-//!   - an item purchased on a roughly regular cadence that isn't currently in the fridge
-//!     (a frequency/recency heuristic — you don't need ML for this)
-//!   - a fridge item expiring soon, suggested as a replacement
-//!
-//! Non-grocery items never reach this function: `shopping_list::mark_purchased` only logs
-//! purchase history for `is_grocery` rows, so `history` is grocery-only by construction.
-//!
-//! TODO(you): replace the body of `suggest_shopping_items`. The tests below describe the
-//! required behavior — they will fail against the current placeholder (which always
-//! returns an empty list) until you implement real scoring. Worth reading before you start:
-//! simple frequency/recency heuristics (e.g. "days since last purchase" vs. "median gap
-//! between purchases") as a legitimate first pass — see the "Working patterns established
-//! in Phase 1" section of `apps/fridge-app/CLAUDE.md` for pitfalls that bit `nlp.rs` and
-//! will likely bite this too (band overflows, unreachable branches, tests passing for the
-//! wrong reason).
 
 use chrono::{TimeDelta, Utc};
 use serde::Serialize;
@@ -30,9 +11,9 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionReason {
-    /// Purchased on a regular-enough cadence, and not currently in the fridge.
+    /// Indicator that a product is frequently purchased and may be purchased again
     FrequentlyPurchased,
-    /// Already in the fridge, but expiring soon enough to suggest buying a replacement.
+    /// Indicator that a product in the fridge may need replacement soon
     ExpiringReplacement,
 }
 
@@ -42,6 +23,9 @@ pub struct Suggestion {
     pub reason: SuggestionReason,
 }
 
+/// Helper function to calculate MAD - Median Absolute Deviation, an outlier
+/// robust variance calculation that helps weed out long gaps between product
+/// purchases that may occur due to trips or other circumstances.
 fn calculate_mad(item: &[&PurchaseHistory]) -> Option<TimeDelta> {
     let iterate = item.windows(2);
     let mut consec_median: Vec<TimeDelta> = iterate
@@ -51,9 +35,12 @@ fn calculate_mad(item: &[&PurchaseHistory]) -> Option<TimeDelta> {
     consec_median.get(consec_median.len() / 2).copied()
 }
 
-/// Suggests items to add to the shopping list from purchase history and current fridge
-/// contents. See the module doc for the two signals PLAN.md names, and the module
-/// boundary — this function's body is what you implement.
+/// Compiles suggestable items based on items in the fridge and items frequently
+/// purchased. Items in the fridge that are expiring within 3 days are added first.
+/// Then the items in purchased history are hashed and sorted by the date they were
+/// purchased. The variance in purchase times for each item not already in the
+/// fridge is calculated and if it's due for a purchase it will be added to the
+/// suggestions.
 pub fn suggest_shopping_items(
     history: &[PurchaseHistory],
     fridge: &[FridgeItem],
@@ -63,11 +50,6 @@ pub fn suggest_shopping_items(
     let mut suggest: Vec<Suggestion> = fridge
         .iter()
         .filter(|item| {
-            // `estimated_expiration` is `None` when the item has no shelf-life estimate at
-            // all — that's "unknown," not "expiring soon," so it must not match here.
-            // Relying on `Option`'s default ordering would get this backwards: `None` sorts
-            // as less than every `Some(_)`, so a plain `<` comparison would treat "no
-            // estimate" as always expiring before the cutoff.
             item.estimated_expiration
                 .is_some_and(|expiration| expiration < expiring_soon_cutoff)
         })
@@ -136,8 +118,6 @@ mod tests {
 
     #[test]
     fn suggests_item_purchased_weekly_and_missing_from_fridge() {
-        // Bought roughly every 7 days for the last month, and the fridge is empty — this
-        // is the clearest possible "you're about to run out" signal.
         let history = vec![
             purchase("milk", 7),
             purchase("milk", 14),
@@ -215,9 +195,6 @@ mod tests {
 
     #[test]
     fn one_off_purchase_is_not_a_frequency_signal() {
-        // A single purchase three weeks ago isn't "regularly bought" by any reasonable
-        // definition of cadence — this guards against a threshold so loose it fires on
-        // one data point.
         let history = vec![purchase("saffron", 21)];
         let fridge = vec![];
 

@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
@@ -15,11 +15,7 @@ use crate::routes::auth::CurrentUser;
 const SELECT_COLUMNS: &str = "id, canonical_name, quantity, unit, added_at, \
      estimated_expiration, foodkeeper_product_id";
 
-/// How far apart two expiration dates can be and still count as the same batch.
-///
-/// Two rows for the same food normally differ in expiration by however far apart they were
-/// added, so this is effectively "bought within a few days of each other". Widen it and
-/// week-old milk absorbs today's; narrow it and you get a new row every trip.
+/// The margin of error in which items will be merged:
 const MERGE_EXPIRATION_TOLERANCE_DAYS: i64 = 3;
 
 pub async fn list_items(
@@ -29,13 +25,7 @@ pub async fn list_items(
     Ok(Json(fetch_all(&pool, &user.id).await?))
 }
 
-/// One account's fridge items, most recently added first. Shared by `GET /items` and the
-/// shopping-list suggestions endpoint, which needs current fridge contents as input to
-/// `recommend::suggest_shopping_items`.
-///
-/// `user_id` is required rather than optional: an unscoped variant of this function would be
-/// one accidental call away from serving another account's fridge, and there is no caller
-/// that legitimately wants every account's items at once.
+/// Grabs all of the items in the fridge for a given user
 pub(crate) async fn fetch_all(
     pool: &SqlitePool,
     user_id: &str,
@@ -58,20 +48,13 @@ pub async fn add_item(
     Ok((status, Json(item)))
 }
 
-/// Inserts a new fridge row for `req`, or merges into an existing one when
-/// `find_merge_target` says they're the same batch. This is the single call site for
-/// "a grocery item was acquired" — it's used directly by `POST /items` and also by
-/// `shopping_list::mark_purchased` when a grocery item is checked off the shopping list,
-/// so a purchase is logged to `purchase_history` exactly once no matter which flow
-/// produced it, never twice.
+/// Adds an item to the pool:
 pub(crate) async fn upsert_fridge_item(
     pool: &SqlitePool,
     user_id: &str,
     req: &AddItemRequest,
 ) -> Result<(StatusCode, FridgeItem), StatusCode> {
-    // Name resolution happens before the request gets here: the user picks from the
-    // suggestion dropdown (`GET /items/suggest`) or commits what they typed. The server
-    // takes the confirmed name at face value and only normalizes whitespace/casing.
+    // Normalize the name:
     let canonical_name = req.name.trim().to_lowercase();
     if canonical_name.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -80,13 +63,7 @@ pub(crate) async fn upsert_fridge_item(
     let added_at = Utc::now();
     let estimated_expiration = estimate_expiration(&canonical_name, added_at);
 
-    // Same name and unit only makes a row *eligible* to merge — the expiration still has to
-    // line up, or adding fresh milk would silently join a carton that's about to turn.
-    // Units must match too: 2 count + 1 litre is not 3 of anything.
-    //
-    // The `user_id` filter is not optional here: without it one account's milk would merge
-    // into another's, which is a data leak dressed up as a quantity update — and unlike a
-    // read leak it would be destructive, since the two rows become one.
+    // Fetches all items in the fridge currently matching the specs of the item requesting to be added:
     let existing = sqlx::query_as::<_, MergeCandidate>(
         "SELECT id, estimated_expiration FROM fridge_items \
          WHERE user_id = ? AND canonical_name = ? AND unit = ?",
@@ -98,6 +75,7 @@ pub(crate) async fn upsert_fridge_item(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Finds a suitable matching item from the fetched list and merges it into the fridge
     if let Some(target) = find_merge_target(&existing, estimated_expiration) {
         let result = merge_into_existing(pool, target, req, estimated_expiration).await?;
         purchase_history::record(pool, user_id, &canonical_name, req.quantity, added_at)
@@ -108,6 +86,7 @@ pub(crate) async fn upsert_fridge_item(
 
     let id = Uuid::new_v4().to_string();
 
+    // Insertion into the fridge database
     sqlx::query(
         "INSERT INTO fridge_items (id, canonical_name, quantity, unit, added_at, estimated_expiration, foodkeeper_product_id, user_id) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -124,6 +103,7 @@ pub(crate) async fn upsert_fridge_item(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Records the item as purchased
     purchase_history::record(pool, user_id, &canonical_name, req.quantity, added_at)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -141,19 +121,14 @@ pub(crate) async fn upsert_fridge_item(
     Ok((StatusCode::CREATED, item))
 }
 
-/// An existing row that `add_item` could fold the new quantity into.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct MergeCandidate {
     id: String,
     estimated_expiration: Option<DateTime<Utc>>,
 }
 
-/// Picks the row a newly added item should merge into, if any.
-///
-/// Kept separate from the SQL so the decision is unit-testable. Rows without an expiration
-/// are never merge targets — there's nothing to compare against, so treating them as "close
-/// enough" would be a guess. When several rows qualify, the earliest-expiring one wins, so
-/// the oldest open batch is the one that grows.
+/// This is a Helper function that finds a matching candidate with an expiration
+/// date within the tolerance of the expiration date of the input target.
 fn find_merge_target(
     candidates: &[MergeCandidate],
     new_expiration: DateTime<Utc>,
@@ -172,23 +147,20 @@ fn find_merge_target(
         .map(|(candidate, _)| candidate)
 }
 
-/// Folds the new quantity into an existing row and returns the updated item.
-///
-/// No `user_id` filter needed: `target` can only have come from the ownership-scoped query in
-/// `upsert_fridge_item`, so the id is already known to belong to the caller.
+/// Takes an input item and attempts to merge it with an existing entry in the
+/// fridge table.
 async fn merge_into_existing(
     pool: &SqlitePool,
     target: &MergeCandidate,
     req: &AddItemRequest,
     new_expiration: DateTime<Utc>,
 ) -> Result<(StatusCode, FridgeItem), StatusCode> {
-    // Keep the *earlier* of the two dates. The merged row now covers food of slightly
-    // different ages, and warning early about food that's still fine is a much cheaper
-    // mistake than staying quiet about food that isn't.
+    // Take the earlier time of the 2 expirations to ensure safety
     let expiration = target
         .estimated_expiration
         .map_or(new_expiration, |existing| existing.min(new_expiration));
 
+    // Update query
     sqlx::query(
         "UPDATE fridge_items \
          SET quantity = quantity + ?, \
@@ -198,14 +170,13 @@ async fn merge_into_existing(
     )
     .bind(req.quantity)
     .bind(expiration)
-    // Backfills the catalog id if the existing row was added freehand and this one came
-    // from a suggestion. COALESCE keeps an id the row already had.
     .bind(req.foodkeeper_product_id)
     .bind(&target.id)
     .execute(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Takes the updated data from the merged row
     let item = sqlx::query_as::<_, FridgeItem>(&format!(
         "SELECT {SELECT_COLUMNS} FROM fridge_items WHERE id = ?"
     ))
@@ -214,20 +185,15 @@ async fn merge_into_existing(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // 200 rather than 201: this updated a row instead of creating one.
     Ok((StatusCode::OK, item))
 }
 
+/// Removes an item from the fridge
 pub async fn remove_item(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    // `user_id` in the WHERE clause, not a check-then-delete: ids come straight from the URL,
-    // so without it any signed-in account could delete any row whose id it can name. Folding
-    // ownership into the statement also makes "not yours" and "doesn't exist" the same
-    // outcome — a 404 either way, which is the right answer, since confirming that an id
-    // exists but belongs to someone else is itself a small leak.
     let result = sqlx::query("DELETE FROM fridge_items WHERE id = ? AND user_id = ?")
         .bind(&id)
         .bind(&user.id)
@@ -270,7 +236,6 @@ mod tests {
 
     #[test]
     fn does_not_merge_when_expirations_are_far_apart() {
-        // Milk bought two weeks ago should not absorb milk bought today.
         let new_expiration = days_from_now(7);
         let existing = vec![candidate("a", Some(days_from_now(-7)))];
 
@@ -289,7 +254,11 @@ mod tests {
 
         let outside = vec![candidate(
             "b",
-            Some(new_expiration - Duration::days(MERGE_EXPIRATION_TOLERANCE_DAYS) - Duration::minutes(1)),
+            Some(
+                new_expiration
+                    - Duration::days(MERGE_EXPIRATION_TOLERANCE_DAYS)
+                    - Duration::minutes(1),
+            ),
         )];
         assert!(find_merge_target(&outside, new_expiration).is_none());
     }
