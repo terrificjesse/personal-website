@@ -5,10 +5,34 @@ export type BlogPost = {
   author_id: string;
   title: string;
   slug: string;
+  /** Markdown source. Rendered by `app/blog/MarkdownBody.tsx`, never stored as HTML. */
   body: string;
   published: boolean;
   created_at: string;
   updated_at: string;
+  /**
+   * `"db"` for a post written here, `"file"` for one synced from `content/blog/*.md`.
+   * File-sourced posts are read-only — the backend answers PATCH/DELETE on one with 409,
+   * because the next sync would overwrite the edit from disk anyway.
+   */
+  source: BlogPostSource;
+};
+
+export type BlogPostSource = "db" | "file";
+
+export type BlogSortOrder = "newest" | "oldest";
+
+export type ListPostsOptions = {
+  sort?: BlogSortOrder;
+  q?: string;
+};
+
+/** What one run of the file sync changed. */
+export type BlogSyncReport = {
+  created: number;
+  updated: number;
+  deleted: number;
+  skipped: number;
 };
 
 export type CreateBlogPostInput = {
@@ -33,8 +57,15 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
  * non-admin, drafts included for an admin. Uses a plain `fetch` rather than `apiFetch` —
  * this route works signed-out, so a missing cookie is the ordinary case, not a 401 to raise.
  */
-export async function fetchPosts(): Promise<BlogPost[]> {
-  const res = await fetch(`${apiBase()}/blog/posts`, {
+export async function fetchPosts(options: ListPostsOptions = {}): Promise<BlogPost[]> {
+  const params = new URLSearchParams();
+  // Only send what was actually asked for: an empty `q=` is not a search for the empty
+  // string, and omitting `sort` lets the backend's own default (newest) stand.
+  if (options.sort) params.set("sort", options.sort);
+  if (options.q?.trim()) params.set("q", options.q.trim());
+
+  const query = params.toString();
+  const res = await fetch(`${apiBase()}/blog/posts${query ? `?${query}` : ""}`, {
     credentials: "include",
     cache: "no-store",
   });
@@ -96,4 +127,20 @@ export async function deletePost(id: string): Promise<void> {
   if (!res.ok) {
     throw new Error(await errorMessage(res, "Could not delete post"));
   }
+}
+
+/**
+ * Admin-only: re-read `content/blog/` and reconcile it with the database.
+ *
+ * Uses `apiFetch` rather than the plain `fetch` the public read paths use — this one genuinely
+ * requires a session, so a 401 should raise and redirect rather than being the ordinary
+ * signed-out case.
+ */
+export async function syncBlogFiles(): Promise<BlogSyncReport> {
+  const res = await apiFetch("/blog/sync", { method: "POST" });
+
+  if (!res.ok) {
+    throw new Error(await errorMessage(res, "Could not sync files"));
+  }
+  return res.json();
 }

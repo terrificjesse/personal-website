@@ -3,7 +3,14 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchMe, type AuthenticatedUser } from "@/lib/authApi";
-import { createPost, deletePost, fetchPosts, updatePost, type BlogPost } from "@/lib/blogApi";
+import {
+  createPost,
+  deletePost,
+  fetchPosts,
+  syncBlogFiles,
+  updatePost,
+  type BlogPost,
+} from "@/lib/blogApi";
 import { useApiError } from "@/lib/useApiError";
 import { PostForm } from "./PostForm";
 
@@ -20,6 +27,8 @@ export default function BlogAdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<string | null>(null);
   const handleApiError = useApiError();
 
   useEffect(() => {
@@ -92,6 +101,24 @@ export default function BlogAdminPage() {
     setReloadKey((key) => key + 1);
   }
 
+  async function handleSync() {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const report = await syncBlogFiles();
+      setSyncResult(
+        `${report.created} created, ${report.updated} updated, ${report.deleted} deleted, ` +
+          `${report.skipped} skipped.` +
+          (report.skipped > 0 ? " Check the backend log for why a file was skipped." : ""),
+      );
+      setReloadKey((key) => key + 1);
+    } catch (err) {
+      setError(handleApiError(err, "Couldn't sync files"));
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
       <h1 className="text-xl font-semibold">Blog admin</h1>
@@ -100,6 +127,27 @@ export default function BlogAdminPage() {
           View the public blog
         </Link>
       </p>
+
+      <div className="mt-6 rounded border border-black/10 dark:border-white/10 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-medium">Posts from files</h2>
+            <p className="mt-1 text-xs opacity-60">
+              <code>content/blog/*.md</code> syncs automatically every few seconds, and at
+              startup. This forces it now — useful if you&apos;d rather not wait, or want to
+              see why a file was skipped.
+            </p>
+          </div>
+          <button
+            onClick={handleSync}
+            disabled={syncing}
+            className="rounded border border-black/20 dark:border-white/20 px-3 py-1.5 text-sm disabled:opacity-50"
+          >
+            {syncing ? "Syncing…" : "Re-sync files"}
+          </button>
+        </div>
+        {syncResult && <p className="mt-3 text-xs opacity-70">{syncResult}</p>}
+      </div>
 
       <div className="mt-6 rounded border border-black/10 dark:border-white/10 p-4">
         <h2 className="text-sm font-medium">New post</h2>
@@ -112,7 +160,7 @@ export default function BlogAdminPage() {
 
       <ul className="mt-6 divide-y divide-black/10 dark:divide-white/10">
         {posts.map((post) =>
-          editingId === post.id ? (
+          editingId === post.id && post.source !== "file" ? (
             <li key={post.id} className="py-4">
               <PostForm
                 initial={post}
@@ -128,16 +176,26 @@ export default function BlogAdminPage() {
                 <p className="text-xs opacity-60">
                   {new Date(post.updated_at).toLocaleDateString()}
                   {!post.published && " · Draft"}
+                  {post.source === "file" && " · From file"}
                 </p>
               </div>
-              <div className="flex items-center gap-3 text-sm">
-                <button onClick={() => setEditingId(post.id)} className="hover:underline">
-                  Edit
-                </button>
-                <button onClick={() => handleDelete(post.id)} className="text-red-600 hover:underline">
-                  Delete
-                </button>
-              </div>
+              {/*
+                A file-sourced post has no Edit or Delete, because the next sync would
+                overwrite either one from disk — the backend refuses both with 409 regardless,
+                so this is the same optimistic-UI-over-real-enforcement split as `is_admin`.
+              */}
+              {post.source === "file" ? (
+                <p className="shrink-0 text-xs opacity-50">Edit the markdown file</p>
+              ) : (
+                <div className="flex items-center gap-3 text-sm">
+                  <button onClick={() => setEditingId(post.id)} className="hover:underline">
+                    Edit
+                  </button>
+                  <button onClick={() => handleDelete(post.id)} className="text-red-600 hover:underline">
+                    Delete
+                  </button>
+                </div>
+              )}
             </li>
           ),
         )}

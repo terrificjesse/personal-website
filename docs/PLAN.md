@@ -325,6 +325,218 @@ is written as a real-data exercise rather than a test-suite target.
 
 ---
 
+## Phase 6 — Blog tab — **complete 2026-08-19**
+
+**Not a Learning Mode phase.** Every task below is `[gen]` — Claude implements fully. The
+flagged subsystems are auth, NLP, recommendations, and expiration; content management is none
+of those. Don't stop at a boundary here.
+
+**Already done (2026-08-19), documented in `docs/BLOG.md`:** `users.is_admin` + the
+`RequireAdmin` extractor; `blog_posts` table; full CRUD behind admin; public `/blog` and
+`/blog/[slug]` that work signed out; drafts hidden from non-admins.
+
+### Remaining scope — all done
+
+- [gen] **Markdown rendering.** **Done** — frontend `react-markdown` + `remark-gfm`, chosen
+  over backend `pulldown-cmark` so `body` stays markdown source in exactly one representation
+  (database, API, editor, and what search matches are all the same string). `react-markdown`
+  builds a React tree rather than setting `innerHTML`, so raw HTML in a post is escaped and no
+  sanitizer is needed — **`rehype-raw` would switch that off and must not be added casually.**
+  Rendering lives in one component, `app/blog/MarkdownBody.tsx`, shared by the post page and
+  the editor's preview.
+
+  The non-obvious half was CSS: Tailwind's preflight resets headings and list markers, so
+  `react-markdown` alone renders markdown that still *looks* like plain text. A scoped
+  `.markdown-body` block in `globals.css` does that work, hand-written rather than pulling in
+  `@tailwindcss/typography` for a third dependency.
+- [gen] **Sort by date.** **Done** — `GET /blog/posts?sort=newest|oldest`, as a two-variant
+  enum so `?sort=oldset` is a **400** rather than a silent fall back to newest.
+- [gen] **Keyword search.** **Done** — `GET /blog/posts?q=…`, SQLite `LIKE` over title and
+  body, with `%`/`_`/`\` escaped and `ESCAPE '\'`. Without the escaping a search for `100%`
+  returns every post. FTS5 stayed out: it buys ranking, stemming, and phrase queries that
+  nobody asked for, and costs a shadow table the file sync would have to write to as well.
+  **Revisit when you want ranked results, not when you have more posts.**
+- [gen] **Markdown files from git.** **Done** — design 1 below, `content/blog/*.md` synced
+  into `blog_posts` with a `source` column. Author-facing docs are `content/blog/README.md`.
+- [gen] Search + sort compose and cover both kinds identically. **Achieved literally**: there
+  is no branch on `source` anywhere in the read path — `list_posts` builds one statement from
+  a draft filter, an optional `LIKE`, and an `ORDER BY`.
+
+### The file-ingestion decision — chose 1
+
+Three shapes, in rough order of preference:
+
+1. **Sync-on-startup — chosen.** Backend reads `content/blog/*.md` at boot and upserts
+   into `blog_posts` with a `source` column (`'db'` | `'file'`). **One query path**, so sort
+   and search work uniformly and no endpoint has to merge two stores. File-sourced posts
+   become read-only in the admin UI. Cost: a restart (or an explicit re-sync endpoint) to pick
+   up changes.
+2. **Read-through at request time.** Always fresh, but every list/search/sort has to merge two
+   sources and reconcile ordering — the complexity lands in the query layer permanently.
+3. **GitHub API at runtime.** No redeploy needed, but adds a network dependency, rate limits,
+   and a token if the repo is ever private.
+
+Whichever is chosen: YAML frontmatter (`title`, `date`, `published`, optional `slug`) is the
+conventional carrier for metadata, and slug stability rules from `docs/BLOG.md` still apply —
+a file's slug must not change when its title does.
+
+**What settled it** was the constraint above, not the ordering here: option 1 is the only one
+where sort and search are written *once*. Options 2 and 3 merge two stores in the query layer,
+so every future query feature gets implemented twice. The frontmatter parser is hand-rolled
+(~30 lines, no crate) since the schema is four flat scalars; **an unknown key is an error**,
+because a misspelled `pubished: true` would otherwise leave a post a draft forever with no
+symptom but a post that never appears.
+
+Decisions taken while building, each of which had a wrong answer that looks reasonable:
+
+- **A file's slug comes from its filename, not its title** — the filename is the only identity
+  a file has that editing its contents doesn't change.
+- **`created_at` from frontmatter `date`, never file mtime** — mtime is reset by `git clone`
+  and `git checkout`, so the blog would reshuffle itself on a fresh checkout.
+- **`author_id` is the first-registered admin**; with no admin yet, the sync logs and skips
+  instead of panicking at boot.
+- **On a slug collision with a browser-authored post, the file loses.** Taking the slug would
+  repoint an already-published URL at content nobody linked to.
+- **Sync mirrors rather than imports** — a deleted file deletes its post — and every write is
+  scoped to `source = 'file'`.
+- **File posts are read-only through the API (409), not merely hidden in the UI.** The next
+  sync would overwrite an accepted edit, so accepting one is a lie.
+
+Publishing is automatic: a background task polls a `(filename, mtime, size)` fingerprint of the
+directory every `BLOG_SYNC_INTERVAL_SECS` (default 5) and syncs only when it changed. Startup
+sync and admin-only `POST /blog/sync` both remain.
+
+Polling rather than `notify` because **`sync` makes a spurious trigger cost a no-op** — it only
+counts an update when content genuinely differs. False positives are free, false negatives are
+a missed post, so an imprecise detector is the right tool, and it costs zero new crates against
+`notify` plus a debouncer.
+
+### Checkpoint — met 2026-08-19
+
+Every clause verified against a throwaway copy of `fridge.db`, with `curl` for anything about
+authorization and the browser for anything about rendering. Full matrix in `docs/BLOG.md`.
+
+- Post written in the browser renders as markdown — headings, lists, code, GFM table. ✅
+- A `.md` file appears alongside them; delete the file and its post goes with it. ✅
+- `?sort=oldest` flips the order for **both kinds in one list**. ✅
+- A term appearing only in a file-sourced post's body returns it. ✅
+- Signed-out visitor sees published posts of both kinds and no drafts; a draft slug 404s. ✅
+
+Beyond the checkpoint: `?q=%` returns only posts containing a literal `%` (the `LIKE`-escaping
+bug it would otherwise have); `?sort=bogus` is a 400; `PATCH`/`DELETE` on a file post is 409
+while a db post still edits normally; a `<script>` typed into the editor renders as text with
+**zero** `<script>` elements in the DOM.
+
+`cargo test`: **135 passed** (117 + 18 new), clippy clean, `tsc --noEmit` clean.
+
+The one bug found, caught by the compiler rather than a test: `sync` accumulated its skip count
+in a local that never reached the returned report, so `skipped` would always have read `0`. It
+surfaced as an `unused_assignments` warning — a test asserting on the count would have had to
+exist first, and the warning needed nothing.
+
+**Added beyond the plan:**
+
+- A `PORT` env var in `main.rs` (defaults to 8080), so a second backend instance can run
+  against a throwaway database while the usual one keeps serving. That is how this checkpoint
+  was verified without stopping anything.
+- **Auto-sync** (`blog_files::spawn_watcher`), added at the user's request after the checkpoint
+  — the plan had explicitly deferred a watcher. Verified live: dropped file ~3s, edit ~6s,
+  delete ~6s, and no log output on quiet ticks.
+- A **"Write a post"** button on `/blog`, shown only to admins. Nothing had ever linked *to*
+  `/blog/admin` — it linked out to `/blog` and nothing linked back — so the editor was
+  reachable only by typing its URL. That gap shipped with blog v1 and went unnoticed here
+  because verification navigated straight to the admin URL rather than trying to find it.
+
+
+---
+
+## Phase 7 — Internship tab (scraper + ranking + applied tracker)
+
+**Not a Learning Mode phase, and that includes the ranking.** The user decided this explicitly
+on 2026-08-20. `rank_postings` is a scoring-and-ordering algorithm and so looks exactly like
+the `[learn]` work in Phases 2–4 — it is nonetheless `[gen]`. Do not re-litigate it.
+
+The one open Learning-Mode question is **dedup's fuzzy company/title matching**, which is the
+NLP area's shape. Reuse `src/nlp.rs` if it fits; if it doesn't, **ask before writing a second
+matcher** rather than assuming the `[gen]` exception covers it.
+
+**Goal:** collect open SWE internship postings from several sources, normalize and dedup them,
+rank them, let the user record which ones they applied to, and drop postings once they close.
+
+### Where it lives
+
+Backend in `apps/fridge-app/backend/` (auth and `users` are there — same reasoning as the
+blog, see root `CLAUDE.md`). Frontend at `frontend/src/app/internships/`. Vendored source
+snapshots under `apps/fridge-app/backend/data/internships/`, following `data/themealdb/`.
+
+### Sources — all four classes, isolated from each other
+
+Chosen by the user with the tradeoffs stated. `docs/INTERNSHIP_SCRAPING.md` holds the
+per-source research: endpoints, real field names, and a **field-availability matrix** that says
+which of the ranking's inputs each source actually provides.
+
+| Class | Expectation |
+|---|---|
+| ATS public JSON APIs (Greenhouse, Lever, Ashby) | Primary. Structured, stable, no HTML parsing |
+| GitHub internship-list repos (Summer 2026/2027) | Breadth and cold-start corpus |
+| RSS / JSON feeds where offered | Supplement |
+| LinkedIn / Indeed / Handshake | **Best-effort. Expected to yield little.** Never on the critical path |
+
+The **scraping rules in the root `CLAUDE.md` are binding**: per-source isolation, fail fast,
+every failure recorded in `source_runs` and the log, and **no detection evasion** — identify
+honestly, respect `robots.txt`, rate-limit, and give up on a source that pushes back rather
+than working around it.
+
+### Scope
+
+- [gen] **Source adapters** behind one trait, each returning either postings or a recorded
+  failure. Adding a source must not touch the runner.
+- [gen] **Run record** (`source_runs`): source, started/finished, count, outcome, error. A
+  source that silently returned zero must be distinguishable from one that had zero.
+- [gen] **Normalization + QC**: parse pay into a numeric range with currency and period; parse
+  term/season; normalize location and a remote flag; parse class-year eligibility. Reject or
+  flag rows that don't survive it, and **make the rejects visible** — silent drops are how a
+  scraper looks healthy while losing half its data.
+- [gen] **Dedup** across sources. Merge key plus fuzzy fallback — see the NLP note above.
+- [gen] **Ranking** — `rank_postings`. Composite over pay, posted date, deadline proximity,
+  location match, class-year fit, and a **derived** prestige signal (the user chose derived
+  signals over a hand-maintained tier list). Two rules carried from Phases 3–4, which were
+  learned the hard way: **user-supplied filters are hard filters, not scoring inputs**, so
+  results stay predictable; and **every continuous score needs an explicit threshold** —
+  `>` vs `>=` silently excluded every 4★ recipe in Phase 4.
+  **Missing data is the central difficulty here, not the weighting.** Pay is absent from most
+  sources; a posting with no salary must not be ranked as though it pays zero. Decide and
+  document what absent means for each input.
+- [gen] **Filters**: term, location/remote, class year, pay floor, source, company.
+- [gen] **Applied tracker**: per-user, with status (applied → OA → interview → offer/rejected),
+  applied date, and notes.
+- [gen] **Expiry sweep**: drop postings past their deadline, and postings that have vanished
+  from their source for N consecutive runs. Cadence via env var, same shape as
+  `BLOG_SYNC_INTERVAL_SECS`.
+- [gen] Frontend: ranked list with filter controls, an applied-tracker view, and a run-health
+  panel so a quietly broken source is visible rather than merely absent.
+
+### Two design traps to settle before writing the schema
+
+1. **An applied posting must survive expiry.** If the sweep deletes a posting the user applied
+   to, their application history is orphaned or lost. Snapshot company/title/URL/pay onto the
+   applied row, or soft-delete and keep it joinable. Decide before the migration, not after.
+2. **Disappearance is not closure.** A source erroring, being rate-limited, or reshaping its
+   response also makes postings "vanish." **The expiry sweep must only count a disappearance
+   from a run that actually succeeded**, or one blocked LinkedIn fetch silently expires
+   everything it ever supplied. This is the single most likely data-loss bug in the phase.
+
+### Checkpoint
+
+Run a collection with at least one source deliberately failing; confirm the others still land
+and the failure is visible in both the run record and the log. Confirm a posting present in two
+sources appears once. Confirm the ranking reorders sensibly when pay and deadline change, and
+that a posting with unknown pay is neither first nor last by accident. Mark one applied, let it
+expire, and confirm the application survives with its details intact. Confirm a failed run does
+**not** expire that source's postings.
+
+---
+
 ## After Phase 5
 
 Not planned in detail yet: additional site tabs beyond the fridge app, deployment

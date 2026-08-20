@@ -244,6 +244,50 @@ pub struct BlogPost {
     pub published: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// `"db"` for a post written through `/blog/admin`, `"file"` for one ingested from
+    /// `content/blog/*.md` by `blog_files::sync`. Both kinds live in the same table so that
+    /// sort and search have one query path; see migration `0011`.
+    pub source: String,
+}
+
+/// The value of `BlogPost::source` for a post written in the browser.
+pub const BLOG_SOURCE_DB: &str = "db";
+/// The value of `BlogPost::source` for a post ingested from a markdown file.
+pub const BLOG_SOURCE_FILE: &str = "file";
+
+/// Ordering for `GET /blog/posts`. Named rather than a raw `&str` so the only two strings
+/// the API accepts are pinned in one place, and so an unrecognized value is rejected by the
+/// `Query` extractor as a 400 instead of silently falling back to a default — a silent
+/// fallback would turn `?sort=oldset` into "newest" with no way to notice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    Newest,
+    Oldest,
+}
+
+impl SortOrder {
+    /// The SQL direction this maps to. Returns a `&'static str` rather than anything
+    /// caller-supplied, because it is interpolated into the statement — `ORDER BY` cannot
+    /// take a bind parameter, so this is the one part of the query that must not be
+    /// reachable from user input.
+    pub fn sql_direction(self) -> &'static str {
+        match self {
+            SortOrder::Newest => "DESC",
+            SortOrder::Oldest => "ASC",
+        }
+    }
+}
+
+/// Query string for `GET /blog/posts`. Both fields are optional; absent `sort` means newest
+/// first, which is what the endpoint did before either existed.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListPostsQuery {
+    #[serde(default)]
+    pub sort: SortOrder,
+    /// Free-text search across title and body. Whitespace-only is treated as absent.
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,5 +385,38 @@ mod tests {
     #[test]
     fn slugify_of_an_all_punctuation_title_is_empty() {
         assert_eq!(slugify("!!!"), "");
+    }
+
+    // `Query` deserializes with `serde_urlencoded`, which isn't a direct dependency here.
+    // These go through `serde_json` instead: the behavior under test is the *derived*
+    // `Deserialize` impl — the `#[default]` and the rejection of an unknown unit variant —
+    // and that is decided by the derive, not by the wire format.
+    fn parse_sort(value: &str) -> Result<SortOrder, serde_json::Error> {
+        serde_json::from_value(serde_json::Value::String(value.to_string()))
+    }
+
+    #[test]
+    fn absent_sort_means_newest_first() {
+        let query: ListPostsQuery =
+            serde_json::from_str("{}").expect("both fields are optional, so {} is valid");
+        assert_eq!(query.sort, SortOrder::Newest);
+        assert_eq!(query.sort.sql_direction(), "DESC");
+        assert!(query.q.is_none());
+    }
+
+    #[test]
+    fn sort_accepts_exactly_newest_and_oldest() {
+        assert_eq!(parse_sort("newest").unwrap(), SortOrder::Newest);
+        assert_eq!(parse_sort("oldest").unwrap(), SortOrder::Oldest);
+        assert_eq!(parse_sort("oldest").unwrap().sql_direction(), "ASC");
+    }
+
+    /// The point of the enum: a typo has to be an error rather than a silent "newest". This
+    /// is what the `Query` extractor turns into a 400.
+    #[test]
+    fn an_unrecognized_sort_is_rejected_rather_than_defaulted() {
+        assert!(parse_sort("oldset").is_err());
+        assert!(parse_sort("").is_err());
+        assert!(parse_sort("DESC").is_err());
     }
 }

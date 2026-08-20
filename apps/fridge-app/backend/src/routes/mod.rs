@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod blog;
 pub mod health;
+pub mod internships;
 pub mod items;
 pub mod recipes;
 pub mod reviews;
@@ -120,11 +121,24 @@ pub fn build_router(state: AppState) -> Router {
             get(reviews::list_reviews).post(reviews::submit_review),
         )
         .route("/recipes/{id}/reviews", get(reviews::list_recipe_reviews))
-        .route(
-            "/blog/posts",
-            get(blog::list_posts).post(blog::create_post),
-        )
+        .route("/blog/posts", get(blog::list_posts).post(blog::create_post))
         .route("/blog/posts/by-slug/{slug}", get(blog::get_post))
+        .route("/blog/sync", post(blog::sync_posts))
+        .route(
+            "/internships/applications",
+            get(internships::list_applications).post(internships::create_application),
+        )
+        .route("/internships", get(internships::list_postings))
+        .route("/internships/sources", get(internships::list_sources))
+        .route("/internships/runs", get(internships::run_health))
+        .route(
+            "/internships/runs/{source_run_id}/rejects",
+            get(internships::list_rejects),
+        )
+        .route(
+            "/internships/applications/{id}",
+            patch(internships::update_application).delete(internships::delete_application),
+        )
         .route(
             "/blog/posts/{id}",
             patch(blog::update_post).delete(blog::delete_post),

@@ -7,18 +7,17 @@ Trimmed 2026-08-19. Decisions are recorded here as *rules*; the reasoning behind
 git history, in `docs/PLAN.md`'s phase checkpoints, and in each module's own doc comment.
 When a module doc and this file disagree, the module doc wins — it's closer to the code.
 
-## Current status: Phases 1–5 complete; blog tab added 2026-08-19
+## Current status: Phases 1–6 complete (blog tab finished 2026-08-19)
 
 All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`,
 `rerank.rs`, `auth.rs` — were implemented by the user, with Claude reviewing rather than
 writing them. Every phase was verified against real data, not just fixtures; the per-phase
 evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **117 passed, 0 failed**, clippy clean.
+`cargo test`: **141 passed, 0 failed**, clippy clean.
 
-**Still open, none blocking:** `auth::require_admin` is a deliberate `[learn]` stub that denies
-everyone (see "Admin flag & blog"); the deferred `[learn]` items in PLAN.md (small-sample
-rating statistics; weighting personal vs. global feedback in `rerank`); rate limiting on
+**Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
+statistics; weighting personal vs. global feedback in `rerank`); rate limiting on
 `POST /reviews`; and a moderation path for `hidden`.
 
 ### Scoring models, in one place
@@ -150,6 +149,16 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   read helpers with deliberately different scopes: `fetch_for_viewer` (own) vs.
   `fetch_visible_to` (own + public). **Picking the wrong one leaks a stranger's review into a
   personal view.**
+- `src/blog_files.rs` — `[gen]` markdown-file ingestion for the blog. Hand-rolled frontmatter
+  parser (no crate), `sync` (mirrors `content/blog/*.md` into `blog_posts`), and
+  `spawn_watcher` (polls a `(name, mtime, size)` fingerprint every `BLOG_SYNC_INTERVAL_SECS`).
+  Read its module doc before changing it — the filename-not-title slug rule and the
+  frontmatter-not-mtime date rule both look like details and are not.
+  **`is_post_file` is deliberately shared** by the reader and the watcher; let those two drift
+  and you get either changes that never sync or a sync that loops on a file it ignores.
+  Note mtime is used for change detection while being refused for `created_at` — not an
+  inconsistency: for ordering it gives a wrong answer, for detection a redundant one, and
+  `sync` makes a redundant trigger a no-op.
 - `src/nlp.rs` — **[learn]** banded-tier fuzzy/prefix/substring matcher; module doc has the bands.
 - `src/expiration.rs` — **[learn]** FoodKeeper-CSV-backed shelf-life lookup.
 - `src/recommend.rs` — **[learn]** `suggest_shopping_items`. See technical debt re `calculate_mad`.
@@ -236,6 +245,20 @@ Deliberate choices worth not "fixing":
   those hosts differ the cookie isn't sent and the callback fails the state check. Keep
   `GOOGLE_REDIRECT_URI`, `FRONTEND_ORIGIN`, and the host you actually browse on identical.
   Register both variants in Google Cloud Console if you like; only `.env` has to be consistent.
+- **`BLOG_CONTENT_DIR`** overrides where the blog looks for `.md` files; the default is
+  `content/blog` at the repo root, resolved off `CARGO_MANIFEST_DIR` rather than the working
+  directory (the backend runs three levels below the root). A missing directory is logged and
+  skipped, not an error.
+- **`BLOG_SYNC_INTERVAL_SECS`** (default 5) is how often the blog watcher re-checks that
+  directory; `0`, or anything unparseable, disables it and falls back to startup +
+  `POST /blog/sync`. A tick does no database work and logs nothing unless the directory
+  actually changed.
+- **`PORT`** (default 8080) lets a second backend run alongside the usual one — how Phase 6 was
+  verified against a throwaway database without stopping the running instance.
+- **`cargo fmt` reformats the whole crate, `[learn]` files included.** It stripped a leading
+  blank line from `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`, and
+  `rerank.rs` during Phase 6 and had to be reverted by hand. Format single files
+  (`rustfmt src/foo.rs`) or check the diff afterwards.
 - Backend binds `0.0.0.0` on purpose. Every data route now requires a session, but
   `COOKIE_SECURE` defaults to off (plain HTTP on a LAN), so still trusted networks only.
 - `apps/fridge-app/backend/.env.example` documents every env var; `.env` is gitignored.
@@ -254,34 +277,48 @@ Deliberate choices worth not "fixing":
 
 ## Admin flag & blog (added 2026-08-19)
 
-`users.is_admin` (migration `0009`) gates access to admin-only features — currently just the
-blog editor. Not settable through any API; grant it to your own account directly:
-`sqlite3 fridge.db "UPDATE users SET is_admin = 1 WHERE email = 'you@example.com';"`.
+**Full reference — every file and function — is `docs/BLOG.md`. Read that before working on
+the blog.** Only the rules that constrain *this* backend are repeated here.
 
-- **`auth::require_admin(user: &User) -> Result<(), AuthError>` is a `[learn]` stub**,
-  deliberately left denying everyone (`Err(AuthError::Forbidden)`), same convention as the
-  rest of `auth.rs`: a placeholder that *grants* access returns the denying value rather than
-  `todo!()`. Implement the real `user.is_admin` check yourself. Until you do, every
-  `RequireAdmin`-gated route 403s regardless of the flag.
-- `routes::auth::RequireAdmin` is the `[gen]` extractor built on top of it — wraps
-  `CurrentUser`, then calls `require_admin`. Every write route in `routes/blog.rs` takes it
-  instead of `CurrentUser`, same "route signature is the authority" pattern Phase 5 already
-  established.
-- The blog itself (`blog_posts` table, migration `0010`; `src/routes/blog.rs`;
-  `frontend/src/app/blog/`) is a **separate top-level tab**, not part of the fridge app —
-  per the root `CLAUDE.md`'s "each tab is a self-contained mini-project," even though it
-  currently shares this backend and its auth/users table. `GET /blog/posts` and
-  `GET /blog/posts/by-slug/{slug}` are public (via `MaybeUser`, not `CurrentUser`) so signed-out
-  visitors can read published posts; drafts are visible only to an admin. Write routes
-  (`POST /blog/posts`, `PATCH /blog/posts/{id}`, `DELETE /blog/posts/{id}`) are admin-only.
-- `slug` (`models::slugify`, `[gen]`, deterministic) is stored at creation and never rewritten
-  on a title edit, so a published URL stays stable. `routes/blog.rs::unique_slug` appends
-  `-2`, `-3`, ... on collision.
-- Frontend: `frontend/src/proxy.ts`'s matcher now also covers `/blog/admin/:path*` (same
-  cookie-presence-only check as `/fridge`). `/blog/admin/page.tsx` additionally checks
-  `is_admin` from `/auth/me` so a signed-in non-admin sees a message instead of the editor —
-  but that check, like the proxy, is optimistic UI only; `RequireAdmin` on the backend is the
-  actual enforcement.
+`users.is_admin` (migration `0009`) gates admin-only features. Not settable through any API;
+grant it directly: `sqlite3 fridge.db "UPDATE users SET is_admin = 1 WHERE email = '…';"`
+(match the email **lowercased** — `normalize_email` lowercases before insert). No re-login or
+restart needed: `validate_session` re-joins `users` every request, so grants and revocations
+land immediately.
+
+- `auth::require_admin` is implemented (by the user, in the `[learn]` file `src/auth.rs`) —
+  `Ok(())` when `is_admin`, else `Err(AuthError::Forbidden)` → **403**. Its doc comment is
+  **stale**, still calling itself an unimplemented placeholder; leave it for the user to fix.
+- **Phase 6 is done.** Markdown rendering (frontend `react-markdown`), `?sort=`, `?q=`, and
+  `content/blog/*.md` ingestion all landed 2026-08-19. Two rules worth not rediscovering:
+  file-sourced posts answer `PATCH`/`DELETE` with **409** (the next sync would overwrite the
+  edit), and **there is no branch on `source` in the read path** — `list_posts` is one query
+  covering both kinds, which is the whole reason files are rows rather than a second store.
+  Adding `rehype-raw` on the frontend would re-enable raw HTML in posts; don't, without
+  deciding to accept that.
+- **The editor had no inbound link until 2026-08-19.** `/blog/admin` linked out to `/blog` and
+  nothing linked back, so it was reachable only by typing the URL. `/blog` now shows a "Write a
+  post" button gated on `is_admin` — optimistic UI, same as every other `is_admin` read.
+- **`Forbidden`/403 must stay distinct from `InvalidCredentials`/401.** `apiFetch` raises
+  `UnauthorizedError` on 401 only, and `useApiError` redirects that to `/login` — routing a
+  non-admin through 401 would bounce a signed-in user to a login page they're already past.
+- `routes::auth::RequireAdmin` is the `[gen]` extractor: `CurrentUser` → `require_admin`.
+  Every write route in `routes/blog.rs` takes it, so **a route's signature is the authority**
+  on its own protection — the Phase 5 pattern, unchanged.
+- **Two places answer "is this an admin":** `require_admin`, and two inline
+  `user.is_admin` reads in `blog.rs` (`list_posts`, `get_post`) that widen results to include
+  drafts. They agree only while `require_admin` is exactly `user.is_admin`. Make it richer and
+  the read paths silently keep the old policy — same hazard as `fetch_for_viewer` vs
+  `fetch_visible_to` above.
+- `slug` is stored at creation and **never rewritten** on a title edit, so a published URL
+  stays stable. `unique_slug` appends `-2`, `-3`, … on collision.
+- **Verify authorization with `curl`, not the browser.** `proxy.ts` and the admin page's
+  `is_admin` check are both optimistic UI; only `RequireAdmin` enforces, and only curl skips
+  the other two.
+- The blog is a **separate tab** that happens to live in this backend because auth and `users`
+  are here. Not a fridge feature — don't let the two bleed together.
+- **Phase 6 (markdown rendering, sort, search, `.md` files from git) is `[gen]`, not Learning
+  Mode.** See `docs/PLAN.md`.
 
 ## Open technical debt
 
@@ -350,12 +387,9 @@ Repo root, branch `main`, remote `origin` →
 
 Nothing blocking. In rough priority:
 
-1. **Implement `auth::require_admin`** — the `[learn]` stub currently denies everyone, so the
-   blog editor is unreachable. See "Admin flag & blog".
-2. **Register the real account on `fridge.db`.** Still 0 users / 16 unclaimed reviews as of
-   2026-08-19. That run claims the 22 rows for good — check the liked list reads 8 immediately
-   after, then grant yourself `is_admin`.
-3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
+1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
+   unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
+2. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.
 

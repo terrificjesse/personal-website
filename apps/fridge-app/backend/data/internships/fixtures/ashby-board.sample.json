@@ -1,0 +1,207 @@
+{
+ "apiVersion": "1",
+ "jobs": [
+  {
+   "id": "0321523b-f0c3-44cd-9c46-cf318a1cad9e",
+   "title": "GTM Intern",
+   "department": "GTM",
+   "team": "GTM",
+   "employmentType": "Intern",
+   "location": "San Jose",
+   "shouldDisplayCompensationOnJobPostings": false,
+   "secondaryLocations": [],
+   "publishedAt": "2026-05-19T22:25:46.940+00:00",
+   "isListed": true,
+   "isRemote": false,
+   "workplaceType": "OnSite",
+   "address": {
+    "postalAddress": {
+     "addressRegion": "CA",
+     "addressCountry": "United States",
+     "addressLocality": "San Jose"
+    }
+   },
+   "jobUrl": "https://jobs.ashbyhq.com/Etched/0321523b-f0c3-44cd-9c46-cf318a1cad9e",
+   "applyUrl": "https://jobs.ashbyhq.com/Etched/0321523b-f0c3-44cd-9c46-cf318a1cad9e/application",
+   "compensation": {
+    "compensationTierSummary": null,
+    "scrapeableCompensationSalarySummary": null,
+    "compensationTiers": [],
+    "summaryComponents": []
+   },
+   "descriptionPlain": "About Etched\n\nEtched is building hardware for frontier intelligence. We co-design chips, racks, software, and manufacturing to deliver best-in-class throughput and latency across both prefill and deco [truncated for fixture]"
+  },
+  {
+   "id": "f32908bd-8abc-495c-ab69-ac893b6c924d",
+   "title": "Core Ops Intern",
+   "department": "Operations",
+   "team": "Operations",
+   "employmentType": "Intern",
+   "location": "San Jose",
+   "shouldDisplayCompensationOnJobPostings": false,
+   "secondaryLocations": [],
+   "publishedAt": "2026-05-19T22:27:16.912+00:00",
+   "isListed": true,
+   "isRemote": false,
+   "workplaceType": "OnSite",
+   "address": {
+    "postalAddress": {
+     "addressRegion": "CA",
+     "addressCountry": "United States",
+     "addressLocality": "San Jose"
+    }
+   },
+   "jobUrl": "https://jobs.ashbyhq.com/Etched/f32908bd-8abc-495c-ab69-ac893b6c924d",
+   "applyUrl": "https://jobs.ashbyhq.com/Etched/f32908bd-8abc-495c-ab69-ac893b6c924d/application",
+   "compensation": {
+    "compensationTierSummary": null,
+    "scrapeableCompensationSalarySummary": null,
+    "compensationTiers": [],
+    "summaryComponents": []
+   },
+   "descriptionPlain": "About Etched\n\nEtched is building hardware for frontier intelligence. We co-design chips, racks, software, and manufacturing to deliver best-in-class throughput and latency across both prefill and deco [truncated for fixture]"
+  },
+  {
+   "id": "639fe410-56a4-44aa-ac93-8ee7c10c7d75",
+   "title": "Talent Intern",
+   "department": "Operations",
+   "team": "Operations",
+   "employmentType": "Intern",
+   "location": "San Jose",
+   "shouldDisplayCompensationOnJobPostings": false,
+   "secondaryLocations": [],
+   "publishedAt": "2025-12-08T22:41:41.532+00:00",
+   "isListed": true,
+   "isRemote": false,
+   "workplaceType": "OnSite",
+   "address": {
+    "postalAddress": {
+     "addressRegion": "CA",
+     "addressCountry": "United States",
+     "addressLocality": "San Jose"
+    }
+   },
+   "jobUrl": "https://jobs.ashbyhq.com/Etched/639fe410-56a4-44aa-ac93-8ee7c10c7d75",
+   "applyUrl": "https://jobs.ashbyhq.com/Etched/639fe410-56a4-44aa-ac93-8ee7c10c7d75/application",
+   "compensation": {
+    "compensationTierSummary": null,
+    "scrapeableCompensationSalarySummary": null,
+    "compensationTiers": [],
+    "summaryComponents": []
+   },
+   "descriptionPlain": "About Etched\n\nEtched is building hardware for frontier intelligence. We co-design chips, racks, software, and manufacturing to deliver best-in-class throughput and latency across both prefill and deco [truncated for fixture]"
+  },
+  {
+   "id": "7aeafe31-c2c6-43e0-bb31-01868dcfad39",
+   "title": "Design Verification Engineer - Internal IP",
+   "department": "ASIC",
+   "team": "ASIC",
+   "employmentType": "FullTime",
+   "location": "San Jose",
+   "shouldDisplayCompensationOnJobPostings": true,
+   "secondaryLocations": [],
+   "publishedAt": "2025-06-11T05:03:53.978+00:00",
+   "isListed": true,
+   "isRemote": false,
+   "workplaceType": "OnSite",
+   "address": {
+    "postalAddress": {
+     "addressRegion": "CA",
+     "addressCountry": "United States",
+     "addressLocality": "San Jose"
+    }
+   },
+   "jobUrl": "https://jobs.ashbyhq.com/Etched/7aeafe31-c2c6-43e0-bb31-01868dcfad39",
+   "applyUrl": "https://jobs.ashbyhq.com/Etched/7aeafe31-c2c6-43e0-bb31-01868dcfad39/application",
+   "compensation": {
+    "compensationTierSummary": "$150K \u2013 $275K \u2022 Plus Significant Equity",
+    "scrapeableCompensationSalarySummary": "$150K - $275K",
+    "compensationTiers": [
+     {
+      "id": "d7e9f6d7-a048-4e36-96dd-8f038f4ca69f",
+      "tierSummary": "$150K \u2013 $275K \u2022 Plus Significant Equity",
+      "title": null,
+      "additionalInformation": "Plus Significant Equity",
+      "components": [
+       {
+        "id": "fe4810f5-c87d-483a-982c-672039fef01d",
+        "summary": "$150K \u2013 $275K",
+        "compensationType": "Salary",
+        "interval": "1 YEAR",
+        "currencyCode": "USD",
+        "minValue": 150000,
+        "maxValue": 275000
+       }
+      ]
+     }
+    ],
+    "summaryComponents": [
+     {
+      "compensationType": "Salary",
+      "interval": "1 YEAR",
+      "currencyCode": "USD",
+      "minValue": 150000,
+      "maxValue": 275000
+     }
+    ]
+   },
+   "descriptionPlain": "About Etched\n\nEtched is building hardware for frontier intelligence. We co-design chips, racks, software, and manufacturing to deliver best-in-class throughput and latency across both prefill and deco [truncated for fixture]"
+  },
+  {
+   "id": "1c03c13b-6f2e-44e7-b5bd-b7628412f8b9",
+   "title": "Infrastructure Software Engineer",
+   "department": "Software",
+   "team": "Software",
+   "employmentType": "FullTime",
+   "location": "San Jose",
+   "shouldDisplayCompensationOnJobPostings": true,
+   "secondaryLocations": [],
+   "publishedAt": "2026-01-20T04:05:35.637+00:00",
+   "isListed": true,
+   "isRemote": false,
+   "workplaceType": "OnSite",
+   "address": {
+    "postalAddress": {
+     "addressRegion": "CA",
+     "addressCountry": "United States",
+     "addressLocality": "San Jose"
+    }
+   },
+   "jobUrl": "https://jobs.ashbyhq.com/Etched/1c03c13b-6f2e-44e7-b5bd-b7628412f8b9",
+   "applyUrl": "https://jobs.ashbyhq.com/Etched/1c03c13b-6f2e-44e7-b5bd-b7628412f8b9/application",
+   "compensation": {
+    "compensationTierSummary": "$150K \u2013 $250K \u2022 Plus Significant Equity",
+    "scrapeableCompensationSalarySummary": "$150K - $250K",
+    "compensationTiers": [
+     {
+      "id": "89a17722-72e0-4b7d-99e3-f1302aa2c9f7",
+      "tierSummary": "$150K \u2013 $250K \u2022 Plus Significant Equity",
+      "title": null,
+      "additionalInformation": "Plus Significant Equity",
+      "components": [
+       {
+        "id": "e6608ab7-30e2-4540-8a55-c3d017b0aedf",
+        "summary": "$150K \u2013 $250K",
+        "compensationType": "Salary",
+        "interval": "1 YEAR",
+        "currencyCode": "USD",
+        "minValue": 150000,
+        "maxValue": 250000
+       }
+      ]
+     }
+    ],
+    "summaryComponents": [
+     {
+      "compensationType": "Salary",
+      "interval": "1 YEAR",
+      "currencyCode": "USD",
+      "minValue": 150000,
+      "maxValue": 250000
+     }
+    ]
+   },
+   "descriptionPlain": "About Etched\n\nEtched is building hardware for frontier intelligence. We co-design chips, racks, software, and manufacturing to deliver best-in-class throughput and latency across both prefill and deco [truncated for fixture]"
+  }
+ ]
+}

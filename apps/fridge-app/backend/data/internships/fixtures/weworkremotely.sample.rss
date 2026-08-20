@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss">
+  <channel>
+    <title>We Work Remotely: Remote jobs in design, programming, marketing and more</title>
+    <link>https://weworkremotely.com/categories/remote-programming-jobs.rss</link>
+    <description>We Work Remotely: Remote jobs in design, programming, marketing and more</description>
+    <language>en-US</language>
+    <ttl>60</ttl>
+  <item>
+      <title>Twilio: Machine Learning Engineer</title>
+      <region>Anywhere in the World</region>
+      <category>Full-Stack Programming</category>
+      <description>[description truncated for fixture]</description>
+      <pubDate>Wed, 22 Jul 2026 07:03:46 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/twilio-machine-learning-engineer</guid>
+      <link>https://weworkremotely.com/remote-jobs/twilio-machine-learning-engineer</link>
+    </item>
+  <item>
+      <title>Coinbase: Head of Finance, Canada</title>
+      <region>Anywhere in the World</region>
+      <category>Full-Stack Programming</category>
+      <description>[description truncated for fixture]</description>
+      <pubDate>Wed, 22 Jul 2026 07:03:14 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/coinbase-head-of-finance-canada</guid>
+      <link>https://weworkremotely.com/remote-jobs/coinbase-head-of-finance-canada</link>
+    </item>
+  <item>
+      <title>Stripe: Head of Self-Serve Paid Media</title>
+      <region>Anywhere in the World</region>
+      <category>Full-Stack Programming</category>
+      <description>[description truncated for fixture]</description>
+      <pubDate>Wed, 22 Jul 2026 07:03:14 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/stripe-head-of-self-serve-paid-media</guid>
+      <link>https://weworkremotely.com/remote-jobs/stripe-head-of-self-serve-paid-media</link>
+    </item>
+  <item>
+      <title>Stripe: GTM Operations Process Architect</title>
+      <region>Anywhere in the World</region>
+      <category>Full-Stack Programming</category>
+      <description>[description truncated for fixture]</description>
+      <pubDate>Wed, 22 Jul 2026 07:02:54 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/stripe-gtm-operations-process-architect</guid>
+      <link>https://weworkremotely.com/remote-jobs/stripe-gtm-operations-process-architect</link>
+    </item>
+  <item>
+      <title>Stripe: Fullstack Engineer, Privy</title>
+      <region>Anywhere in the World</region>
+      <category>Full-Stack Programming</category>
+      <description>[description truncated for fixture]</description>
+      <pubDate>Wed, 22 Jul 2026 07:02:37 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/stripe-fullstack-engineer-privy</guid>
+      <link>https://weworkremotely.com/remote-jobs/stripe-fullstack-engineer-privy</link>
+    </item>
+  </channel>
+</rss>

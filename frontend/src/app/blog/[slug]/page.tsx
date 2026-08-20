@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchPostBySlug, type BlogPost } from "@/lib/blogApi";
+import { MarkdownBody } from "../MarkdownBody";
 
 export default function BlogPostPage({
   params,
@@ -52,7 +53,9 @@ export default function BlogPostPage({
             {new Date(post.created_at).toLocaleDateString()}
             {!post.published && " · Draft"}
           </p>
-          <div className="mt-6 whitespace-pre-wrap text-sm leading-relaxed">{post.body}</div>
+          <div className="mt-6">
+            <MarkdownBody>{post.body}</MarkdownBody>
+          </div>
         </article>
       )}
     </div>

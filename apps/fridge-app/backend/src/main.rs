@@ -1,7 +1,9 @@
 mod auth;
+mod blog_files;
 mod db;
 mod expiration;
 mod foodkeeper;
+mod internships;
 mod models;
 mod nlp;
 mod purchase_history;
@@ -32,6 +34,22 @@ async fn main() -> anyhow::Result<()> {
         Err(err) => eprintln!("could not purge expired sessions: {err:?}"),
     }
 
+    // Reconcile the blog with the markdown files in content/blog/. Deliberately not fatal:
+    // the blog falling back to database-only posts shouldn't stop the fridge app from serving.
+    match blog_files::sync(&pool).await {
+        Ok(report) if report == blog_files::SyncReport::default() => {}
+        Ok(report) => println!(
+            "blog sync: {} created, {} updated, {} deleted, {} skipped",
+            report.created, report.updated, report.deleted, report.skipped
+        ),
+        Err(err) => eprintln!("blog sync failed, serving database posts only: {err:?}"),
+    }
+
+    // Then keep watching, so dropping a .md file in doesn't need a restart or a button press.
+    // Spawned after the startup sync above, which is what its first fingerprint is taken
+    // against — otherwise it would immediately re-sync what startup just ingested.
+    blog_files::spawn_watcher(pool.clone());
+
     // Load the FoodKeeper and MealDB catalogs
     let catalog = Arc::new(foodkeeper::Catalog::load()?);
     println!("loaded {} FoodKeeper names", catalog.entries().len());
@@ -57,8 +75,14 @@ async fn main() -> anyhow::Result<()> {
         google_oauth,
     });
 
-    // Sets up a socket listening connection address
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    // Sets up a socket listening connection address. The port is configurable so a second
+    // instance (a throwaway database for verification, say) can run alongside the usual one
+    // without either having to be stopped; the default is what everything else assumes.
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("fridge_backend listening on http://{addr}");
 
     // Awaits a connection from the frontend

@@ -38,7 +38,7 @@ export default function RootLayout({
         <header className="border-b border-black/10 dark:border-white/10">
           <nav className="mx-auto max-w-4xl flex items-center gap-6 px-4 py-3">
             <Link href="/" className="font-semibold">
-              home
+              Home
             </Link>
             {tabs.map((tab) => (
               <Link key={tab.href} href={tab.href} className="text-sm opacity-80 hover:opacity-100">

@@ -1,0 +1,259 @@
+{
+ "jobs": [
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/anthropic/jobs/5358120008",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 4517587008,
+   "location": {
+    "name": "Remote-Friendly (Travel Required) | San Francisco, CA"
+   },
+   "metadata": [
+    {
+     "id": 4036944008,
+     "name": "Location Type",
+     "value": "On-Site",
+     "value_type": "single_select"
+    }
+   ],
+   "id": 5358120008,
+   "updated_at": "2026-08-07T17:23:01-04:00",
+   "requisition_id": "P-5171",
+   "title": "Director, US International Tax",
+   "pay_input_ranges": [
+    {
+     "min_cents": 23000000,
+     "max_cents": 30000000,
+     "currency_type": "USD",
+     "title": "Annual Salary:",
+     "blurb": "<p>The annual compensation range for this role is listed below.&nbsp;</p>\n<p>For sales roles, the range provided is the  [truncated for fixture]"
+    }
+   ],
+   "company_name": "Anthropic",
+   "first_published": "2026-08-07T17:19:10-04:00",
+   "language": "en",
+   "application_deadline": null
+  },
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/anthropic/jobs/5358100008",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 4517577008,
+   "location": {
+    "name": "Dublin, IE"
+   },
+   "metadata": [
+    {
+     "id": 4036944008,
+     "name": "Location Type",
+     "value": "On-Site",
+     "value_type": "single_select"
+    }
+   ],
+   "id": 5358100008,
+   "updated_at": "2026-08-03T18:25:22-04:00",
+   "requisition_id": "P-5161",
+   "title": "Head of Deal Desk - International",
+   "pay_input_ranges": [
+    {
+     "min_cents": 29500000,
+     "max_cents": 29500000,
+     "currency_type": "EUR",
+     "title": "Annual Salary:",
+     "blurb": "<p>The annual compensation range for this role is listed below.&nbsp;</p>\n<p>For sales roles, the range provided is the  [truncated for fixture]"
+    }
+   ],
+   "company_name": "Anthropic",
+   "first_published": "2026-07-24T09:58:11-04:00",
+   "language": "en",
+   "application_deadline": null
+  },
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/anthropic/jobs/5369755008",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 4517577008,
+   "location": {
+    "name": "London, UK"
+   },
+   "metadata": [
+    {
+     "id": 4036944008,
+     "name": "Location Type",
+     "value": "On-Site",
+     "value_type": "single_select"
+    }
+   ],
+   "id": 5369755008,
+   "updated_at": "2026-08-03T18:25:22-04:00",
+   "requisition_id": "P-5161",
+   "title": "Head of Deal Desk - International",
+   "pay_input_ranges": [
+    {
+     "min_cents": 28500000,
+     "max_cents": 28500000,
+     "currency_type": "GBP",
+     "title": "Annual Salary:",
+     "blurb": "<p>The annual compensation range for this role is listed below.&nbsp;</p>\n<p>For sales roles, the range provided is the  [truncated for fixture]"
+    }
+   ],
+   "company_name": "Anthropic",
+   "first_published": "2026-07-24T09:59:26-04:00",
+   "language": "en",
+   "application_deadline": null
+  },
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/anthropic/jobs/5197551008",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 4463868008,
+   "location": {
+    "name": "Dublin, IE"
+   },
+   "metadata": [
+    {
+     "id": 4036944008,
+     "name": "Location Type",
+     "value": "On-Site",
+     "value_type": "single_select"
+    }
+   ],
+   "id": 5197551008,
+   "updated_at": "2026-08-03T18:25:22-04:00",
+   "requisition_id": "262015",
+   "title": "Head of International Order-to-Cash",
+   "pay_input_ranges": [
+    {
+     "min_cents": 22000000,
+     "max_cents": 22000000,
+     "currency_type": "EUR",
+     "title": "Annual Salary:",
+     "blurb": "<p>The annual compensation range for this role is listed below.&nbsp;</p>\n<p>For sales roles, the range provided is the  [truncated for fixture]"
+    }
+   ],
+   "company_name": "Anthropic",
+   "first_published": "2026-06-10T11:09:15-04:00",
+   "language": "en",
+   "application_deadline": null
+  },
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/airtable/jobs/8403127002",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 6354778002,
+   "location": {
+    "name": "Remote - US"
+   },
+   "metadata": null,
+   "id": 8403127002,
+   "updated_at": "2026-03-27T15:33:08-04:00",
+   "requisition_id": "Pipeline",
+   "title": "Account Executive, Strategic Accounts",
+   "pay_input_ranges": [
+    {
+     "min_cents": 27200000,
+     "max_cents": 35400000,
+     "currency_type": "USD",
+     "title": "For work locations in the San Francisco Bay Area, Seattle, Los Angeles, and New York, the on-target earnings range for t",
+     "blurb": "<p>Compensation awarded to successful candidates will vary based on their work location, relevant skills, and experience [truncated for fixture]"
+    },
+    {
+     "min_cents": 24500000,
+     "max_cents": 31800000,
+     "currency_type": "USD",
+     "title": "For all other work locations (including remote), the on-target earnings range for this role is:",
+     "blurb": ""
+    }
+   ],
+   "company_name": "Airtable",
+   "first_published": "2026-02-28T09:04:24-05:00",
+   "language": "en",
+   "application_deadline": null
+  },
+  {
+   "absolute_url": "https://job-boards.greenhouse.io/airtable/jobs/8654173002",
+   "data_compliance": [
+    {
+     "type": "gdpr",
+     "requires_consent": false,
+     "requires_processing_consent": false,
+     "requires_retention_consent": false,
+     "retention_period": null,
+     "demographic_data_consent_applies": false
+    }
+   ],
+   "internal_job_id": 6428105002,
+   "location": {
+    "name": "New York, NY; Remote - US"
+   },
+   "metadata": null,
+   "id": 8654173002,
+   "updated_at": "2026-08-01T04:17:01-04:00",
+   "requisition_id": "P-TEQ001180-20250501",
+   "title": "Delivery Consultant",
+   "pay_input_ranges": [
+    {
+     "min_cents": 14900000,
+     "max_cents": 19360000,
+     "currency_type": "USD",
+     "title": "For work locations in the San Francisco Bay Area, Seattle, Los Angeles, and New York, the on-target earnings range for t",
+     "blurb": "<p>Compensation awarded to successful candidates will vary based on their work location, relevant skills, and experience [truncated for fixture]"
+    },
+    {
+     "min_cents": 13500000,
+     "max_cents": 17510000,
+     "currency_type": "USD",
+     "title": "For all other work locations (including remote), the on-target earnings range for this role is:",
+     "blurb": ""
+    }
+   ],
+   "company_name": "Airtable",
+   "first_published": "2026-07-28T15:59:04-04:00",
+   "language": "en",
+   "application_deadline": null
+  }
+ ],
+ "meta": {
+  "total": 6
+ }
+}
