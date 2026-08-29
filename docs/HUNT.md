@@ -1,0 +1,252 @@
+# Internship hunt tooling — reference
+
+Phase 8: a tool for running an internship hunt. Two tracks that share a backend and are
+otherwise independent — an inbox agent that reads a burner Gmail (Track A), and a Firefox
+extension that fills applications and raises desktop alerts (Track B).
+
+**Only 8e is built.** This is the **what and where** for what exists, plus a map of the seams
+it left for the rest. Design *rules* live in `apps/hunt-extension/CLAUDE.md` — read that before
+changing anything here, because most of what looks like a detail below is a rule from that
+file made concrete. Phase status is `docs/PLAN.md` § Phase 8.
+
+**None of this is Learning Mode.** The user decided on 2026-08-29 that all of Phase 8 is
+`[gen]`, including the email classifier and the email→application matcher, both of which are
+NLP-shaped and would otherwise fall under the flagged subsystems. That exception does not
+extend to the `[learn]` files themselves: `src/nlp.rs` and friends may be **called** and never
+edited.
+
+## Feature overview
+
+| Feature | State |
+|---|---|
+| `hunt_events` table, both producers designed in | ✅ migration `0014` |
+| `GET /hunt/events` — poll for undelivered alerts | ✅ `CurrentUser`-scoped |
+| `POST /hunt/events/{id}/ack` — delivery receipt | ✅ idempotent |
+| Posting producer — tier-1/2 company posts something new | ✅ `internships::alerts` |
+| Firefox MV3 extension: alarm poll, notifications, popup, options | ✅ `apps/hunt-extension/` |
+| Verified in Firefox itself | ⬜ **not yet** — see "What is not proven" below |
+| Email producer — OA / interview / offer mail | ⬜ 8d, writes to the same table |
+| Gmail OAuth, sync, classify, match, labels | ⬜ 8a–8c |
+| CV autofill on ATS pages | ⬜ 8f |
+| Answer library | ⬜ 8g |
+
+## The one structural idea
+
+**Two producers, one table, one poll endpoint, one notification path.**
+
+```
+  internships::collector ─── new posting from a tier-1/2 company ───┐
+                                                                    ├─► hunt_events
+  inbox::classify (8d) ───── mail that means OA/interview/offer ────┘        │
+                                                                             ▼
+                                              GET /hunt/events ──► extension background poll
+                                                                     └─► browser.notifications
+```
+
+8d adds a producer, not a pipeline. If a future alert kind needs its own table, its own poll,
+or its own notification code, something has gone wrong with this shape.
+
+## Data model
+
+**`hunt_events`** (migration `0014_create_hunt_events.sql`):
+
+| Column | Notes |
+|---|---|
+| `id` | UUID text, like every other table here |
+| `kind` | `'posting'` \| `'email'`. The extension filters alert kinds on it, so "should cold outreach interrupt me" stays a client-side predicate rather than a schema change |
+| `user_id` | **NULL = from the shared posting corpus, visible to every signed-in user. NOT NULL = private to that user.** The email producer must always set it; a leak would require it to write NULL, which is a visible bug at the write site rather than a forgotten predicate at the read site |
+| `subject_id` | What the event is about, and the idempotency key: a posting id, or a Gmail message id in 8d. Polymorphic, so no `REFERENCES` clause is possible |
+| `title`, `body` | **Rendered, not structured.** One notification path serves both producers; each producer decides how its own event reads |
+| `url` | Where clicking goes. Nullable |
+| `payload_json` | The facts behind those two lines — company, tier, term, source — for the popup |
+| `created_at` | |
+| `acked_at` | **A delivery receipt, not a user dismissal.** Set once a client has raised a notification. NULL means undelivered, which is what the background poll asks for |
+| `UNIQUE (kind, subject_id)` | One alert per subject, made structural. Re-running collection cannot write a second event even if the producer's newness check later changes |
+
+Two indexes: a partial one on `created_at WHERE acked_at IS NULL` for the poll, and a plain one
+on `created_at` for the popup's recent-alerts list.
+
+**Ack is global for a NULL-user event.** A second registered user acking a posting alert acks
+it for everyone. Accepted deliberately for a single-user tool; per-user ack state would be a
+`hunt_event_acks (event_id, user_id)` join table, and the time to add it is when a second
+person actually uses this.
+
+## Backend
+
+### `src/hunt/events.rs` *(new — `[gen]`)*
+
+Producer-agnostic. Knows how an event is stored, who may see it, and what "already delivered"
+means — never what is worth alerting about.
+
+| Item | What it does |
+|---|---|
+| `EventKind` | `Posting` \| `Email`, `sqlx::Type` + serde, lowercase. `as_str` matches the migration's CHECK |
+| `NewHuntEvent` | What a producer builds: kind, optional `user_id`, `subject_id`, rendered title/body/url, `payload` |
+| `HuntEvent` | What the API returns. `HuntEventRow` is the row; the `From` impl parses `payload_json` and falls back to `Value::Null` — an unreadable payload costs the popup some detail, never the alert |
+| `VISIBLE_TO_VIEWER` | `(user_id IS NULL OR user_id = ?)`, written once and used by every read so the two halves cannot drift |
+| `emit` | `INSERT … ON CONFLICT (kind, subject_id) DO NOTHING`. Returns whether a row was written; `false` is normal, not an error |
+| `EventQuery` | `viewer`, optional `since`, `include_acked`, `limit` |
+| `list` | Visible events, newest first |
+| `unacked_total` | Every undelivered event, not just the ones under `limit`. Without it a truncated page is indistinguishable from a complete one |
+| `ack` | Idempotent, first receipt wins. Returns `Acked` / `AlreadyAcked` / `NotFound` — "not yours" and "doesn't exist" are deliberately one outcome |
+
+### `src/internships/alerts.rs` *(new — `[gen]`)*
+
+The whole predicate: **curated tier 1 or 2, and nothing else.**
+
+| Item | What it does |
+|---|---|
+| `ALERT_TIERS` | `[1, 2]`. Named so "which tiers alert" is one line to read |
+| `posting_event` | `Option<NewHuntEvent>` for a newly collected posting. Judges the company, not the novelty — the caller decides what is new |
+| `MAX_BODY_CHARS` | 140. A notification shows about two lines and truncates the rest silently; cutting here makes the cut visible and lands it after the role |
+| `notification_body` | Role, then term, then location — **absent facts omitted, never filled in** |
+| `summarize_locations` | `Palo Alto, CA +29 more`. See the verification section for why this exists |
+| `truncate` | Cuts on a character boundary (`chars`, not bytes) and appends `…` |
+
+### `src/routes/hunt.rs` *(new — `[gen]`)*
+
+```
+GET  /hunt/events?since=&include_acked=&limit=    CurrentUser
+     -> { "events": [ … ], "unacked_total": n }
+POST /hunt/events/{id}/ack                        CurrentUser -> 204
+```
+
+| Item | What it does |
+|---|---|
+| `list_events` | Default limit 50, clamped at 200 — an oversized `limit` is a client bug, not a reason to fail. A malformed `since` is a **400**, not silently ignored |
+| `ack_event` | `204` for both `Acked` and `AlreadyAcked`; `404` for unknown or invisible. A retry the extension isn't sure landed must not look like a failure, or it gives up and re-notifies instead |
+
+**The background poller does not send `since`.** A watermark held by the client is exactly the
+state an MV3 background page loses, and an event that arrived while Firefox was closed would
+sit behind a watermark that had already moved past it. `acked_at` is the record; `since` exists
+for the popup.
+
+### `src/internships/collector.rs` *(changed)*
+
+| Change | Why |
+|---|---|
+| `Upserted { id, created }` replaces `Result<bool>` from `upsert_posting` | The producer needs a stable key, and the function had already looked the id up |
+| `emit_posting_alert` | Called only where a posting is genuinely new. **A failed alert never fails the posting** — it is logged, not recorded as a reject, because a reject means the row did not land and this one did |
+| `CompanyTiers::load()` hoisted into `collect_with` | It reads a file. Shared with `recompute_company_signals`, which used to load it separately |
+| `CollectionReport.alerts_created` | Surfaces in `POST /internships/collect`, so the checkpoint is checkable from the response instead of by hand in `sqlite3` |
+
+Also changed: `src/main.rs` (`mod hunt`), `src/routes/mod.rs` (two routes),
+`src/routes/internships.rs` (`CollectionSummary.alerts_created`).
+
+## The extension — `apps/hunt-extension/`
+
+Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
+
+| File | Notes |
+|---|---|
+| `manifest.json` | `background.scripts`, **not** `service_worker` — Firefox MV3. `browser_specific_settings.gecko.id` is `hunt@personal-website` and is **required**, or stored settings do not survive a sideload. Permissions are exactly `alarms`, `notifications`, `storage`, plus host permission for `localhost:8080` and `127.0.0.1:8080` |
+| `background.js` | The event page. See below |
+| `popup/` | Recent alerts, last check, "Check now" |
+| `options/` | Backend URL, site URL, poll interval, notification budget, alert kinds, **Test connection** |
+| `icons/icon.svg` | Firefox accepts SVG for extension icons. Notifications carry no `iconUrl` and fall back to this |
+| `README.md` | How to sideload |
+
+### `background.js`
+
+| Function | What it does |
+|---|---|
+| `poll` | Fetches, filters by enabled kinds, raises, records status. **Never throws** — the callers are an alarm and a button |
+| `raise` | Notifies up to `maxNotificationsPerPoll` (default 3) individually, one summary for the rest, then acks everything shown |
+| `notify` | The **notification id is the event id**, so a re-notify after a failed ack replaces rather than stacks |
+| `ack` | Failure leaves the event unacked on purpose: it is offered again next poll |
+| `setStatus` | Records one of `ok` / `unreachable` / `unauthenticated` / `error` |
+| `cacheForPopup` | Last 50 events, so the popup is never blank and a notification click can still resolve its URL after the page has been killed |
+| `bumpUnseen` / `paintBadge` | Badge counts alerts raised since the popup was last opened; `!` in red for any non-`ok` status |
+| `ensureAlarm` | Creates the alarm **only if absent or at the wrong period**. `alarms.create` on an existing name resets the countdown, so calling it on every wake would push the next poll further out each time and polling would quietly stop |
+
+Every listener is registered synchronously at the top level, or the event meant to wake the
+page arrives before anything is listening.
+
+**Notify, then ack — in that order.** At-least-once, deliberately. A failed ack costs a
+duplicate notification; acking first would cost a silently dropped alert.
+
+## Auth: the site's own session cookie
+
+`host_permissions` for the backend origin plus `fetch(..., { credentials: "include" })` puts the
+ordinary `fridge_session` cookie on the request. Signed in on the site means signed in in the
+extension. **There is no extension token and no second auth path.**
+
+The risk, and the reason the options page has a **Test connection** button: that cookie is
+`SameSite=Lax`, and a request from a `moz-extension://` page to the backend is cross-site.
+Host permissions definitely exempt the request from CORS; whether Firefox also attaches a Lax
+cookie is the open question. The three failure modes all present as "no notifications" and have
+completely different fixes, so they are stored as distinct states and named explicitly:
+
+| Symptom | Fix |
+|---|---|
+| origin not in `host_permissions` | add it to `manifest.json`, reload the extension |
+| backend unreachable | start it |
+| reachable, 401 | sign in on the site — **or this is the SameSite problem** |
+
+## Three rules worth not rediscovering
+
+1. **Dedup is the server's job.** An MV3 background page is killed and restarted at the
+   browser's convenience, so anything it remembers is gone and every alert re-fires.
+   `browser.storage.local` is a cache, never the record.
+2. **`None` prestige is not tier 3.** An unlisted company scores `None`, meaning *unknown*.
+   The curated file names 44 companies of ~455 in the corpus, so alerting on `None` alerts on
+   essentially everything, and a channel that fires on everything gets muted — taking the
+   tier-1 alerts with it.
+3. **The alert predicate reads the tier file, not `company_signals.prestige`.** The derived
+   band exists to *rank* companies we know little about, which is a different question from
+   whether to wake someone up. And that table is recomputed after every source finishes, so at
+   the moment a posting is inserted it holds no score for a company first seen in that run.
+
+## Verification performed (2026-08-29)
+
+22 tests added: 9 in `hunt::events`, 9 in `internships::alerts`, 4 in
+`collector::integration_tests`. Clippy produced no new warnings.
+
+Verified against a **real Simplify run over a copy of the live database**, not fixtures:
+
+- **A new tier-1/2 posting writes exactly one row.** 2,247 rows fetched, 206 postings created,
+  **22 alerts — every one a tier-1 or tier-2 company.** Tier-3 controls (Intel) were deleted and
+  re-collected and produced nothing. ✅
+- **Re-running collection does not write a second event.** A second run updated 1,097 postings
+  and reported `alerts_created: 0`. ✅
+- **The endpoints behave.** `204` first ack, `204` repeat, `404` unknown id, `401` signed out,
+  `400` on a malformed `since`; `unacked_total` fell 22 → 21 and the acked event left the poll
+  while staying in the popup's view. ✅
+- **The extension's logic, driven against the live backend** with a stubbed WebExtension API:
+  10 waiting events produced 3 notifications plus one "+7 more", all 10 acked, and an immediate
+  second poll raised nothing. All three failure modes came out distinct and badged. ✅
+
+### What the real run caught that the tests could not
+
+The same pattern `apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
+
+**Simplify packs every city a posting is open in into one location string.** A single Google
+posting produced a **429-character** notification body with the role pushed off the end — and
+this is the normal shape of a big-company listing, not an outlier, because `dedup` deliberately
+keeps location out of the merge key so per-location rows merge into one posting. Locations now
+collapse to `first +N more` and the body is capped at 140 characters. Pinned by a test using
+the real 30-city string.
+
+### What is not proven
+
+**The extension has not been loaded in Firefox.** Alarms firing, notifications rendering, and
+above all **whether `SameSite=Lax` lets the session cookie through from a `moz-extension://`
+page** are all unverified. That last one is load-bearing for 8f and 8g too, which authenticate
+the same way. If it fails, the fallback recorded in `apps/hunt-extension/CLAUDE.md` is a
+dedicated extension token — a decision for the user, not a workaround to reach for.
+
+The "restart Firefox after acking and the alert does not come back" half of the checkpoint is
+therefore verified server-side only: a second poll after acking returns nothing, and a later
+collection run neither clears the ack nor writes a second event.
+
+## Seams left for the rest of Phase 8
+
+- **8d writes to `hunt_events`, it does not alter it.** `kind = 'email'`, `user_id` set,
+  `subject_id` = the Gmail message id. Nothing about the poll, the ack, or the extension's
+  notification path should need to change.
+- **The `email` alert kind already has a checkbox** in the options page and a filter in
+  `poll()`. It has no producer.
+- **The inbox tables are migration `0015`**, and Track B's `cv_profile` is `0016`.
+  `hunt_events` took `0014` because 8e needed it first.
+- **The extension shows no internship list**, only alerts and a link out. Whether it should is
+  an open question in `apps/hunt-extension/CLAUDE.md`.

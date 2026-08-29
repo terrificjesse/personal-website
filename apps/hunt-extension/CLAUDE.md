@@ -511,8 +511,12 @@ order to build in.
       cold outreach is high-volume and low-precision, and a noisy channel gets muted wholesale,
       taking the OA alerts with it. It's a one-line predicate to flip if the folder turns out
       to be worth interrupting for; make it an extension option rather than a default.
-- [ ] Should Phase 8 be appended to `docs/PLAN.md` as a proper phase, and a `docs/HUNT.md`
-      reference written alongside `BLOG.md` / `INTERNSHIPS.md`?
+- [x] ~~Should Phase 8 be appended to `docs/PLAN.md` as a proper phase, and a `docs/HUNT.md`
+      reference written alongside `BLOG.md` / `INTERNSHIPS.md`?~~ **Done 2026-08-29**, after
+      8e shipped. `docs/PLAN.md` § Phase 8 carries the build order, the traps and the 8e
+      checkpoint; `docs/HUNT.md` is the file-and-function reference. Note that
+      `docs/INTERNSHIPS.md` turns out never to have been written, despite the root
+      `CLAUDE.md` and Phase 7 both pointing at it.
 - [ ] Confidence threshold for auto-apply. Guessing is worse than measuring — set it after 8b
       gives real numbers on the labelled set.
 - [ ] Does the extension need the internship *list*, or only alerts? Right now: only alerts.

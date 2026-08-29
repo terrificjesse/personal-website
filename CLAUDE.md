@@ -20,15 +20,20 @@ personal-website/
       ...other tabs later, not in scope yet
   apps/
     fridge-app/
-      backend/               # Rust API service. Serves the fridge app, the blog, *and* internships.
+      backend/               # Rust API service. Serves the fridge app, the blog, internships,
+                             #   *and* the hunt alert channel (src/hunt/, Phase 8).
       CLAUDE.md               # fridge-app-specific notes (data model, endpoints, phase status)
+    hunt-extension/          # Firefox MV3 extension (Phase 8) — desktop alerts, later autofill
+      CLAUDE.md               # governs Phase 8 wherever its code lives, backend half included
   content/
     blog/                    # Markdown posts, synced into the DB (Phase 6)
   docs/
     PLAN.md                  # Phased implementation plan — read this for current phase status
     BLOG.md                  # Blog + admin-permissions reference (every file and function)
     INTERNSHIPS.md            # Internship tab reference (sources, schema, ranking, expiry)
+                             #   NOT WRITTEN YET — referenced here and by Phase 7, never created
     INTERNSHIP_SCRAPING.md    # Per-source data-acquisition research — read before touching a scraper
+    HUNT.md                  # Phase 8 reference (hunt_events, the alert path, the extension)
     TODO.md                  # Deferred ideas
 ```
 

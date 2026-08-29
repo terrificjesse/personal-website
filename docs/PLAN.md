@@ -609,6 +609,157 @@ had been wrongly merged into each other.
 
 ---
 
+## Phase 8 — Internship-hunt tooling (inbox agent + Firefox extension)
+
+**Not a Learning Mode phase, and that includes the email classifier and the email→application
+matcher.** The user decided this explicitly on 2026-08-29: *"This is meant to be a tool for me
+that I want quickly, so I don't want to be writing any of it."* Classification is NLP-shaped
+and matching is fuzzy-matching-shaped, and both are `[gen]` here. This is the second such
+exception after Phase 7's ranking — do not re-litigate either, and **do not stop at a stub
+boundary and hand back a signature.**
+
+The exception does not reach the `[learn]` files themselves. `src/nlp.rs` and its neighbours
+may be **called** and never edited — including to fix a compile error they throw. If Phase 8
+needs one of them to change, say so and stop.
+
+**Full rules are `apps/hunt-extension/CLAUDE.md`** — read it before touching any of this; it
+governs Phase 8 wherever the code lives. The reference for what exists is `docs/HUNT.md`.
+
+### Where it lives
+
+The extension is `apps/hunt-extension/`. The backend half is `apps/fridge-app/backend/` —
+`src/hunt/` for the alert channel, `src/inbox/` for the Gmail agent when it lands — for the
+same reason the blog and internship tabs are there: auth and `users` are there. That makes it
+the *fourth* tab in a folder named after the first one. The root `CLAUDE.md` already calls that
+name a lie; **extracting it is its own deliberate change and must not be bundled into Phase 8.**
+
+### Two tracks, and B does not depend on A
+
+| Track | What | Needs |
+|---|---|---|
+| **A — inbox agent** | Read a burner Gmail, match mail to applications, propose status transitions, project them onto Gmail labels | OAuth, a Google Cloud project, an Anthropic key |
+| **B — filling applications** | Autofill CV details into ATS forms, plus an answer library for questions already answered well | Nothing |
+
+**8e + 8f is the shortest path to something useful every day.** Track B needs no OAuth and no
+API key at all.
+
+### The one structural idea
+
+**The four email categories already exist in the database.** Phase 7 shipped
+`internship_applications.status` — `applied → oa → interview → offer → rejected` — which is
+exactly "confirmation folder / OA folder / interview folder". So the classifier's job is **not**
+"sort this email into a folder"; it is *match this email to an application row, and propose a
+status transition.* Gmail labels are written afterwards as a **projection** of application
+status. Build it the other way round and you get two taxonomies that drift, and a tracker still
+reading `applied` for a job you already interviewed at.
+
+### Build order — classification earns write access, it does not start with it
+
+- [gen] **8a — Read-only pipeline.** OAuth, token storage, incremental sync on `historyId`,
+  `inbox_runs`. Classifier stub returns `Other`. *Checkpoint:* messages sync, the run shows in
+  status, **no writes anywhere.**
+- [gen] **8b — Classify + match, still no writes.** Rules first, Claude API on ambiguity.
+  Verdicts stored. *Checkpoint:* against a hand-labelled set of **real burner-inbox mail across
+  a whole two-week window**, not 50 curated job emails — a curated set contains no newsletters,
+  so it cannot measure the relevance gate, which is the highest-volume decision in the system.
+  Measure junk leaking into `Hunt/Outreach` and **real mail getting disregarded** separately;
+  the second is the one that costs an interview.
+- [gen] **8c — Writes.** Gmail labels + `status_proposals`. *Checkpoint:* a late-arriving
+  autoresponder does not drag an interview back to `applied`.
+- [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
+  table, which 8e built.
+- [gen] **8e — The extension shell, end to end. — complete 2026-08-29**
+- [gen] **8f — Autofill.** Content script, label-based field mapper, `cv_profile`, and the
+  "track this application" offer that creates the tracker row from a page you actually applied
+  on. *Checkpoint:* fill a real Greenhouse, Lever and Ashby form **without submitting any of
+  them**; React-controlled inputs keep their values after a re-render; nothing fires on page
+  load and no EEO field is touched.
+- [gen] **8g — The answer library.** Save answers, similarity retrieval, company-specific
+  flagging. *Checkpoint:* a "why do you want to work here" answer stored against one company is
+  **not** offered for another, and a genuinely reusable one ("a project you're proud of") is.
+
+### The traps, in one place
+
+Each is a real failure mode, not a style preference. `apps/hunt-extension/CLAUDE.md` carries all
+twelve with their reasoning; these are the ones that shape the schema.
+
+1. **Email is untrusted content, and the classifier sits upstream of Gmail write access.**
+   `classify` is a pure function that gets no tools and returns a constrained enum — never an
+   action, a label name, or SQL. Every write happens in Rust, outside the model call. Never
+   fetch a URL found in an email.
+2. **A misclassification must never silently rewrite the tracker.** Every email-driven change
+   writes a `status_proposals` row linking back to the message. Auto-apply only above the
+   confidence threshold and only forwards; **never auto-apply `offer` or `rejected`.**
+3. **Status advances; it does not follow the newest email.** Email order is not event order.
+4. **"Disregarded" means unlabelled, not unrecorded.** This is `posting_rejects` one subsystem
+   over: a dropped email that leaves no trace makes "correctly ignored 400 newsletters" and
+   "ate an OA" produce identical output. Pin
+   `classified = pressing + confirmation + outreach + disregarded` with a test.
+5. **Category is decided before the match, and a pressing email is never disregarded.** The
+   matcher is fuzzy and will miss; if unmatched routed to disregard, one miss silently eats an
+   interview invite. An OA email matching no application is still labelled and still alerted.
+6. **Autofill never fires on its own and never submits.** Explicit user action only; hard
+   blocklist on password/payment/SSN fields checked *before* the fuzzy mapper; EEO questions
+   opt-in and default off. **Do not ship `<all_urls>`.**
+
+### 8e — complete 2026-08-29
+
+**The vertical slice that ends in a desktop notification**, and it needed no Gmail and no API
+key: `hunt_events`, the poll and ack endpoints, the posting producer, and the extension shell.
+It proves the whole alert path before the inbox agent exists. Full reference: `docs/HUNT.md`.
+
+Two producers were designed in from the start (`kind` is `posting | email`) so 8d adds a
+producer rather than a pipeline.
+
+Verified against a **real Simplify run over a copy of the live database**, not fixtures:
+
+- **A new tier-1/2 posting writes exactly one row.** 2,247 fetched, 206 postings created,
+  **22 alerts, every one a tier-1 or tier-2 company.** Tier-3 controls produced none. ✅
+- **Re-running collection writes no second event.** A second run updated 1,097 postings and
+  reported `alerts_created: 0`. Dedup is structural — `UNIQUE (kind, subject_id)` — not a
+  caller remembering to check. ✅
+- **The alert predicate is the existing `prestige::CompanyTiers::tier()`, tiers 1 and 2.** No
+  new ranking code. **`None` is not tier 3**: unlisted means *unknown*, the curated file names
+  44 of ~455 companies, and alerting on unknown would alert on nearly everything. ✅
+- **Endpoints:** `204` first ack, `204` repeat, `404` unknown, `401` signed out, `400` on a
+  malformed `since`. ✅
+- **The extension's logic against the live backend**, driven with a stubbed WebExtension API:
+  10 waiting events → 3 notifications plus one "+7 more", all 10 acked, immediate second poll
+  raised nothing. All three failure modes distinct and badged. ✅
+
+**Notification dedup is the server's job** (`hunt_events.acked_at`), because an MV3 background
+page is killed and restarted at the browser's convenience and anything it remembers is lost.
+`browser.storage.local` is a cache, never the record. `acked_at` is a **delivery receipt** — the
+extension acks what it showed — so the popup lists *recent* events rather than unacked ones.
+
+**What the real run caught that 22 green tests could not.** Simplify packs every city into one
+location string, so a single Google posting produced a **429-character** notification body with
+the role pushed off the end — the normal shape of a big-company listing, since `dedup`
+deliberately keeps location out of the merge key. Locations now collapse to `first +N more`,
+body capped at 140 characters, pinned by a test using the real 30-city string. Same pattern
+`apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
+
+**Not proven: the extension has never been loaded in Firefox.** Alarms firing, notifications
+rendering, and above all **whether `SameSite=Lax` lets `fridge_session` through from a
+`moz-extension://` page** are unverified. That last one is load-bearing for 8f and 8g, which
+authenticate the same way; the options page's **Test connection** button names it explicitly
+rather than letting it look like a dead backend. If it fails, the recorded fallback is a
+dedicated extension token — the user's decision, not a workaround to reach for.
+
+### Open questions
+
+- Should `Hunt/Outreach` raise a notification? **Currently no.** Cold outreach is high-volume
+  and low-precision, and a noisy channel gets muted wholesale, taking the OA alerts with it.
+  8e made this a one-line predicate plus an existing checkbox in the options page.
+- Confidence threshold for auto-apply — set it after 8b gives real numbers, not by guessing.
+- Does the extension need the internship *list*, or only alerts? 8e shipped alerts only.
+- How does an answer first get into the library? Cheapest: after a fill, offer to save what you
+  typed into the free-text boxes — also the version most likely to catch answers while good.
+- Does the answer library want embeddings, or is `strsim` over normalized question text enough?
+  Start with `strsim`; it is already a dependency and the corpus is tiny.
+
+---
+
 ## After Phase 5
 
 Not planned in detail yet: additional site tabs beyond the fridge app, deployment
