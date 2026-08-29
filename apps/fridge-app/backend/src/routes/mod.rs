@@ -130,6 +130,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
+        .route("/internships/collect", post(internships::collect_now))
         .route("/internships/runs", get(internships::run_health))
         .route(
             "/internships/runs/{source_run_id}/rejects",

@@ -22,6 +22,7 @@ export const metadata: Metadata = {
 const tabs = [
   { href: "/fridge", label: "Fridge" },
   { href: "/blog", label: "Blog" },
+  { href: "/internships", label: "Internships" },
 ];
 
 export default function RootLayout({

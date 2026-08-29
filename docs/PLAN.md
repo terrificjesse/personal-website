@@ -526,14 +526,86 @@ than working around it.
    from a run that actually succeeded**, or one blocked LinkedIn fetch silently expires
    everything it ever supplied. This is the single most likely data-loss bug in the phase.
 
-### Checkpoint
+### Checkpoint — met 2026-08-20, with one clause verified by test rather than live
 
-Run a collection with at least one source deliberately failing; confirm the others still land
-and the failure is visible in both the run record and the log. Confirm a posting present in two
-sources appears once. Confirm the ranking reorders sensibly when pay and deadline change, and
-that a posting with unknown pay is neither first nor last by accident. Mark one applied, let it
-expire, and confirm the application survives with its details intact. Confirm a failed run does
-**not** expire that source's postings.
+Verified against a **real collection run**, not fixtures: 2,746 rows fetched from Simplify,
+Greenhouse, Lever, Ashby and WeWorkRemotely in 22 seconds, capped at
+`INTERNSHIP_MAX_BOARDS_PER_RUN=6` so the run was a few dozen polite requests rather than the
+~2,084-board, half-hour sweep an uncapped run performs.
+
+- **The others still land when a source doesn't.** LinkedIn and Indeed recorded `skipped` with
+  their honest `robots.txt` reasons and **made zero requests**; three ATS sources recorded
+  `partial` on hitting the board cap; Simplify still returned 924 accepted postings. Every
+  outcome carried a reason into `source_runs` and the log. ✅
+- **A posting present in two sources appears once.** `AfterQuery — Software Engineering Intern`
+  arrived from both `simplify` and `ashby` and is one posting with two sightings. Beyond the
+  checkpoint, the key also merged **65 postings that one source had exploded per-location** —
+  RTX 14 listings, American Express 8, TikTok 7 — which is exactly the multi-location
+  double-counting § C warned about, and the reason location is not in the key. ✅
+- **Every fetched row is accounted for.** `fetched = accepted + filtered + rejected`:
+  2,746 = 926 + 1,820 + 0. The 1,820 filtered are non-SWE-internship rows, which is healthy
+  bulk; **0 rejected** means nothing that should have parsed didn't. ✅
+- **A posting with unknown pay is neither first nor last.** Only 2 of 808 postings state pay.
+  Under `sort=composite` they land at ranks **247 and 634 of 808** — mid-pack — while both
+  first place (0.615) and last place (0.386) are unknown-pay postings. Under `sort=pay` the two
+  stated figures lead and every unknown follows. ✅
+- **Pay parses to the right magnitude.** `USD 10000.00 per month` → `10000.00 USD/month`, not
+  an hourly rate; `USD 30.00 - 35.00 per hour` → `30–35 USD/hour`. Ashby's explicit interval
+  survived stringification and beat the magnitude heuristic, which is the whole point of the
+  `pay_raw` contract. ✅
+- **An applied posting survives expiry with its details intact.** Applied to a real posting,
+  then expired it, then deleted the row outright. The application kept company, title, URL,
+  pay, term and notes through all three states; `posting_is_live` went `true` → `false` →
+  `null`, and **`null` renders no badge at all** rather than claiming "Closed", which would be
+  a lie. ✅
+- **A failed run does not expire that source's postings.** ⚠️ **Verified by test, not live.**
+  No source hard-failed during the real run — they succeeded, hit the board cap (`partial`), or
+  skipped. The behaviour is pinned by
+  `collector::integration_tests::a_failed_source_does_not_expire_the_postings_it_previously_supplied`
+  (three consecutive failed runs leave `consecutive_misses` at 0 and the posting live), by its
+  non-vacuous counterpart `a_genuine_disappearance_from_successful_runs_does_expire`, and by
+  the run-health panel rendering `counts_for_expiry = false` against seeded failure data. A
+  live hard failure is worth catching opportunistically the first time a source really breaks.
+
+`cargo test`: **510 passed**, clippy clean, `tsc`/`eslint` clean.
+
+### What the real run caught that the test suite could not
+
+Both are dedup bugs, both invisible to 510 green tests, both found within minutes of real data —
+the pattern `apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
+
+1. **`job-boards.eu.greenhouse.io` is a third Greenhouse hostname**, not recorded in
+   `INTERNSHIP_SCRAPING.md`, which lists only `boards.` and `job-boards.`. Postings on the EU
+   host fell through to the fallback key.
+2. **`boards.greenhouse.io/embed/job_app?token=N`** puts the job id in the query string —
+   which every other URL shape treats as strippable tracking noise, so it was discarded.
+
+Both were **over-merging**, the dangerous direction: without an ATS key these collapsed into
+`company|title`, so two distinct jobs at one company sharing a title became one row. After the
+fix, ATS-triple coverage went **266/804 → 285/808**, and the four extra postings are jobs that
+had been wrongly merged into each other.
+
+### Known gaps, recorded rather than fixed
+
+- **ATS-triple coverage is ~35%, where § C predicted 73%.** The shortfall is entirely ATS
+  platforms `dedup::ats_identity` does not parse: **Workday** (`*.myworkdayjobs.com`,
+  `*.myworkdaysite.com` — listed in § C's own table and never implemented), plus
+  `apply.workable.com` and `ats.rippling.com`, which § C does not mention at all. Everything
+  else in the fallback is a company's own careers page (TikTok 82, Tesla 51, ByteDance 38,
+  Apple 7), which correctly has no ATS identity.
+- **Pay coverage in this run was 2 of 808 (0.2%)**, far below § B's "well under half". That is
+  an artefact of the board cap, not a defect: Simplify supplied 924 of 926 accepted postings
+  and carries no salary at all, while the ATS sources that do were capped at 6 boards each. An
+  uncapped run is the only way to measure this honestly.
+- **A capped run can never expire anything.** `INTERNSHIP_MAX_BOARDS_PER_RUN` makes a source
+  report `partial` by construction, and `partial` is not permitted to advance disappearance
+  counters. Convenient for development, wrong for steady state — an uncapped run is required
+  for expiry to function at all.
+- **Fuzzy company/title matching is still an unimplemented seam** (`dedup::FuzzyMatcher`), so
+  `KLA` / `KLA Corporation` remain two postings. Under-merging, which § C calls the safer
+  failure.
+- The frontend's filters are **not URL-synced**, so a filtered view cannot be bookmarked or
+  shared. The backend accepts every parameter; only the page ignores them.
 
 ---
 

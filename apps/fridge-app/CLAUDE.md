@@ -245,6 +245,16 @@ Deliberate choices worth not "fixing":
   those hosts differ the cookie isn't sent and the callback fails the state check. Keep
   `GOOGLE_REDIRECT_URI`, `FRONTEND_ORIGIN`, and the host you actually browse on identical.
   Register both variants in Google Cloud Console if you like; only `.env` has to be consistent.
+- **Never edit a migration that has already been applied.** sqlx stores a checksum of every
+  migration in `_sqlx_migrations` and refuses to start if the file no longer matches:
+  `migration 12 was previously applied but has been modified`. **A comment-only edit breaks it
+  just as thoroughly as a schema change** — this happened to `0012` on 2026-08-20, editing only
+  a comment block, and it took the backend (and so the whole site) down until the file was
+  restored byte-for-byte with `git checkout`. Once a migration has run *anywhere*, it is
+  immutable: corrections go in a new migration, or in a code comment. The failure surfaces as
+  "failed to fetch" in the browser, because the frontend's error is downstream of a backend
+  that never started.
+
 - **`BLOG_CONTENT_DIR`** overrides where the blog looks for `.md` files; the default is
   `content/blog` at the repo root, resolved off `CARGO_MANIFEST_DIR` rather than the working
   directory (the backend runs three levels below the root). A missing directory is logged and

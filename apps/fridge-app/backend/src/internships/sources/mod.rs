@@ -231,6 +231,13 @@ pub struct SourceContext {
     /// [`SourceOutcome::Skipped`] — a source that vanishes from the health panel looks like a
     /// source nobody noticed breaking.
     pub disabled_sources: Vec<String>,
+    /// Specific Handshake `/public/jobs/{id}` URLs to enrich this run.
+    ///
+    /// Handshake is **never swept** — see `best_effort`'s module doc — so it fetches exactly
+    /// what is listed here and nothing else. Empty is the normal case and yields
+    /// [`SourceOutcome::Skipped`]. A non-empty run yields `Partial`, never `Success`, because
+    /// fetching known URLs is not an enumeration of the source.
+    pub handshake_urls: Vec<String>,
 }
 
 impl SourceContext {
@@ -240,6 +247,7 @@ impl SourceContext {
             boards: BoardDirectory::vendored(),
             max_boards_per_run: usize::MAX,
             disabled_sources: Vec::new(),
+            handshake_urls: Vec::new(),
         }
     }
 
@@ -368,40 +376,75 @@ pub fn registry() -> Vec<Arc<dyn Source>> {
 /// Results come back in registry order regardless of which source finished first, so two
 /// identical runs produce identical output.
 pub async fn collect_all(sources: Vec<Arc<dyn Source>>, ctx: Arc<SourceContext>) -> Vec<SourceRunOutput> {
-    let mut handles = Vec::with_capacity(sources.len());
+    let mut receiver = collect_streaming(sources, ctx);
+    let mut indexed = Vec::new();
+    while let Some(item) = receiver.recv().await {
+        indexed.push(item);
+    }
+    // Restore registry order. Completion order is whatever the network decided, and two
+    // identical runs must produce identical output.
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, output)| output).collect()
+}
 
-    for source in sources {
+/// Like [`collect_all`], but hands each source's result over **the moment that source
+/// finishes** rather than after the slowest one does.
+///
+/// This is what the coordinator uses, and the reason is latency, not elegance. An uncapped run
+/// polls ~2,084 boards and takes on the order of half an hour; batching meant the database
+/// stayed empty for that entire time and then gained everything at once. Simplify alone
+/// answers in seconds and supplies most of the corpus, so streaming turns "nothing for thirty
+/// minutes" into "most of it almost immediately". It also means one slow or hanging source
+/// cannot delay every other source's data from landing.
+///
+/// The item is `(registry_index, output)` so [`collect_all`] can restore deterministic order;
+/// callers that persist as they go can ignore the index.
+///
+/// **Every source still produces exactly one item**, panics included — the guarantee the
+/// run-health panel depends on. Each source is awaited inside a supervising task that converts
+/// a panicked `JoinHandle` into a recorded failure before sending, so an adapter that panics
+/// cannot simply go missing from the channel.
+pub fn collect_streaming(
+    sources: Vec<Arc<dyn Source>>,
+    ctx: Arc<SourceContext>,
+) -> tokio::sync::mpsc::Receiver<(usize, SourceRunOutput)> {
+    // Capacity is the whole registry, so no adapter ever blocks on a slow consumer.
+    let (sender, receiver) = tokio::sync::mpsc::channel(sources.len().max(1));
+
+    for (index, source) in sources.into_iter().enumerate() {
         let ctx = Arc::clone(&ctx);
+        let sender = sender.clone();
         let name = source.name().to_string();
+        let task_name = name.clone();
 
-        // One task per source. A panic lands in this handle rather than unwinding the run.
-        let handle = tokio::task::spawn(async move {
-            if ctx.is_disabled(&name) {
-                return SourceFetch::skipped("disabled by configuration");
-            }
-            source.fetch(&ctx).await
+        tokio::task::spawn(async move {
+            // Inner task so a panicking adapter lands in a `JoinHandle` rather than taking
+            // this supervisor — and therefore its `send` — down with it.
+            let inner = tokio::task::spawn(async move {
+                if ctx.is_disabled(&task_name) {
+                    return SourceFetch::skipped("disabled by configuration");
+                }
+                source.fetch(&ctx).await
+            });
+
+            let fetch = match inner.await {
+                Ok(fetch) => fetch,
+                Err(join_error) => {
+                    // A panicking adapter is a bug, and the run keeps going anyway. Recorded
+                    // as a failure so it is visible, and *not* as a success so it cannot
+                    // expire anything on its way out.
+                    let detail = panic_detail(join_error);
+                    eprintln!("internships: source {name} panicked: {detail}");
+                    SourceFetch::failed(format!("adapter panicked: {detail}"))
+                }
+            };
+
+            // A send failure means the coordinator went away; nothing useful to do about it.
+            let _ = sender.send((index, into_output(&name, fetch))).await;
         });
-
-        handles.push((name, handle));
     }
 
-    let mut outputs = Vec::with_capacity(handles.len());
-    for (name, handle) in handles {
-        let fetch = match handle.await {
-            Ok(fetch) => fetch,
-            Err(join_error) => {
-                // A panicking adapter is a bug, and the run keeps going anyway. Recorded as a
-                // failure so it is visible, and *not* as a success so it cannot expire
-                // anything on its way out.
-                let detail = panic_detail(join_error);
-                eprintln!("internships: source {name} panicked: {detail}");
-                SourceFetch::failed(format!("adapter panicked: {detail}"))
-            }
-        };
-        outputs.push(into_output(&name, fetch));
-    }
-
-    outputs
+    receiver
 }
 
 /// Turn one adapter's [`SourceFetch`] into the record the coordinator persists.

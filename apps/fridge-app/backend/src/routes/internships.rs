@@ -17,10 +17,21 @@
 //!
 //! 1. An `INNER JOIN` drops the application entirely once the posting is gone — trap 1
 //!    arriving by the back door after the snapshot was supposed to have closed it.
-//! 2. Foreign keys are **not enforced** in this database (`db::init_pool` sets no
-//!    `PRAGMA foreign_keys`), so a hard-deleted posting leaves `posting_id` *dangling* rather
-//!    than NULL. `ON DELETE SET NULL` never fires. Verified against a real database, not
-//!    assumed.
+//! 2. A hard-deleted posting can leave `posting_id` either NULL **or dangling**, and this
+//!    code has to handle both.
+//!
+//!    Correcting the note in migration `0007`: **sqlx turns `PRAGMA foreign_keys` ON per
+//!    connection**, so through the application the `REFERENCES` clauses really are enforced
+//!    and `ON DELETE SET NULL` does fire. That was proved the hard way — an insert-ordering
+//!    bug in `internships::collector` failed with `FOREIGN KEY constraint failed`, which is
+//!    impossible if they are off. But the `sqlite3` CLI does *not* enable them, so a delete
+//!    performed by hand leaves the column pointing at an id that no longer resolves. Both
+//!    states were reproduced against a real database.
+//!
+//!    (This note lived in migration `0012` briefly and was moved here: **editing an applied
+//!    migration changes its checksum and sqlx then refuses to start**, with
+//!    `migration 12 was previously applied but has been modified`. A migration is immutable
+//!    once it has run anywhere — corrections go in the code or in a new migration.)
 //!
 //! Together those mean the liveness column cannot be written as `p.expired_at IS NULL`:
 //! when the join misses, every column of `p` is NULL, and `NULL IS NULL` is **true** — so a
@@ -49,7 +60,7 @@ use crate::internships::models::{
     Application, Season, ApplicationStatus, CreateApplicationRequest, MAX_APPLICATION_NOTES_LENGTH,
     UpdateApplicationRequest,
 };
-use crate::routes::auth::CurrentUser;
+use crate::routes::auth::{CurrentUser, RequireAdmin};
 
 /// The application columns plus the one derived field.
 ///
@@ -547,6 +558,76 @@ pub struct SourceHealth {
 pub struct RunHealthResponse {
     pub runs: Vec<CollectionRunSummary>,
     pub sources: Vec<SourceHealth>,
+    /// Present only while a run is actually in flight. See [`current_progress`].
+    pub in_progress: Option<RunProgress>,
+}
+
+/// A collection run that has started and not yet finished.
+///
+/// This exists because a running scrape was previously indistinguishable from a broken one:
+/// the tab was empty, the health panel was empty, and nothing said whether anything was
+/// happening. `sources_done` climbs as each source lands, which is only meaningful because the
+/// coordinator persists per-source rather than batching — see `internships::collector`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunProgress {
+    pub run_id: String,
+    pub started_at: DateTime<Utc>,
+    pub trigger: String,
+    /// Sources that have finished and been recorded so far.
+    pub sources_done: i64,
+    /// How many there are in total, from the registry.
+    pub sources_total: usize,
+    /// Postings accepted so far in this run — visible progress rather than a spinner.
+    pub postings_so_far: i64,
+}
+
+/// The in-flight run, if there is one.
+///
+/// A run is in flight when its `collection_runs` row has no `finished_at`. Note this is also
+/// true of a run whose process died mid-way, which is deliberate: a run that never finished is
+/// a real thing to surface, and the alternative — treating it as complete — would hide it.
+async fn current_progress(pool: &SqlitePool) -> Result<Option<RunProgress>, StatusCode> {
+    let row = sqlx::query_as::<_, InFlightRow>(
+        "SELECT id, started_at, trigger FROM collection_runs
+         WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(internal("reading the in-flight run"))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let sources_done: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM source_runs WHERE run_id = ?")
+            .bind(&row.id)
+            .fetch_one(pool)
+            .await
+            .map_err(internal("counting finished sources"))?;
+
+    let postings_so_far: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(accepted_count), 0) FROM source_runs WHERE run_id = ?")
+            .bind(&row.id)
+            .fetch_one(pool)
+            .await
+            .map_err(internal("counting accepted postings"))?;
+
+    Ok(Some(RunProgress {
+        run_id: row.id,
+        started_at: row.started_at,
+        trigger: row.trigger,
+        sources_done,
+        sources_total: crate::internships::sources::registry().len(),
+        postings_so_far,
+    }))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct InFlightRow {
+    id: String,
+    started_at: DateTime<Utc>,
+    trigger: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -555,6 +636,10 @@ pub struct CollectionRunSummary {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub trigger: String,
+    /// The process running this died before it finished. Reconciled at the next startup —
+    /// see `collector::reconcile_interrupted_runs`. Worth showing: a source that keeps being
+    /// interrupted is a real signal, and it explains a gap in the data.
+    pub interrupted: bool,
     pub sources: Vec<SourceRunSummary>,
 }
 
@@ -564,6 +649,7 @@ struct CollectionRunRow {
     started_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
     trigger: String,
+    interrupted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -586,7 +672,7 @@ pub async fn run_health(
     let limit = params.limit.unwrap_or(DEFAULT_RUN_LIMIT).min(MAX_RUN_LIMIT);
 
     let run_rows = sqlx::query_as::<_, CollectionRunRow>(
-        "SELECT id, started_at, finished_at, trigger
+        "SELECT id, started_at, finished_at, trigger, interrupted
          FROM collection_runs ORDER BY started_at DESC LIMIT ?",
     )
     .bind(limit)
@@ -612,6 +698,7 @@ pub async fn run_health(
             started_at: run.started_at,
             finished_at: run.finished_at,
             trigger: run.trigger,
+            interrupted: run.interrupted,
             sources,
         });
     }
@@ -648,7 +735,12 @@ pub async fn run_health(
     .await
     .map_err(internal("computing source health"))?;
 
-    Ok(Json(RunHealthResponse { runs, sources }))
+    let in_progress = current_progress(&pool).await?;
+    Ok(Json(RunHealthResponse {
+        runs,
+        sources,
+        in_progress,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -790,6 +882,8 @@ pub struct ListPostingsResponse {
     pub returned: usize,
     pub sort: String,
     pub postings: Vec<RankedPosting>,
+    /// Set while a collection is running, so an empty or partial list can say why.
+    pub collection: Option<RunProgress>,
 }
 
 /// The ranked, filtered list of open postings.
@@ -887,6 +981,7 @@ pub async fn list_postings(
         returned: ranked.len(),
         sort: sort.as_str().to_string(),
         postings: ranked,
+        collection: current_progress(&pool).await?,
     }))
 }
 
@@ -902,4 +997,55 @@ pub async fn list_sources(
         eprintln!("internships: listing sources failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// Trigger a collection by hand.
+///
+/// Admin-only, matching `POST /blog/sync`: it reaches out to every configured source, so it is
+/// not something an ordinary signed-in user should be able to set off repeatedly. The scheduled
+/// runner is the normal path — this exists for "I just changed a source, show me".
+///
+/// Runs inline and returns the report, so the caller sees what happened rather than a 202 and
+/// a shrug. That makes it slow by design; the scheduler is what you want for routine use.
+pub async fn collect_now(
+    State(pool): State<SqlitePool>,
+    RequireAdmin(_user): RequireAdmin,
+) -> Result<Json<CollectionSummary>, StatusCode> {
+    let report = crate::internships::collector::collect(&pool, "manual")
+        .await
+        .map_err(|err| {
+            eprintln!("internships: manual collection failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(CollectionSummary {
+        run_id: report.run_id,
+        sources_run: report.sources_run,
+        sources_succeeded: report.sources_succeeded,
+        fetched: report.fetched,
+        accepted: report.accepted,
+        filtered: report.filtered,
+        rejected: report.rejected,
+        postings_created: report.postings_created,
+        postings_updated: report.postings_updated,
+        marked_closed: report.marked_closed,
+        swept_deadline: report.swept_deadline,
+        swept_vanished: report.swept_vanished,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionSummary {
+    pub run_id: String,
+    pub sources_run: usize,
+    pub sources_succeeded: usize,
+    pub fetched: i64,
+    pub accepted: i64,
+    pub filtered: i64,
+    pub rejected: i64,
+    pub postings_created: i64,
+    pub postings_updated: i64,
+    pub marked_closed: u64,
+    pub swept_deadline: u64,
+    pub swept_vanished: u64,
 }

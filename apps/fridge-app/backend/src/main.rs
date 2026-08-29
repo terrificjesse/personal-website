@@ -50,6 +50,11 @@ async fn main() -> anyhow::Result<()> {
     // against — otherwise it would immediately re-sync what startup just ingested.
     blog_files::spawn_watcher(pool.clone());
 
+    // Internship collection + the expiry sweep. Both are cadenced by env vars and both
+    // disable cleanly; see `internships::collector`. Spawned rather than awaited — a slow or
+    // blocked job board must never delay the server binding its port.
+    internships::collector::spawn(pool.clone());
+
     // Load the FoodKeeper and MealDB catalogs
     let catalog = Arc::new(foodkeeper::Catalog::load()?);
     println!("loaded {} FoodKeeper names", catalog.entries().len());
