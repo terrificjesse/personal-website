@@ -371,9 +371,16 @@ it can be suggested elsewhere (see above).
 
 ---
 
-## Data model sketch — migration `0014_create_inbox.sql`
+## Data model sketch — migration `0015_create_inbox.sql`
 
 Not final. Argue with it before writing it.
+
+**`hunt_events` is not in this migration — it shipped ahead of it, in `0014_create_hunt_events.sql`.**
+8e needed the table and the inbox did not exist yet, and it belongs on its own regardless: it
+has two producers and only one of them is the inbox. Bundling it into the inbox migration
+would say the alert channel is an inbox feature, which is exactly the coupling the "two
+producers, one table" shape exists to prevent. So the inbox tables below are `0015`, and
+Track B's `cv_profile` moves along with them.
 
 - `gmail_accounts` — `user_id`, `email`, `refresh_token`, `history_id` watermark, `connected_at`.
 - `inbox_runs` — mirrors `source_runs`. Outcome enum, counts, error.
@@ -387,10 +394,13 @@ Not final. Argue with it before writing it.
   `matched_application_id` is nullable and NULL is legal on a pressing category — rule 8.
 - `status_proposals` — application id, from/to status, verdict id, `applied_automatically`,
   `reviewed_at`. Rule 2 lives here.
-- `hunt_events` — `kind` (`posting` | `email`), payload, `created_at`, `acked_at`. Rule 6
-  lives here.
+- `hunt_events` — **already built**, in `0014_create_hunt_events.sql`. `kind`
+  (`posting` | `email`), `user_id` (NULL = from the shared posting corpus, NOT NULL = private
+  to that user — the email producer must always set it), `subject_id` with
+  `UNIQUE (kind, subject_id)`, the rendered `title`/`body`/`url`, `payload_json`,
+  `created_at`, `acked_at`. Rule 6 lives here. 8d writes to it rather than altering it.
 
-Track B, which may well land first — put it in its own migration, `0015_create_cv_profile.sql`,
+Track B, which may well land first — put it in its own migration, `0016_create_cv_profile.sql`,
 rather than bundling it with the inbox tables:
 
 - `cv_profile` — `user_id`, and the flat fields an ATS asks for: name, email, phone, location,
@@ -403,7 +413,9 @@ rather than bundling it with the inbox tables:
 ## Endpoints sketch
 
 ```
-GET    /hunt/events?since=            unacked events, newest first
+GET    /hunt/events?since=&include_acked=&limit=
+                                      undelivered events, newest first; the popup passes
+                                      include_acked=true for its recent-alerts list
 POST   /hunt/events/{id}/ack
 GET    /hunt/inbox/status             last run, outcome, whether Gmail is connected
 GET    /hunt/proposals                pending status proposals awaiting review
@@ -429,7 +441,11 @@ apps/hunt-extension/
                      doesn't persist across sideloads.
   background.js      background.scripts (Firefox event page, NOT service_worker).
                      browser.alarms polls; browser.notifications alerts.
-  popup/             Unacked events, last sync status, pending proposals.
+  popup/             RECENT events (include_acked=true), last sync status, pending
+                     proposals. Not a list of unacked ones: `acked_at` is a delivery
+                     receipt, so the background page acks each event a second after
+                     notifying and an unacked-only popup would be empty every time you
+                     opened it. See rule 6.
   options/           Backend URL, poll interval, alert kinds, CV profile editor,
                      answer library browser, EEO-autofill opt-in (default off).
   content/           Injected on known ATS hosts ONLY. Field mapper, the fill action,
