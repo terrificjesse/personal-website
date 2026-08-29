@@ -9,6 +9,8 @@
 //! - [`normalize`] — the QC pass. Every raw posting yields exactly one outcome, so
 //!   `fetched = accepted + filtered + rejected` holds and nothing is silently dropped.
 //! - [`prestige`] — the company prestige signal: curated tiers over a derived fallback.
+//! - [`alerts`] — which newly collected postings are worth a desktop notification. Phase 8e;
+//!   it reads `prestige`'s curated tiers and writes `hunt_events`. See `crate::hunt`.
 //! - [`rank`] — hard filters and the composite ranking. Its module doc carries the
 //!   per-input absent-data policy table; read that before changing any weight.
 //! - [`http`] — the shared polite-fetch layer. Every adapter goes through it.
@@ -31,6 +33,7 @@
 //!    `posting_sightings.consecutive_misses` in migration `0012`.
 
 mod audit;
+pub mod alerts;
 pub mod collector;
 pub mod dedup;
 pub mod expiry;

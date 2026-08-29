@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod blog;
 pub mod health;
+pub mod hunt;
 pub mod internships;
 pub mod items;
 pub mod recipes;
@@ -128,6 +129,8 @@ pub fn build_router(state: AppState) -> Router {
             "/internships/applications",
             get(internships::list_applications).post(internships::create_application),
         )
+        .route("/hunt/events", get(hunt::list_events))
+        .route("/hunt/events/{id}/ack", post(hunt::ack_event))
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

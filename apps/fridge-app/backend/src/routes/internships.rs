@@ -1028,6 +1028,7 @@ pub async fn collect_now(
         rejected: report.rejected,
         postings_created: report.postings_created,
         postings_updated: report.postings_updated,
+        alerts_created: report.alerts_created,
         marked_closed: report.marked_closed,
         swept_deadline: report.swept_deadline,
         swept_vanished: report.swept_vanished,
@@ -1045,6 +1046,8 @@ pub struct CollectionSummary {
     pub rejected: i64,
     pub postings_created: i64,
     pub postings_updated: i64,
+    /// Desktop-notification events this run raised. See `internships::alerts`.
+    pub alerts_created: i64,
     pub marked_closed: u64,
     pub swept_deadline: u64,
     pub swept_vanished: u64,

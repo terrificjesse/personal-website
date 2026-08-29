@@ -39,6 +39,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::hunt;
+
+use super::alerts;
 use super::dedup::dedup_key;
 use super::expiry::{self, SourceRunResult};
 use super::http::PoliteClient;
@@ -68,6 +71,11 @@ pub struct CollectionReport {
     pub rejected: i64,
     pub postings_created: i64,
     pub postings_updated: i64,
+    /// `hunt_events` rows this run wrote — see [`super::alerts`]. Reported rather than left
+    /// to be counted by hand in `sqlite3`, because "a new tier-1/2 posting raises exactly one
+    /// notification, and re-running raises none" is the checkpoint this producer has to meet,
+    /// and a number in the manual-collect response is how you check it.
+    pub alerts_created: i64,
     pub marked_closed: u64,
     pub swept_deadline: u64,
     pub swept_vanished: u64,
@@ -167,6 +175,11 @@ pub async fn collect_with(
     let sources_run = source_list.len();
     let mut receiver = sources::collect_streaming(source_list, Arc::clone(&ctx));
 
+    // Loaded once for the whole run and shared by the two things that need it: the alert
+    // predicate below, and `recompute_company_signals` at the end. It reads a file, and a run
+    // that inserts a few hundred postings would otherwise read it a few hundred times.
+    let tiers = prestige::CompanyTiers::load();
+
     let mut report = CollectionReport {
         run_id: run_id.clone(),
         sources_run,
@@ -207,8 +220,13 @@ pub async fn collect_with(
                 QcOutcome::Accepted(normalized) => {
                     counts.accepted += 1;
                     match upsert_posting(pool, &normalized, &run_id, now).await {
-                        Ok(true) => report.postings_created += 1,
-                        Ok(false) => report.postings_updated += 1,
+                        Ok(upserted) if upserted.created => {
+                            report.postings_created += 1;
+                            report.alerts_created +=
+                                emit_posting_alert(pool, &tiers, &normalized, &upserted.id, now)
+                                    .await;
+                        }
+                        Ok(_) => report.postings_updated += 1,
                         Err(err) => {
                             // One unwritable row must not abort the source, let alone the run.
                             // It is recorded as a reject so it is visible rather than lost.
@@ -315,7 +333,7 @@ pub async fn collect_with(
         .execute(pool)
         .await?;
 
-    if let Err(err) = recompute_company_signals(pool, Utc::now()).await {
+    if let Err(err) = recompute_company_signals(pool, &tiers, Utc::now()).await {
         eprintln!("internships: recomputing company signals failed: {err:?}");
     }
 
@@ -345,7 +363,17 @@ struct QcCounts {
     rejected: i64,
 }
 
-/// Insert or merge one posting, and record the sighting. Returns whether the posting is new.
+/// What one upsert did: which row it landed on, and whether that row is new.
+///
+/// The id is returned rather than discarded because the alert producer needs something stable
+/// to key its event on, and this function has already looked it up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Upserted {
+    id: String,
+    created: bool,
+}
+
+/// Insert or merge one posting, and record the sighting.
 ///
 /// # Merging rule: a source that knows something beats a source that does not
 ///
@@ -361,7 +389,7 @@ async fn upsert_posting(
     posting: &NormalizedPosting,
     run_id: &str,
     now: DateTime<Utc>,
-) -> Result<bool> {
+) -> Result<Upserted> {
     let key = dedup_key(posting);
     let id = Uuid::new_v4().to_string();
 
@@ -487,7 +515,44 @@ async fn upsert_posting(
     .execute(pool)
     .await?;
 
-    Ok(existing.is_none())
+    Ok(Upserted {
+        id: posting_id,
+        created: existing.is_none(),
+    })
+}
+
+/// Alert on a newly collected posting, if [`super::alerts`] judges it worth one. Returns how
+/// many events were written — 0 or 1.
+///
+/// **A failed alert never fails the posting.** The posting is already stored by the time this
+/// runs; an undelivered notification is a worse day, not lost data, and the isolation rule
+/// that governs sources applies just as much to a producer bolted onto them. It is also not
+/// recorded as a reject: a reject means the posting did not land, and this one did.
+///
+/// `emit` returning `false` is normal rather than exceptional — it means an event already
+/// exists for this posting, which is what stops a second run raising a second notification.
+async fn emit_posting_alert(
+    pool: &SqlitePool,
+    tiers: &prestige::CompanyTiers,
+    posting: &NormalizedPosting,
+    posting_id: &str,
+    now: DateTime<Utc>,
+) -> i64 {
+    let Some(event) = alerts::posting_event(tiers, posting, posting_id) else {
+        return 0;
+    };
+
+    match hunt::events::emit(pool, &event, now).await {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(err) => {
+            eprintln!(
+                "internships: could not raise an alert for {} — {}: {err:?}",
+                posting.company_name, posting.title
+            );
+            0
+        }
+    }
 }
 
 /// Expire postings a source has explicitly declared closed.
@@ -612,7 +677,11 @@ async fn record_reject(
 ///
 /// **`prestige` is left NULL below the evidence threshold**, and NULL means *unknown* to the
 /// ranking, never *worst*. A company we have barely seen is not a company we know to be bad.
-async fn recompute_company_signals(pool: &SqlitePool, now: DateTime<Utc>) -> Result<()> {
+async fn recompute_company_signals(
+    pool: &SqlitePool,
+    tiers: &prestige::CompanyTiers,
+    now: DateTime<Utc>,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO company_signals (
              company_key, company_name, distinct_sources, live_postings, total_postings_seen,
@@ -677,7 +746,6 @@ async fn recompute_company_signals(pool: &SqlitePool, now: DateTime<Utc>) -> Res
     // them. On a real 455-company corpus that gave **60 companies a score, all of them exactly
     // 1.0**, because nothing was carried by more than two sources. It read like a ranking and
     // behaved like a coin flip.
-    let tiers = prestige::CompanyTiers::load();
     let max_sources: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(distinct_sources), 0) FROM company_signals")
             .fetch_one(pool)
@@ -692,7 +760,7 @@ async fn recompute_company_signals(pool: &SqlitePool, now: DateTime<Utc>) -> Res
 
     for (company_key, live_postings, distinct_sources, median_pay_hourly_usd) in rows {
         let value = prestige::score(
-            &tiers,
+            tiers,
             &company_key,
             prestige::DerivedInputs {
                 live_postings,
@@ -1118,6 +1186,176 @@ mod integration_tests {
         assert_eq!(report.accepted, 1, "the posting should have survived QC");
         assert_eq!(report.postings_created, 1);
         assert_eq!(misses(&pool, "greenhouse", "gh-1").await, 0);
+    }
+
+    /// Every `hunt_events` row, oldest first.
+    async fn events(pool: &SqlitePool) -> Vec<(String, String, String, Option<String>)> {
+        sqlx::query_as("SELECT kind, subject_id, title, user_id FROM hunt_events ORDER BY created_at")
+            .fetch_all(pool)
+            .await
+            .expect("events")
+    }
+
+    #[tokio::test]
+    async fn a_new_posting_from_a_tier_one_company_raises_exactly_one_alert() {
+        let pool = test_pool().await;
+        let sources = vec![FakeSource::arc(
+            "greenhouse",
+            SourceFetch::success(vec![raw(
+                "greenhouse",
+                "gh-1",
+                "https://job-boards.greenhouse.io/google/jobs/1",
+                "Software Engineer Intern",
+                "Google",
+            )]),
+        )];
+
+        let report = collect_with(&pool, "manual", sources, ctx().await)
+            .await
+            .expect("collect");
+
+        assert_eq!(report.postings_created, 1);
+        assert_eq!(report.alerts_created, 1);
+
+        let events = events(&pool).await;
+        assert_eq!(events.len(), 1, "one new posting, one alert");
+        assert_eq!(events[0].0, "posting");
+        assert!(events[0].2.contains("Google"), "got {:?}", events[0].2);
+        assert_eq!(
+            events[0].3, None,
+            "a posting belongs to the shared corpus, not to a user"
+        );
+
+        // The event points at the posting it is about, so the popup can link to it.
+        let posting_id: String =
+            sqlx::query_scalar("SELECT id FROM internship_postings LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("posting");
+        assert_eq!(events[0].1, posting_id);
+    }
+
+    #[tokio::test]
+    async fn a_tier_three_or_unlisted_company_raises_none() {
+        // The predicate must not degrade to "is the company listed at all", and it must not
+        // read a NULL prestige as a low one — that would alert on nearly every posting
+        // collected, which is how a notification channel gets muted wholesale.
+        let pool = test_pool().await;
+        let sources = vec![FakeSource::arc(
+            "greenhouse",
+            SourceFetch::success(vec![
+                raw(
+                    "greenhouse",
+                    "gh-1",
+                    "https://job-boards.greenhouse.io/intel/jobs/1",
+                    "Software Engineer Intern",
+                    "Intel",
+                ),
+                raw(
+                    "greenhouse",
+                    "gh-2",
+                    "https://job-boards.greenhouse.io/acme/jobs/2",
+                    "Software Engineer Intern",
+                    "Acme",
+                ),
+            ]),
+        )];
+
+        let report = collect_with(&pool, "manual", sources, ctx().await)
+            .await
+            .expect("collect");
+
+        assert_eq!(report.postings_created, 2, "both postings should be stored");
+        assert_eq!(report.alerts_created, 0);
+        assert!(events(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_running_collection_over_the_same_posting_does_not_alert_twice() {
+        // The MV3 failure this whole design exists to prevent, one layer down: collection runs
+        // every six hours over a corpus that mostly does not change, so a producer that keys
+        // on "did we see it this run" would re-notify for the same job four times a day.
+        let pool = test_pool().await;
+
+        for run in 0..3 {
+            let sources = vec![FakeSource::arc(
+                "greenhouse",
+                SourceFetch::success(vec![raw(
+                    "greenhouse",
+                    "gh-1",
+                    "https://job-boards.greenhouse.io/google/jobs/1",
+                    "Software Engineer Intern",
+                    "Google",
+                )]),
+            )];
+            let report = collect_with(&pool, "scheduled", sources, ctx().await)
+                .await
+                .expect("collect");
+            assert_eq!(
+                report.alerts_created,
+                i64::from(run == 0),
+                "only the first run should alert (run {run})"
+            );
+        }
+
+        assert_eq!(events(&pool).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_acked_alert_is_not_resurrected_by_a_later_collection() {
+        // "Restart Firefox after acking and it does not come back" has a server-side half:
+        // the next collection run must not clear or replace the ack. The posting is seen
+        // again on every run, so this is the ordinary path, not an edge case.
+        let pool = test_pool().await;
+
+        let listing = || {
+            vec![FakeSource::arc(
+                "greenhouse",
+                SourceFetch::success(vec![raw(
+                    "greenhouse",
+                    "gh-1",
+                    "https://job-boards.greenhouse.io/google/jobs/1",
+                    "Software Engineer Intern",
+                    "Google",
+                )]),
+            )]
+        };
+
+        collect_with(&pool, "manual", listing(), ctx().await)
+            .await
+            .expect("first collect");
+
+        let event_id: String = sqlx::query_scalar("SELECT id FROM hunt_events")
+            .fetch_one(&pool)
+            .await
+            .expect("event");
+
+        sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?1,?2,?3,?4)")
+            .bind("u1")
+            .bind("hunter@example.com")
+            .bind("x")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .expect("user");
+
+        let acked = crate::hunt::events::ack(&pool, &event_id, "u1", Utc::now())
+            .await
+            .expect("ack");
+        assert_eq!(acked, crate::hunt::events::AckOutcome::Acked);
+
+        collect_with(&pool, "scheduled", listing(), ctx().await)
+            .await
+            .expect("second collect");
+
+        let still_acked: Option<String> =
+            sqlx::query_scalar("SELECT acked_at FROM hunt_events WHERE id = ?")
+                .bind(&event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("row");
+        assert!(still_acked.is_some(), "the ack must survive a later run");
+        assert_eq!(events(&pool).await.len(), 1, "and no second event");
     }
 
     #[tokio::test]

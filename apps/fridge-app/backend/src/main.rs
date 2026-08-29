@@ -3,6 +3,7 @@ mod blog_files;
 mod db;
 mod expiration;
 mod foodkeeper;
+mod hunt;
 mod internships;
 mod models;
 mod nlp;
