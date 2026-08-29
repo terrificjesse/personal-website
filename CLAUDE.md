@@ -31,7 +31,6 @@ personal-website/
     PLAN.md                  # Phased implementation plan — read this for current phase status
     BLOG.md                  # Blog + admin-permissions reference (every file and function)
     INTERNSHIPS.md            # Internship tab reference (sources, schema, ranking, expiry)
-                             #   NOT WRITTEN YET — referenced here and by Phase 7, never created
     INTERNSHIP_SCRAPING.md    # Per-source data-acquisition research — read before touching a scraper
     HUNT.md                  # Phase 8 reference (hunt_events, the alert path, the extension)
     TODO.md                  # Deferred ideas

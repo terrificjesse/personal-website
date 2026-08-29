@@ -469,6 +469,9 @@ Backend in `apps/fridge-app/backend/` (auth and `users` are there — same reaso
 blog, see root `CLAUDE.md`). Frontend at `frontend/src/app/internships/`. Vendored source
 snapshots under `apps/fridge-app/backend/data/internships/`, following `data/themealdb/`.
 
+**Full reference — every file and function — is `docs/INTERNSHIPS.md`** (written 2026-08-29,
+after the fact). This section stays the phase record: scope, decisions, and the checkpoint.
+
 ### Sources — all four classes, isolated from each other
 
 Chosen by the user with the tradeoffs stated. `docs/INTERNSHIP_SCRAPING.md` holds the
