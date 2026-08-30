@@ -292,17 +292,35 @@ keeps location out of the merge key so per-location rows merge into one posting.
 collapse to `first +N more` and the body is capped at 140 characters. Pinned by a test using
 the real 30-city string.
 
-### What is not proven
+### Verified in Firefox, 2026-08-30
 
-**The extension has not been loaded in Firefox.** Alarms firing, notifications rendering, and
-above all **whether `SameSite=Lax` lets the session cookie through from a `moz-extension://`
-page** are all unverified. That last one is load-bearing for 8f and 8g too, which authenticate
-the same way. If it fails, the fallback recorded in `apps/hunt-extension/CLAUDE.md` is a
-dedicated extension token — a decision for the user, not a workaround to reach for.
+The checkpoint, end to end, against the real database and a real Firefox:
 
-The "restart Firefox after acking and the alert does not come back" half of the checkpoint is
-therefore verified server-side only: a second poll after acking returns nothing, and a later
-collection run neither clears the ack nor writes a second event.
+- **A new tier-1/2 posting raises exactly one notification.** ✅
+- **A tier-3 or untiered one raises none.** ✅
+- **Re-running collection raises no second notification.** ✅
+- **Acking, then quitting and reopening Firefox, does not re-raise it.** ✅ 39 of 39 events
+  acked; nothing fired on restart. This is the property the whole design turns on — the
+  background page loses everything it knew, so only `acked_at` on the server prevents a
+  re-notify.
+
+### Four causes, one symptom — the thing that actually cost the day
+
+Every one of these presented as *"can't reach the backend"*, and two were misdiagnosed
+confidently before anyone measured:
+
+| Cause | Why it looked like a dead server |
+|---|---|
+| The dev servers genuinely dying | It was a dead server, twice, mid-test |
+| Firefox MV3 not granting `host_permissions` | Chrome grants them at install; Firefox makes the user grant them, and a blocked fetch throws a bare `TypeError` |
+| CORS not naming the extension's origin | The backend answered 200 and the browser discarded the response before JS could see it — again a bare `TypeError` |
+| `SameSite=Lax` on the session cookie | The request arrived with no cookie, so the 401 was truthful and useless |
+
+**The lasting fix is not any one of those repairs — it is that they now report themselves
+distinctly.** `unpermitted`, `unreachable`, `no-token`, `token-rejected`, each a separate
+stored state with its own message naming its own fix. A single "can't reach" covering four
+unrelated causes is what turned a ten-minute check into a day, and 8f authenticates the same
+way, so it inherits the diagnosis rather than the search.
 
 ## Seams left for the rest of Phase 8
 

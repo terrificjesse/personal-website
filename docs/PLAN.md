@@ -671,7 +671,7 @@ reading `applied` for a job you already interviewed at.
   autoresponder does not drag an interview back to `applied`.
 - [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
   table, which 8e built.
-- [gen] **8e — The extension shell, end to end. — complete 2026-08-29**
+- [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
 - [gen] **8f — Autofill.** Content script, label-based field mapper, `cv_profile`, and the
   "track this application" offer that creates the tracker row from a page you actually applied
   on. *Checkpoint:* fill a real Greenhouse, Lever and Ashby form **without submitting any of
@@ -705,7 +705,7 @@ twelve with their reasoning; these are the ones that shape the schema.
    blocklist on password/payment/SSN fields checked *before* the fuzzy mapper; EEO questions
    opt-in and default off. **Do not ship `<all_urls>`.**
 
-### 8e — complete 2026-08-29
+### 8e — complete 2026-08-30
 
 **The vertical slice that ends in a desktop notification**, and it needed no Gmail and no API
 key: `hunt_events`, the poll and ack endpoints, the posting producer, and the extension shell.
@@ -742,12 +742,21 @@ deliberately keeps location out of the merge key. Locations now collapse to `fir
 body capped at 140 characters, pinned by a test using the real 30-city string. Same pattern
 `apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
 
-**Not proven: the extension has never been loaded in Firefox.** Alarms firing, notifications
-rendering, and above all **whether `SameSite=Lax` lets `fridge_session` through from a
-`moz-extension://` page** are unverified. That last one is load-bearing for 8f and 8g, which
-authenticate the same way; the options page's **Test connection** button names it explicitly
-rather than letting it look like a dead backend. If it fails, the recorded fallback is a
-dedicated extension token — the user's decision, not a workaround to reach for.
+**Verified in Firefox 2026-08-30, and the cookie plan did not survive it.** `SameSite=Lax`
+means Firefox never attaches `fridge_session` to a request from a `moz-extension://` page, so
+the backend answered a truthful 401 to a signed-in user. The recorded fallback — a dedicated
+bearer token — is now what the extension uses: `hunt_tokens` (migration `0015`), minted from an
+**Extension access** panel on the internships tab. It is a second *credential*, not a second
+auth system: it reuses `auth`'s hashing by calling it, and is accepted inside the existing
+`MaybeUser` extractor, so every route keeps its `CurrentUser` signature.
+
+Three other faults wore that same "can't reach the backend" symptom on the way: the dev servers
+genuinely dying, Firefox MV3 declining to grant `host_permissions` the manifest merely requests
+(Chrome grants them at install), and CORS never naming the extension's origin so responses were
+discarded before the extension could read them. **The durable fix is that all four now report
+themselves distinctly** — `unpermitted`, `unreachable`, `no-token`, `token-rejected` — because
+one message covering four unrelated causes is what turned a ten-minute check into a day. 8f
+authenticates identically and inherits the diagnosis rather than the search.
 
 ### Open questions
 
