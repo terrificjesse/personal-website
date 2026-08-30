@@ -297,10 +297,24 @@ fillButton?.addEventListener("click", async () => {
       fillResultEl.textContent = "Could not load your CV details.";
       return;
     }
-    const report = await browser.tabs.sendMessage(tab.id, {
-      type: "hunt-fill",
-      profile: await res.json(),
-    });
+    let report;
+    try {
+      report = await browser.tabs.sendMessage(tab.id, {
+        type: "hunt-fill",
+        profile: await res.json(),
+      });
+    } catch {
+      // Every frame declined, which means the script is there and none of them hold a form.
+      // Distinct from "the script never loaded", which the ping above already ruled out.
+      fillResultEl.textContent =
+        "No fillable form on this page. If the application is behind an Apply button, " +
+        "open it first and try again.";
+      return;
+    }
+    if (!report) {
+      fillResultEl.textContent = "No fillable form on this page.";
+      return;
+    }
     fillResultEl.textContent = describe(report);
   } catch (err) {
     fillResultEl.textContent = `Fill failed: ${err.message}`;

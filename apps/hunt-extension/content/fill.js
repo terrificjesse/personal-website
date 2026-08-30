@@ -237,7 +237,21 @@ function hasFillableFields() {
 // The only entry point. Nothing above runs until this message arrives, and the message only
 // comes from the popup's button.
 browser.runtime.onMessage.addListener((message) => {
-  // Silence rather than a negative answer — see `hasFillableFields`.
+  // A ping is answered by EVERY frame that has the script, whether or not it has fields, and
+  // reports the count. Staying silent here was a mistake: it made "the script never loaded"
+  // and "the script loaded and this page has no form" produce the identical symptom, which is
+  // precisely the conflation this extension has already been bitten by three times.
+  if (message?.type === "hunt-ping") {
+    return Promise.resolve({
+      ready: true,
+      host: location.host,
+      fields: candidates().length,
+    });
+  }
+
+  // Fill and describe, though, are answered only by a frame that actually has fields. A
+  // listener returning `undefined` does not respond at all, so the frame holding the form wins
+  // the broadcast rather than the empty top frame of an embed page.
   if (!hasFillableFields()) return undefined;
 
   if (message?.type === "hunt-fill") {
@@ -245,9 +259,6 @@ browser.runtime.onMessage.addListener((message) => {
   }
   if (message?.type === "hunt-describe") {
     return Promise.resolve(describePage());
-  }
-  if (message?.type === "hunt-ping") {
-    return Promise.resolve({ ready: true, host: location.host });
   }
   return undefined;
 });
