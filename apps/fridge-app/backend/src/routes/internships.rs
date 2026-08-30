@@ -1011,11 +1011,22 @@ pub async fn collect_now(
     State(pool): State<SqlitePool>,
     RequireAdmin(_user): RequireAdmin,
 ) -> Result<Json<CollectionSummary>, StatusCode> {
+    use crate::internships::collector::CollectError;
+
     let report = crate::internships::collector::collect(&pool, "manual")
         .await
-        .map_err(|err| {
-            eprintln!("internships: manual collection failed: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+        .map_err(|err| match err {
+            // A refusal, not a failure. 409 rather than 500 so a double-clicked button reads
+            // as "one is already running" instead of "the server broke" — the same distinction
+            // the blog phase drew between 403 and 401.
+            CollectError::AlreadyRunning => {
+                println!("internships: manual collection refused — one is already running");
+                StatusCode::CONFLICT
+            }
+            CollectError::Failed(err) => {
+                eprintln!("internships: manual collection failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         })?;
 
     Ok(Json(CollectionSummary {

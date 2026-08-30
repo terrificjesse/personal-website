@@ -86,9 +86,64 @@ pub struct CollectionReport {
 /// Never returns `Err` for a source-level problem — that is the isolation rule. An `Err` here
 /// means the *database* or the HTTP client could not be set up at all, which is a real failure
 /// of the run rather than of a source.
-pub async fn collect(pool: &SqlitePool, trigger: &str) -> Result<CollectionReport> {
-    let client = PoliteClient::new()?;
-    collect_with(pool, trigger, sources::registry(), Arc::new(configured_context(client))).await
+pub async fn collect(pool: &SqlitePool, trigger: &str) -> Result<CollectionReport, CollectError> {
+    // One collection at a time. Nothing used to prevent two: repeated clicks on "Collect now",
+    // or a manual run overlapping the scheduler, each performed a **full sweep of every
+    // third-party source**. Storage stayed correct — `dedup_key` is UNIQUE — so the cost was
+    // never corruption, it was doubling the load we put on other people's servers, which the
+    // politeness rules exist to bound.
+    //
+    // The guard sits here rather than in `collect_with` deliberately. Both production entry
+    // points — the route and the scheduler — come through this function, while `collect_with`
+    // is the injectable version the tests use; a global lock down there would make parallel
+    // tests fail each other on `try_lock` rather than serialize.
+    //
+    // In-process only. A second backend against the same database (the `PORT` trick from
+    // Phase 6) would not be excluded, and that is left alone on purpose: the realistic
+    // collision is a double click, and a database-level lock would need its own stale-lock
+    // reconciliation — the failure mode that just cost us the "Collecting…" lockout.
+    let Some(_guard) = try_begin_collection() else {
+        return Err(CollectError::AlreadyRunning);
+    };
+
+    let client = PoliteClient::new().map_err(|err| CollectError::Failed(err.into()))?;
+    collect_with(pool, trigger, sources::registry(), Arc::new(configured_context(client)))
+        .await
+        .map_err(CollectError::Failed)
+}
+
+/// Why a collection did not produce a report.
+#[derive(Debug)]
+pub enum CollectError {
+    /// Another collection is in flight in this process. Not a failure — a refusal.
+    AlreadyRunning,
+    /// The run could not be set up or completed.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for CollectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectError::AlreadyRunning => {
+                write!(f, "a collection is already running; not starting another")
+            }
+            CollectError::Failed(err) => write!(f, "{err:?}"),
+        }
+    }
+}
+
+/// Serializes collections within this process.
+static COLLECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Held for the length of a run; releasing it is what lets the next one start.
+pub struct CollectionGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+/// Claim the right to collect, or `None` if a run already holds it.
+///
+/// `try_lock` rather than `lock`: a second request should be told *now* that one is running,
+/// not queued behind a sweep that may take ten minutes and then run a redundant one.
+fn try_begin_collection() -> Option<CollectionGuard> {
+    COLLECTION_LOCK.try_lock().ok().map(CollectionGuard)
 }
 
 /// Build the source context from the environment.
@@ -400,13 +455,16 @@ async fn upsert_posting(
         None => (now, true),
     };
 
-    let existing: Option<String> =
-        sqlx::query_scalar("SELECT id FROM internship_postings WHERE dedup_key = ?")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await?;
-
-    sqlx::query(
+    // `RETURNING id` settles created-vs-updated **atomically**, and supplies the id the
+    // sighting needs — replacing a SELECT before the upsert and another after it.
+    //
+    // The old shape asked "does this key exist?" and then inserted, which is a race: two runs
+    // could both see nothing and both count a creation. Concurrent collections reported 41
+    // creations for 40 postings. The trick is that `id` is generated here, and
+    // `ON CONFLICT DO UPDATE` keeps the *existing* row's id — so an id that comes back equal
+    // to the one sent is an insert, and a different one is an update. No second query, and
+    // nothing to get out of step.
+    let returned_id: String = sqlx::query_scalar(
         "INSERT INTO internship_postings (
              id, dedup_key, company_key, company_name, title, canonical_url,
              term_season, term_year,
@@ -449,7 +507,8 @@ async fn upsert_posting(
              -- must clear together with its reason or the CHECK constraint rejects the row.
              expired_at = NULL,
              expiry_reason = NULL,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at
+         RETURNING id",
     )
     .bind(&id)
     .bind(&key)
@@ -481,14 +540,11 @@ async fn upsert_posting(
     .bind(i64::from(estimated))
     .bind(posting.deadline.map(|d| d.to_rfc3339()))
     .bind(now.to_rfc3339())
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
-    let posting_id: String =
-        sqlx::query_scalar("SELECT id FROM internship_postings WHERE dedup_key = ?")
-            .bind(&key)
-            .fetch_one(pool)
-            .await?;
+    let created = returned_id == id;
+    let posting_id = returned_id;
 
     // The sighting: this source, this listing. Its `consecutive_misses` resets to 0 here so a
     // posting that reappears after a gap starts counting again from clean, rather than
@@ -517,7 +573,7 @@ async fn upsert_posting(
 
     Ok(Upserted {
         id: posting_id,
-        created: existing.is_none(),
+        created,
     })
 }
 
@@ -1121,6 +1177,59 @@ mod integration_tests {
                 .unwrap();
         assert!(finished.is_some(), "an abandoned run must stop reading as in-flight");
         assert_eq!(interrupted, 1, "but must not read as completed either");
+    }
+
+    #[tokio::test]
+    async fn only_one_collection_may_run_at_a_time() {
+        // Audit finding F6. Nothing used to stop two: repeated clicks on "Collect now", or a
+        // manual run overlapping the scheduler, each swept every third-party source.
+        let first = try_begin_collection().expect("the first claim should succeed");
+        assert!(
+            try_begin_collection().is_none(),
+            "a second collection must be refused while one holds the guard"
+        );
+        drop(first);
+        assert!(
+            try_begin_collection().is_some(),
+            "and the guard must be released when the run ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_collection_is_distinguishable_from_a_failed_one() {
+        // The route maps these to 409 and 500 respectively, so a double-clicked button reads
+        // as "already running" rather than "the server broke".
+        let _held = try_begin_collection().expect("claim");
+        let pool = test_pool().await;
+        match collect(&pool, "manual").await {
+            Err(CollectError::AlreadyRunning) => {}
+            Err(CollectError::Failed(err)) => panic!("expected a refusal, got a failure: {err:?}"),
+            Ok(_) => panic!("a collection ran while the guard was held"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_created_count_is_settled_by_the_upsert_itself() {
+        // The count used to come from a SELECT before the INSERT, which is a race: two runs
+        // could both see nothing and both count a creation (41 reported for 40 postings).
+        // `RETURNING id` settles it atomically — an id equal to the one sent is an insert.
+        let pool = test_pool().await;
+        let p = raw("gh", "1", "https://job-boards.greenhouse.io/acme/jobs/1",
+                    "Software Engineer Intern", "Acme");
+
+        let first = collect_with(&pool, "manual", vec![FakeSource::arc("gh", SourceFetch::success(vec![p.clone()]))], ctx().await)
+            .await
+            .unwrap();
+        assert_eq!((first.postings_created, first.postings_updated), (1, 0));
+
+        let second = collect_with(&pool, "manual", vec![FakeSource::arc("gh", SourceFetch::success(vec![p]))], ctx().await)
+            .await
+            .unwrap();
+        assert_eq!(
+            (second.postings_created, second.postings_updated),
+            (0, 1),
+            "the second sighting of one job is an update, never a second creation"
+        );
     }
 
     #[tokio::test]
