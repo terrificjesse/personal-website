@@ -362,6 +362,8 @@ mode* rather than a feature. Method and hypotheses: `docs/BLOG_STRESS_TEST_PLAN.
 | H3 | Length limits counted **bytes** while the docs promised characters, so a 200-char CJK title 400'd | `models::exceeds_char_limit` |
 | H5 | A whitespace-only body was **valid via the API and invalid via a file** | `models::is_blank`, shared by all four call sites |
 | H7 | "First-registered admin" was really "lowest UUID" | `ORDER BY created_at ASC, id ASC` |
+| H8 | A long unbroken token made the page **2255px wide in a 900px viewport**, pushing every element sideways | `overflow-wrap: anywhere` + `min-width: 0` on `.markdown-body` |
+| H9 | A failed search kept the **previous query's results** on screen under the error banner, with no loading state | the catch clears `posts`; `loading` is derived from a request key |
 
 Two hypotheses were **refuted**, and are worth recording so nobody re-investigates them:
 
@@ -385,15 +387,24 @@ into `docs/PLAN.md` § Phase 7 — which was authored *after* this code shipped 
 **H3 and H5 also share a cause:** one rule written twice, in two places, which then drifted.
 Both were fixed by extracting a named predicate rather than patching the copy that was wrong.
 
-`cargo test`: **635 passed, 0 failed**, clippy clean. Each fix was re-verified end-to-end
-against a copy of the real `fridge.db` over HTTP, not only in unit tests.
+`cargo test`: **642 passed, 0 failed**, clippy clean, `tsc` clean, lint back to exactly the 2
+pre-existing errors. The five backend fixes were re-verified end-to-end against a copy of the
+real `fridge.db` over HTTP; H8 and H9 are frontend and were verified in the browser, since
+there is no JS test harness in this project.
+
+**Two rules the CSS fix encodes**, both easy to undo by accident:
+
+- `overflow-wrap: **anywhere**`, not `break-word` — only `anywhere` also shrinks the element's
+  intrinsic min-content width, which is what stops a flex or grid parent being sized by an
+  unbroken token.
+- `pre` keeps `overflow-wrap: normal` **on purpose**. Prose wraps; code scrolls. Re-flowing a
+  code block changes what it appears to say.
 
 ### Still open from that pass
 
-- **H8** — long unbroken tokens may overflow the post body; `.markdown-body pre` scrolls but a
-  `<p>` has no `overflow-wrap`.
-- **H9** — a failed search leaves the previous query's results on screen under an error banner,
-  and `loading` never returns true after mount.
-- Untested areas: concurrency (racing `unique_slug`), sync × API interleaving, frontmatter
-  fuzzing (BOM, CRLF, duplicate keys, non-UTF-8, symlinks), search at scale (there is **no
-  pagination**), and volume (1,000 posts).
+- **No pagination on `GET /blog/posts`** — every matching post comes back in one response.
+  Invisible at current volume, and the one item here that is a design hole rather than an
+  untested hypothesis.
+- Untested areas: concurrency (racing `unique_slug` → UNIQUE violation → 500?), sync × API
+  interleaving, frontmatter fuzzing (BOM, CRLF, duplicate keys, non-UTF-8, symlinks), and
+  volume (1,000 posts).

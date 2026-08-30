@@ -14,7 +14,7 @@ All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recomme
 writing them. Every phase was verified against real data, not just fixtures; the per-phase
 evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **635 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
+`cargo test`: **642 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
 Phase 7 work from a parallel session plus the blog stress-test suite.)
 
 **Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
@@ -411,10 +411,11 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **Finish the blog stress test.** H8 (long tokens may overflow the post body) and H9 (a
-   failed search leaves stale results on screen) are found-but-unfixed, and the untested areas
-   — concurrency, sync × API interleaving, frontmatter fuzzing, and **no pagination on
-   `/blog/posts`** — are unexplored. `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
+2. **Add pagination to `GET /blog/posts`.** It returns every matching post in one response.
+   Invisible at current volume; the only *design* hole the blog stress test left open, as
+   opposed to a merely untested area. The rest of that table — concurrency, sync × API
+   interleaving, frontmatter fuzzing, volume — is unexplored;
+   `docs/BLOG_STRESS_TEST_PLAN.md` has the method for a second pass.
 3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.

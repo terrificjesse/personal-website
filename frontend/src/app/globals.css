@@ -41,6 +41,24 @@ body {
 .markdown-body {
   font-size: 0.875rem;
   line-height: 1.7;
+
+  /*
+   * A long unbroken token — a URL, a hash, a base64 blob — has no break opportunity, so
+   * without this it sets the width of the whole page: a 260-character word measured 2255px
+   * inside a 900px viewport and pushed every other element sideways. `pre` and `table` scroll
+   * inside their own boxes, but ordinary prose had nothing.
+   *
+   * `anywhere` rather than `break-word` because only `anywhere` also shrinks the element's
+   * intrinsic min-content width, which is what stops a flex or grid parent from being sized
+   * by the unbroken token in the first place.
+   */
+  overflow-wrap: anywhere;
+}
+
+/* Belt and braces for the container itself: a flex or grid child will not shrink below its
+   min-content width unless told it may. */
+.markdown-body {
+  min-width: 0;
 }
 
 .markdown-body > :first-child {
@@ -146,8 +164,10 @@ body {
   padding: 0.9em 1em;
   border-radius: 0.375rem;
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
-  /* Long lines scroll inside the block instead of widening the page. */
+  /* Long lines scroll inside the block instead of widening the page. Deliberately NOT
+     wrapped like prose: re-flowing code changes what it appears to say. */
   overflow-x: auto;
+  overflow-wrap: normal;
 }
 
 .markdown-body pre code {

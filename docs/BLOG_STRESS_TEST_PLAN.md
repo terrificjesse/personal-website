@@ -1,15 +1,14 @@
 # Blog tab — stress test
 
-> **Status: first pass complete, 2026-08-30.** Five hypotheses confirmed and fixed, two
-> refuted, two found-but-unfixed, and the "areas to probe" table below still untouched.
+> **Status: first pass complete, 2026-08-30.** Seven hypotheses confirmed and fixed, two
+> refuted, and the "areas to probe" table below still untouched.
 > Findings and fixes are summarised in `docs/BLOG.md` § "Adversarial stress test"; this file
 > keeps the *method* and the per-hypothesis reasoning, which is what makes a second pass cheap.
 >
 > | | |
 > |---|---|
-> | **Confirmed & fixed** | H1, H1b, H1c, H2, H3, H5, H7 |
+> | **Confirmed & fixed** | H1, H1b, H1c, H2, H3, H5, H7, H8, H9 |
 > | **Refuted** | H4 (ordering is correct despite mixed encodings), H6 (`react-markdown` strips unsafe URL protocols) |
-> | **Confirmed, not fixed** | H8, H9 |
 > | **Not yet attempted** | everything under "Areas to probe beyond the ranked list" |
 
 **Goal: find what's broken.** Not to re-confirm the Phase 6 checkpoint, which passed and
@@ -127,7 +126,7 @@ posts created at different times.
   account owns the file post. Expected to fail. (Doc-vs-code mismatch; the fix may be to
   correct the doc rather than the code — a review question, not mine to settle.)
 
-### H8 — Layout: long unbroken tokens overflow the post body 🟡 — NOT YET RUN
+### H8 — Layout: long unbroken tokens overflow the post body 🟡 — CONFIRMED, FIXED
 
 `.markdown-body pre` has `overflow-x: auto`, but a long URL or token inside a `<p>` has no
 `overflow-wrap`. The body would push the page sideways — the thing the artifact rules call
@@ -136,13 +135,39 @@ out as never acceptable.
 - **Test:** browser check with a 300-character unbroken string; assert
   `document.body.scrollWidth <= clientWidth`.
 
-### H9 — A failed search leaves stale results on screen 🟡 — NOT YET RUN
+**Finding — confirmed.** A 260-character token made the page **2255px wide in a 900px
+viewport**, overflowing by 1355px and pushing every other element sideways.
+
+**Fix.** `.markdown-body` gets `overflow-wrap: anywhere` and `min-width: 0`. Two choices:
+`anywhere` rather than `break-word`, because only `anywhere` also shrinks the element's
+intrinsic *min-content* width — which is what stops a flex or grid parent being sized by the
+unbroken token in the first place; and `pre` explicitly keeps `overflow-wrap: normal`, because
+prose should wrap but code should scroll — re-flowing a code block changes what it appears to
+say. Verified at 900px and at 375px, with the fenced block still scrolling inside its own box.
+
+### H9 — A failed search leaves stale results on screen 🟡 — CONFIRMED, FIXED
 
 `fetchPosts` rejection sets `error` but leaves `posts` populated, so the list shows the
 previous query's results under an error banner. Also `setLoading(false)` never returns true
 after mount, so slow searches give no feedback.
 
 - **Test:** browser, with the backend stopped mid-session.
+
+**Finding — confirmed**, by intercepting `window.fetch` to reject `/blog/posts`: the error
+banner appeared *and* the previous query's post stayed in the list, presenting stale content
+as though it answered the current search.
+
+**Fix.** The catch clears `posts`, so a failed search shows the error alone. `loading` is now
+**derived** — a `requestKey` of sort + trimmed query, compared against the last settled key —
+rather than a `setLoading(true)` at the top of the effect. That pattern is the
+`react-hooks/set-state-in-effect` error this codebase already carries two of, and it would not
+have shown a spinner on re-search anyway, since the original only ran once on mount.
+
+**A note on measuring this one.** Two of my probes reported "no spinner" and were both wrong:
+the first sampled before the 250ms debounce had fired, the second after the slow-response patch
+had been replaced by an instantly-rejecting one. Only a *timed series* across the request
+showed the truth — `Overflow Probe` → `Loading…` → `No posts match "zz"`. A single
+badly-timed sample of an async UI is evidence of nothing.
 
 ---
 

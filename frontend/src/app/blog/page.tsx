@@ -10,14 +10,23 @@ const SEARCH_DEBOUNCE_MS = 250;
 
 export default function BlogPage() {
   const [posts, setPosts] = useState<BlogPost[]>([]);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // What the last settled request was for. Loading is *derived* from comparing it to what the
+  // current controls ask for, rather than a `setLoading(true)` at the top of the effect —
+  // which is the `react-hooks/set-state-in-effect` pattern this codebase already has two
+  // outstanding errors for, and which would show no spinner on re-search anyway.
+  const [settledKey, setSettledKey] = useState<string | null>(null);
   const [sort, setSort] = useState<BlogSortOrder>("newest");
   // Two states rather than one: `query` is what's in the box and must update on every
   // keystroke, `debouncedQuery` is what's actually been asked for.
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
+
+  // Identifies the request the current controls call for. Anything not yet settled at this
+  // key is in flight.
+  const requestKey = `${sort}\u0000${debouncedQuery.trim()}`;
+  const loading = settledKey !== requestKey;
 
   // Purely so an admin has a way *into* the editor — `/blog/admin` linked out to here but
   // nothing linked in, which left the editor reachable only by typing its URL. Optimistic in
@@ -49,6 +58,7 @@ export default function BlogPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const key = requestKey;
 
     // Both controls feed one request. Sorting and searching compose in the backend's single
     // query, so there's nothing to merge or re-sort here — including across posts that came
@@ -62,16 +72,23 @@ export default function BlogPage() {
         setError(null);
       })
       .catch(() => {
-        if (!cancelled) setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        if (cancelled) return;
+        setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        // Clear the list too. Leaving the previous query's results under an error banner
+        // presents stale content as though it answered the current search.
+        setPosts([]);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setSettledKey(key);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [sort, debouncedQuery]);
+    // `requestKey` is derived from the other two, so listing it changes nothing at runtime
+    // — it is here because the effect reads it, and a dependency array that lies is how the
+    // next person gets a stale closure.
+  }, [sort, debouncedQuery, requestKey]);
 
   const searching = debouncedQuery.trim().length > 0;
 
