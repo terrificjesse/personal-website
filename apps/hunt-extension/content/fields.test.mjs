@@ -88,5 +88,37 @@ eq("Country* (not stored)", classify("Country*"), skip);
 eq("Non-compete comments", classify("Non-compete/Notice period comments*"), skip);
 eq("Acknowledge/Confirm", classify("Acknowledge/Confirm"), skip);
 
+
+console.log("\n-- labels taken verbatim from a live Lever form (Energy Vault) --");
+// Lever renders a select's options into the label with no separator. These read as
+// "genderselect" / "raceselect" once normalized, and the blocklist silently missed them.
+eq("GenderSelect...", classify("GenderSelect ...MaleFemaleDecline to self-identify"), blocked("demographic"));
+eq("RaceSelect...", classify("RaceSelect ...Hispanic or LatinoWhite (Not Hispanic or Latino)"), blocked("demographic"));
+eq("Veteran statusSelect...", classify("Veteran statusSelect ...I am a veteranI am not a veteran"), blocked("demographic"));
+eq("Full name\u2731", classify("Full name\u2731"), field("full_name"));
+eq("Current location + noise", classify("Current location No location found. Try entering a different"), field("location"));
+eq("GitHub URL", classify("GitHub URL"), field("github_url"));
+eq("Portfolio URL", classify("Portfolio URL"), field("portfolio_url"));
+// Beside "Portfolio URL" on the same form — filling both put one URL in two questions.
+eq("Other website is not the portfolio", classify("Other website"), skip);
+eq("Current company (not stored)", classify("Current company \u2731"), skip);
+eq("Twitter URL (not stored)", classify("Twitter URL"), skip);
+// The unglue step must not cost the matches it could break.
+eq("LinkedIn still matches", classify("LinkedIn URL"), field("linkedin_url"));
+eq("GitHub still matches", classify("GitHub Profile"), field("github_url"));
+
+
+console.log("\n-- labels taken verbatim from a live Ashby form (AfterQuery) --");
+// Ashby labels the applicant name field simply "Name". Exact-only, so it does not reopen
+// the "Company Name" hole that keeping bare "name" out of the synonyms was closing.
+eq("bare Name", classify("Name"), field("full_name"));
+eq("Company Name still skipped", classify("Company Name"), skip);
+eq("Referrer Name still skipped", classify("Referrer Name"), skip);
+eq("Ashby Email", classify("Email"), field("email"));
+eq("Ashby LinkedIn Profile", classify("LinkedIn Profile"), field("linkedin_url"));
+// Rule 11: never touch a CAPTCHA. Ashby puts a real textarea in the form for it.
+eq("recaptcha textarea", classify("g-recaptcha-response g-recaptcha-response-100000"), blocked("sensitive"));
+eq("captcha, any spelling", classify("Captcha"), blocked("sensitive"));
+
 console.log(fail === 0 ? "\n  ALL PASSED" : `\n  ${fail} FAILED`);
 process.exit(fail ? 1 : 0);

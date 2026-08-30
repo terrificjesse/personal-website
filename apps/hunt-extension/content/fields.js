@@ -56,6 +56,11 @@ const BLOCKED = [
   /driv(er|ing)\s*s?\s*licen[sc]e/,
   /national\s*(id|insurance)/,
   /government\s*id/,
+  // Rule 11: do not touch CAPTCHAs. Ashby renders a `g-recaptcha-response` textarea into the
+  // form, which is a real control our candidate scan sees. Nothing maps to it, so nothing
+  // would be typed — but "nothing happens to match" is not a policy, and this is.
+  /recaptcha/,
+  /captcha/,
   // The browser's own autocomplete tokens, which arrive normalized as "cc number", "cc csc"
   // and so on. More reliable than any wording, and missed by the prose patterns above.
   /\bcc\s*(number|csc|cvc|exp|expiry|name)\b/,
@@ -89,6 +94,18 @@ const DEMOGRAPHIC = [
  * or "Referrer name", and a wrong match here writes your legal name into someone else's box.
  * An unmatched field is left alone, which is always the safe outcome.
  */
+/**
+ * Labels that count **only as an exact match**, never as a containment.
+ *
+ * Ashby labels its applicant name field simply "Name". Adding "name" to the synonyms below
+ * would also make it match inside "Company Name" and "Referrer Name" — typing your legal name
+ * into someone else's box, which is exactly why bare "name" was excluded in the first place.
+ * Exact-only gets Ashby's field without reopening that: "company name" is not "name".
+ */
+const EXACT_ONLY = {
+  full_name: ["name"],
+};
+
 const SYNONYMS = {
   first_name: ["first name", "given name", "forename", "first"],
   last_name: ["last name", "surname", "family name", "last"],
@@ -108,10 +125,29 @@ const SYNONYMS = {
   graduation_month: ["graduation month", "grad month", "expected graduation month"],
   github_url: ["github", "github url", "github profile", "github username"],
   linkedin_url: ["linkedin", "linkedin url", "linkedin profile"],
-  portfolio_url: ["portfolio", "website", "personal website", "personal site", "portfolio url", "other website"],
+  // "other website" is deliberately absent: on Lever it sits beside "Portfolio URL", and
+  // treating both as the portfolio typed the same URL into two different questions.
+  portfolio_url: ["portfolio", "personal website", "personal site", "portfolio url"],
   work_authorization: ["work authorization", "authorized to work", "work status", "visa status", "employment authorization"],
   needs_sponsorship: ["sponsorship", "require sponsorship", "need sponsorship", "will you require sponsorship", "visa sponsorship"],
 };
+
+/**
+ * Insert a space at a lower-to-upper case change, so run-together words separate.
+ *
+ * Lever renders a `<select>`'s option text straight into the label with no separator:
+ * "Gender" arrives as `GenderSelect ...MaleFemaleDecline to self-identify`. Normalized that is
+ * "genderselect", and `\bgender\b` never fires — the demographic blocklist silently failed on
+ * a real form while appearing to work, because "Veteran status" happened to be matched by a
+ * pattern without a word boundary.
+ *
+ * Used for the REFUSAL checks only, never for synonym matching: splitting this way also turns
+ * "LinkedIn" into "linked in" and "GitHub" into "git hub", which would break two matches that
+ * work today. Checking the blocklist against both forms can only ever refuse more.
+ */
+function splitRunTogetherWords(text) {
+  return (text || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+}
 
 /** Lowercase, strip punctuation and required-field markers, collapse whitespace. */
 function normalizeLabel(raw) {
@@ -141,16 +177,25 @@ function classify(rawLabel) {
   const label = normalizeLabel(rawLabel);
   if (!label) return { kind: "skip" };
 
+  // The refusal checks see both the plain form and the run-together-words form, because a
+  // label that reads "GenderSelect" in the DOM is still a gender question. Two chances to
+  // refuse, one to match.
+  const unglued = normalizeLabel(splitRunTogetherWords(rawLabel));
+  const refuses = (pattern) => pattern.test(label) || pattern.test(unglued);
+
   // FIRST. See the header — reordering this is a silent safety regression.
   for (const pattern of BLOCKED) {
-    if (pattern.test(label)) return { kind: "blocked", reason: "sensitive" };
+    if (refuses(pattern)) return { kind: "blocked", reason: "sensitive" };
   }
   for (const pattern of DEMOGRAPHIC) {
-    if (pattern.test(label)) return { kind: "blocked", reason: "demographic" };
+    if (refuses(pattern)) return { kind: "blocked", reason: "demographic" };
   }
 
-  // Exact match wins outright.
+  // Exact match wins outright, including the exact-only labels.
   for (const [key, phrases] of Object.entries(SYNONYMS)) {
+    if (phrases.includes(label)) return { kind: "field", key };
+  }
+  for (const [key, phrases] of Object.entries(EXACT_ONLY)) {
     if (phrases.includes(label)) return { kind: "field", key };
   }
 
