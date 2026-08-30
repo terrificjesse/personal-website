@@ -580,3 +580,67 @@ export async function saveCvProfile(profile: CvProfile): Promise<CvProfile> {
   if (!res.ok) throw new Error(`Could not save your CV profile (${res.status})`);
   return res.json();
 }
+
+// ------------------------------------------------------------------------------------------
+// The answer library (Phase 8g)
+// ------------------------------------------------------------------------------------------
+
+/**
+ * A question you have already answered, and the answer you gave.
+ *
+ * `is_company_specific` is the important field. "Why do you want to work at X" reads as the
+ * same question everywhere, which is exactly what makes reusing it verbatim so costly — so a
+ * flagged answer is never offered for a different employer. The backend decides it; nothing
+ * here can override it.
+ */
+export type ApplicationAnswer = {
+  id: string;
+  question_text: string;
+  answer_text: string;
+  is_company_specific: boolean;
+  /** Who it was written for, when known. */
+  company_name: string | null;
+  tags: string | null;
+  /** Counted when an answer is inserted into a form, not when it is merely shown. */
+  use_count: number;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** A previous version, kept so a rewrite you regret is recoverable. */
+export type AnswerRevision = { replaced_at: string; answer_text: string };
+
+export async function listAnswers(): Promise<ApplicationAnswer[]> {
+  const res = await apiFetch("/hunt/answers");
+  if (!res.ok) throw new Error(`Could not load your answers (${res.status})`);
+  const body = await res.json();
+  return body.answers ?? [];
+}
+
+export async function updateAnswer(
+  id: string,
+  answerText: string,
+): Promise<ApplicationAnswer> {
+  const res = await apiFetch(`/hunt/answers/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer_text: answerText }),
+  });
+  if (!res.ok) throw new Error(`Could not save the edit (${res.status})`);
+  return res.json();
+}
+
+export async function deleteAnswer(id: string): Promise<void> {
+  const res = await apiFetch(`/hunt/answers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`Could not delete that answer (${res.status})`);
+}
+
+export async function answerRevisions(id: string): Promise<AnswerRevision[]> {
+  const res = await apiFetch(`/hunt/answers/${encodeURIComponent(id)}/revisions`);
+  if (!res.ok) throw new Error(`Could not load the history (${res.status})`);
+  const body = await res.json();
+  return body.revisions ?? [];
+}

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { PostingCard } from "./PostingCard";
 import { CollectionStatus } from "./CollectionStatus";
+import { AnswerLibrary } from "./AnswerLibrary";
 import { CvProfileEditor } from "./CvProfileEditor";
 import { ExtensionAccess } from "./ExtensionAccess";
 import { useApiError } from "@/lib/useApiError";
@@ -277,6 +278,7 @@ export default function InternshipsPage() {
       <div className="mt-4 space-y-3">
         <ExtensionAccess />
         <CvProfileEditor />
+        <AnswerLibrary />
       </div>
 
       {error && (
