@@ -1,0 +1,68 @@
+import { classify, normalizeLabel, inputIsBlocked } from "./fields.js";
+
+let fail = 0;
+const eq = (name, actual, expected) => {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  if (!ok) { fail++; console.log(`  FAIL  ${name}\n        got ${JSON.stringify(actual)} want ${JSON.stringify(expected)}`); }
+  else console.log(`  pass  ${name}`);
+};
+const field = (k) => ({ kind: "field", key: k });
+const blocked = (r) => ({ kind: "blocked", reason: r });
+const skip = { kind: "skip" };
+
+console.log("\n-- the blocklist, which must win over everything --");
+for (const label of ["Password", "Confirm Password", "Social Security Number", "SSN",
+                     "Credit Card Number", "CVV", "Passport Number", "Driver's License",
+                     "Bank Account Number", "Routing number"])
+  eq(`"${label}" is blocked`, classify(label), blocked("sensitive"));
+
+console.log("\n-- demographics: never matched, never filled --");
+for (const label of ["Race", "Ethnicity", "Gender", "Veteran Status",
+                     "Disability Status", "Sexual Orientation", "Date of Birth"])
+  eq(`"${label}" is blocked`, classify(label), blocked("demographic"));
+
+console.log("\n-- the ordinary fields --");
+eq("First Name", classify("First Name"), field("first_name"));
+eq("Last Name *", classify("Last Name *"), field("last_name"));
+eq("Email (required)", classify("Email (required)"), field("email"));
+eq("Phone Number", classify("Phone Number"), field("phone"));
+eq("LinkedIn URL", classify("LinkedIn URL"), field("linkedin_url"));
+eq("GitHub Profile", classify("GitHub Profile"), field("github_url"));
+eq("School", classify("School"), field("school"));
+eq("Expected Graduation Year", classify("Expected Graduation Year"), field("graduation_year"));
+eq("What is your GPA?", classify("What is your GPA?"), field("gpa"));
+eq("Will you require sponsorship", classify("Will you require visa sponsorship?"), field("needs_sponsorship"));
+
+console.log("\n-- specificity: the longer phrase wins --");
+eq('"First name" is not "name"', classify("First name"), field("first_name"));
+eq("Preferred First Name -> preferred", classify("Preferred First Name"), field("preferred_name"));
+eq("LinkedIn URL beats bare linkedin", classify("LinkedIn URL"), field("linkedin_url"));
+
+console.log("\n-- things that must NOT match --");
+for (const label of ["Company Name", "Referrer Name", "Software Engineer",
+                     "How did you hear about us?", "Cover Letter", "Why do you want to work here?",
+                     "Manager name", ""])
+  eq(`"${label}" is skipped`, classify(label), skip);
+
+console.log("\n-- an unmatched field is left alone rather than guessed --");
+eq("gibberish", classify("Zorble quux"), skip);
+
+console.log("\n-- input attributes, independent of the label --");
+eq("type=password", inputIsBlocked({ type: "password" }), true);
+eq("type=file", inputIsBlocked({ type: "file" }), true);
+// This test asserted `false` and passed, which is how the gap was found: cc-number is the
+// standard autocomplete token for a card number and must be refused.
+eq("autocomplete=cc-number", inputIsBlocked({ type: "text", autocomplete: "cc-number" }), true);
+eq("autocomplete=cc-csc", inputIsBlocked({ type: "text", autocomplete: "cc-csc" }), true);
+eq("autocomplete=email is fine", inputIsBlocked({ type: "text", autocomplete: "email" }), false);
+eq('"Drivers License" (no apostrophe)', classify("Drivers License"), blocked("sensitive"));
+eq('"Driving Licence" (en-GB)', classify("Driving Licence"), blocked("sensitive"));
+eq('"Driver Licence"', classify("Driver Licence"), blocked("sensitive"));
+eq("name=creditCardNumber", inputIsBlocked({ type: "text", name: "creditCardNumber" }), true);
+eq("plain text input", inputIsBlocked({ type: "text", name: "first_name" }), false);
+
+console.log("\n-- normalization --");
+eq("strips markers", normalizeLabel("  First   Name * (required) "), "first name");
+
+console.log(fail === 0 ? "\n  ALL PASSED" : `\n  ${fail} FAILED`);
+process.exit(fail ? 1 : 0);
