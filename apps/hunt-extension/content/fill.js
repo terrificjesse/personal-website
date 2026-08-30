@@ -221,9 +221,25 @@ function describePage() {
   };
 }
 
+/**
+ * Whether this frame holds anything worth filling.
+ *
+ * The script is injected into every frame, and `tabs.sendMessage` broadcasts to all of them,
+ * resolving with the first that answers. A listener returning `undefined` does not answer at
+ * all — so a frame with no fields staying silent is what makes the frame holding the form the
+ * one that replies. Without it the top frame of an embed page wins the race and reports
+ * cheerfully that it filled nothing.
+ */
+function hasFillableFields() {
+  return candidates().length > 0;
+}
+
 // The only entry point. Nothing above runs until this message arrives, and the message only
 // comes from the popup's button.
 browser.runtime.onMessage.addListener((message) => {
+  // Silence rather than a negative answer — see `hasFillableFields`.
+  if (!hasFillableFields()) return undefined;
+
   if (message?.type === "hunt-fill") {
     return Promise.resolve(fill(message.profile || {}));
   }

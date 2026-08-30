@@ -191,9 +191,21 @@ async function activeTab() {
  */
 async function injectInto(tabId) {
   const results = await browser.scripting.executeScript({
-    target: { tabId },
+    // Every frame, because the form is very often not in the top one. A Greenhouse "embed" on
+    // a company careers page — jumptrading.com/hr/job?gh_jid=… is exactly this — is an iframe
+    // pointing at boards.greenhouse.io, and the top frame holds no form at all. Injecting only
+    // there succeeds and fills nothing, which is the worst kind of working.
+    //
+    // Frames with no fillable fields stay silent (see fill.js), so the frame that answers is
+    // the one holding the form.
+    target: { tabId, allFrames: true },
     // Order matters: fill.js reads the global fields.js defines.
-    files: ["content/fields.js", "content/fill.js"],
+    //
+    // LEADING SLASHES ARE LOAD-BEARING. Firefox resolves these relative to the CALLING page,
+    // which is popup/popup.html — bare paths became `popup/content/fields.js` and failed with
+    // "Unable to load script". Chrome resolves from the extension root, so every example
+    // written against Chrome omits the slash and works there.
+    files: ["/content/fields.js", "/content/fill.js"],
   });
 
   // executeScript resolves even when the injected code threw — the failure is reported per
