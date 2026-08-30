@@ -1559,7 +1559,23 @@ pub fn decode_html_entities(text: &str) -> String {
         // scanning the rest of the string looking for a semicolon that belongs to something
         // else entirely.
         const MAX_ENTITY_BODY: usize = 12;
-        let limit = (index + 1 + MAX_ENTITY_BODY).min(bytes.len());
+        // Walk the cap back to a character boundary before slicing.
+        //
+        // `index + 1 + MAX_ENTITY_BODY` is byte arithmetic, and there is no reason for the
+        // byte it lands on to begin a character — slicing a `&str` there panics. A real
+        // Simplify title did exactly that on 2026-08-30: an `&` in
+        // "Materials Planning & Logistics – Development Programs" put the cap at byte 41,
+        // which is inside the en-dash occupying 40..43. The panic killed the whole collection
+        // task: two sources never ran, the run never finished, and the manual trigger returned
+        // an empty body.
+        //
+        // Entity bodies are ASCII, so anything multi-byte inside the window is already proof
+        // this is not an entity. Shrinking the window can only ever cost a match that was
+        // never going to happen.
+        let mut limit = (index + 1 + MAX_ENTITY_BODY).min(bytes.len());
+        while limit > index + 1 && !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
         let semicolon = text[index + 1..limit].find(';').map(|at| index + 1 + at);
 
         match semicolon.and_then(|end| decode_reference(&text[index + 1..end]).map(|ch| (ch, end)))
@@ -1615,6 +1631,41 @@ fn is_http_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact string that panicked a live collection on 2026-08-30.
+    ///
+    /// An `&` followed within twelve bytes by a multi-byte character: the entity-scan cap
+    /// lands mid-character and slicing there panics, taking the whole collection task with it.
+    /// Real data found this; no fixture had an en-dash near an ampersand.
+    #[test]
+    fn an_ampersand_near_a_multibyte_character_does_not_panic() {
+        let title = "Manager, Materials Planning & Logistics – Development Programs (R5252)";
+        assert_eq!(decode_html_entities(title), title);
+    }
+
+    /// The same shape at every offset, since which byte the cap lands on depends on where the
+    /// ampersand sits. One passing example proves only that one offset is safe.
+    #[test]
+    fn an_ampersand_at_any_distance_from_a_multibyte_character_is_safe() {
+        for gap in 0..16 {
+            let text = format!("A & {}– dash", "x".repeat(gap));
+            let decoded = decode_html_entities(&text);
+            assert!(decoded.contains('–'), "lost the dash at gap {gap}");
+        }
+        // And the same for characters wider than three bytes.
+        for gap in 0..16 {
+            let text = format!("A & {}🙂 emoji", "x".repeat(gap));
+            assert!(decode_html_entities(&text).contains('🙂'), "lost the emoji at gap {gap}");
+        }
+    }
+
+    /// The fix must not cost a real entity that happens to sit near one.
+    #[test]
+    fn a_real_entity_still_decodes_next_to_a_multibyte_character() {
+        assert_eq!(decode_html_entities("Ben &amp; Jerry — ice cream"), "Ben & Jerry — ice cream");
+        assert_eq!(decode_html_entities("&amp;–"), "&–");
+    }
+
 
     // --------------------------------------------------------------------------------------
     // Fixtures
