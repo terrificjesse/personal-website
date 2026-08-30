@@ -381,6 +381,27 @@ mod tests {
     }
 
     #[test]
+    fn an_hourly_internship_rate_survives_the_whole_pipeline() {
+        // Audit finding F1, end to end across the adapter/QC seam. Each half was correct on
+        // its own: the adapter emitted a faithful periodless string because Greenhouse has no
+        // interval field, and QC declined to guess a period below $50,000. Together they threw
+        // away every internship rate Greenhouse publishes, and no test on either side failed —
+        // the contract was only wrong *between* them.
+        let hourly = serde_json::json!({
+            "id": 1,
+            "pay_input_ranges": [{ "min_cents": 4500, "max_cents": 5500, "currency_type": "USD" }]
+        });
+        let text = pay_text(&hourly).expect("the adapter should emit pay text");
+        assert_eq!(text, "USD 45.00 - 55.00");
+
+        let parsed = crate::internships::normalize::parse_pay(&text)
+            .expect("QC must be able to read what this adapter emits");
+        assert_eq!(parsed.min, 45.0);
+        assert_eq!(parsed.max, Some(55.0));
+        assert_eq!(parsed.period, crate::internships::models::PayPeriod::Hour);
+    }
+
+    #[test]
     fn cents_are_converted_to_currency_units_not_passed_through() {
         // THE test for this adapter. `min_cents` is cents; `pay_raw` is a human-readable
         // compensation string. Passed through unconverted, `$45.00/hour` reaches QC as the
