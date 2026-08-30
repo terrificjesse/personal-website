@@ -91,3 +91,21 @@ add-on's permission grants when it is installed, so after a manifest permission 
 
 No content script, no autofill, no answer library (8f/8g), and nothing to do with Gmail
 (8a–8d). The `email` alert kind in Settings is wired through and has no producer yet.
+
+## Embedded application forms
+
+A company careers page often *embeds* the ATS rather than linking to it:
+`jumptrading.com/hr/job?gh_jid=…` renders an iframe pointing at `boards.greenhouse.io`, and the
+form lives in that iframe, not in the page you are looking at.
+
+Two settings make this work, and both default the wrong way for it:
+
+- **`all_frames: true` on the content script.** The default is `false`, which loads it only in a
+  tab's top frame — so an embedded Greenhouse form, whose URL matches perfectly, never gets it.
+- **`allFrames: true` on `scripting.executeScript`** for the `activeTab` path. Note this cannot
+  reach a *cross-origin* iframe on its own: `activeTab` grants the top-level origin only, which
+  is why the declarative match above is what actually covers the embed.
+
+If a form still will not fill, check whether it is behind an **Apply** button. Greenhouse embeds
+commonly show the job description first and only render the form after a click, and a form that
+is not in the DOM cannot be filled by anything.
