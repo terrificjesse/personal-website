@@ -180,7 +180,7 @@ pub async fn save(
     .execute(pool)
     .await?;
 
-    Ok(get(pool, &id, user_id).await?)
+    get(pool, &id, user_id).await
 }
 
 const ANSWER_COLUMNS: &str = "id, question_text, answer_text, is_company_specific,
