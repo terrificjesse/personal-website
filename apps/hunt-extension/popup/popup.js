@@ -233,8 +233,19 @@ fillButton?.addEventListener("click", async () => {
           return;
         }
       } catch (err) {
-        // Firefox refuses about:, view-source:, addons.mozilla.org and similar outright.
-        fillResultEl.textContent = `This page cannot be filled (${err.message}).`;
+        // Report what the RUNNING extension actually has, not what the manifest on disk says.
+        // A temporary add-on keeps the permission set it was installed with, so after a
+        // manifest change the two disagree — and "browser.scripting is undefined" looks like
+        // a browser problem when it is really a stale install. Putting the running permission
+        // list in the message turns a guess into a reading.
+        const granted = browser.runtime.getManifest().permissions || [];
+        const hint = granted.includes("scripting")
+          ? "the running extension does have the scripting permission, so this is not a stale install"
+          : "the running extension does NOT have the scripting permission — remove it in " +
+            "about:debugging and Load Temporary Add-on… again; Reload keeps the old grants";
+        fillResultEl.textContent =
+          `This page cannot be filled (${err.message}). ` +
+          `Running permissions: [${granted.join(", ")}] — ${hint}.`;
         return;
       }
     }
