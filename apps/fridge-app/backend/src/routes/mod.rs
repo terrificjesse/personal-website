@@ -130,7 +130,16 @@ pub fn build_router(state: AppState) -> Router {
         .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
             is_allowed_origin(&configured, origin)
         }))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PATCH])
+        // PUT joins the list for `/hunt/profile`. A method missing here is refused at the
+        // preflight, which surfaces as a failed fetch rather than as a 405 — the same
+        // "looks like the backend is down" trap the AUTHORIZATION header hit.
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+        ])
         // AUTHORIZATION is here for the extension's bearer token. Without it the preflight
         // refuses the header and the request never arrives — which looks, once again, exactly
         // like a backend that is down.
@@ -187,6 +196,10 @@ pub fn build_router(state: AppState) -> Router {
             get(hunt::list_tokens).post(hunt::create_token),
         )
         .route("/hunt/tokens/{id}", delete(hunt::revoke_token))
+        .route(
+            "/hunt/profile",
+            get(hunt::get_profile).put(hunt::put_profile),
+        )
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

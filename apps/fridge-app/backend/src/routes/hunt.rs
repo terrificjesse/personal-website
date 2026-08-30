@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::hunt::events::{self, AckOutcome, EventQuery, HuntEvent};
+use crate::hunt::profile::{self, CvProfile};
 use crate::hunt::tokens::{self, HuntToken, MAX_LABEL_LENGTH, MintedToken};
 use crate::routes::auth::CurrentUser;
 
@@ -189,4 +190,41 @@ pub async fn revoke_token(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// CV profile (Phase 8f)
+// ------------------------------------------------------------------------------------------
+
+/// This user's CV details, for the extension's autofill and the site's editor.
+///
+/// Always 200 with a profile — an empty one for a user who has never saved. "You have not
+/// filled this in" is a profile with nothing in it, not a 404, and making the client handle
+/// both shapes would buy nothing.
+pub async fn get_profile(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<CvProfile>, StatusCode> {
+    profile::get(&pool, &user.id)
+        .await
+        .map(Json)
+        .map_err(internal("reading the CV profile"))
+}
+
+/// Replace this user's CV details.
+///
+/// A full replace, not a patch: the editor sends the whole form, and a partial update could
+/// not distinguish "I cleared this field" from "I did not send this field".
+pub async fn put_profile(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<CvProfile>,
+) -> Result<Json<CvProfile>, StatusCode> {
+    let saved = profile::put(&pool, &user.id, body, Utc::now())
+        .await
+        .map_err(internal("saving the CV profile"))?;
+
+    // `None` means a field was over the length cap — a client bug, so 400 rather than a
+    // silent truncation that would put a half-written answer on a real application.
+    saved.map(Json).ok_or(StatusCode::BAD_REQUEST)
 }

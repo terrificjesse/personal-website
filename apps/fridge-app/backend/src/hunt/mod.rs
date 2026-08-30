@@ -16,4 +16,5 @@
 //! reason this is a table rather than a queue in the extension.
 
 pub mod events;
+pub mod profile;
 pub mod tokens;

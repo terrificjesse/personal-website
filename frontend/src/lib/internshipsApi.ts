@@ -506,3 +506,77 @@ export async function revokeExtensionToken(id: string): Promise<void> {
   });
   if (!res.ok) throw new Error(`Could not revoke the token (${res.status})`);
 }
+
+// ------------------------------------------------------------------------------------------
+// CV profile (Phase 8f)
+// ------------------------------------------------------------------------------------------
+
+/**
+ * The CV details the extension autofills into ATS forms.
+ *
+ * **Every field is nullable and that matters at the point of use.** `null` means "never filled
+ * in" and the autofill skips it; an empty string would be typed into the form as a blank,
+ * which looks filled to you and empty to the recruiter. The backend collapses whitespace-only
+ * input to `null` on save, so this type only ever carries real values or nothing.
+ */
+export type CvProfile = {
+  full_name: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  preferred_name: string | null;
+  email: string | null;
+  phone: string | null;
+  location: string | null;
+  school: string | null;
+  degree: string | null;
+  major: string | null;
+  gpa: string | null;
+  graduation_month: number | null;
+  graduation_year: number | null;
+  github_url: string | null;
+  linkedin_url: string | null;
+  portfolio_url: string | null;
+  work_authorization: string | null;
+  /** Three-state: `null` = not stated. Never defaulted — it is a legally meaningful answer. */
+  needs_sponsorship: boolean | null;
+  /** Shown as a reminder when a form wants a file. **Never uploaded.** */
+  resume_path: string | null;
+};
+
+export const EMPTY_CV_PROFILE: CvProfile = {
+  full_name: null,
+  first_name: null,
+  last_name: null,
+  preferred_name: null,
+  email: null,
+  phone: null,
+  location: null,
+  school: null,
+  degree: null,
+  major: null,
+  gpa: null,
+  graduation_month: null,
+  graduation_year: null,
+  github_url: null,
+  linkedin_url: null,
+  portfolio_url: null,
+  work_authorization: null,
+  needs_sponsorship: null,
+  resume_path: null,
+};
+
+export async function getCvProfile(): Promise<CvProfile> {
+  const res = await apiFetch("/hunt/profile");
+  if (!res.ok) throw new Error(`Could not load your CV profile (${res.status})`);
+  return res.json();
+}
+
+export async function saveCvProfile(profile: CvProfile): Promise<CvProfile> {
+  const res = await apiFetch("/hunt/profile", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  });
+  if (!res.ok) throw new Error(`Could not save your CV profile (${res.status})`);
+  return res.json();
+}
