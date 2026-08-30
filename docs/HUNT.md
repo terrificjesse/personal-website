@@ -186,6 +186,23 @@ which Firefox honours because it runs inside a click handler. The background pag
 `permissions.contains` first and reports the distinct `unpermitted` state instead of blaming
 the server.
 
+### The backend must name the extension's origin, and now does so by scheme
+
+`credentials: "include"` makes every extension request a **credentialed cross-origin** request,
+and the browser discards the response unless it carries an `Access-Control-Allow-Origin` naming
+the caller. `ALLOWED_ORIGINS` listed the site's origins and nothing else, so the same endpoint
+returned the header to `http://localhost:3000` and no header at all to `moz-extension://…`.
+The response reached JS as a bare `TypeError` — a third distinct cause producing the identical
+"can't reach" symptom.
+
+`routes::is_allowed_origin` now admits **any** `moz-extension://` origin alongside the
+configured list. Pinning one UUID was the tighter option and was rejected deliberately: the
+UUID is per Firefox profile, so it would mean a per-machine `.env` edit that silently breaks on
+a new profile. **The accepted cost is that any Firefox extension the user installs could call
+this API with their session cookie** — narrowed by Firefox making the user grant a host
+permission per extension, but real, and a local-development posture rather than a deployable
+one. Revisit it with the other three items in `docs/PLAN.md` § After Phase 5.
+
 ### The failure modes, kept distinct
 
 They all present as "no notifications" and have completely different fixes, so each is a
@@ -194,6 +211,7 @@ separate stored state rather than one "error":
 | State | Meaning | Fix |
 |---|---|---|
 | `unpermitted` | the origin is requested but not granted | Test connection, and accept the prompt |
+| *discarded response* | no CORS header for this origin | the backend must allow it — fixed by the scheme rule above |
 | `unreachable` | the request left and got nothing back | start the backend |
 | `unauthenticated` | reachable, 401 | sign in on the site — **or this is the SameSite problem** |
 | `error` | reachable, unexpected status | read the status code |
