@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::hunt::events::{self, AckOutcome, EventQuery, HuntEvent};
+use crate::hunt::answers::{self, Answer, NewAnswer, Suggestion};
 use crate::hunt::profile::{self, CvProfile};
 use crate::hunt::tokens::{self, HuntToken, MAX_LABEL_LENGTH, MintedToken};
 use crate::routes::auth::CurrentUser;
@@ -348,4 +349,175 @@ pub async fn posting_for_page(
         title: details.map(|d| d.1),
         already_tracked: already_tracked.is_some(),
     }))
+}
+
+// ------------------------------------------------------------------------------------------
+// The answer library (Phase 8g)
+// ------------------------------------------------------------------------------------------
+
+/// How many suggestions a lookup returns when the caller doesn't say. Small on purpose: this
+/// is a list you read, and a long one turns choosing into skimming — which is the behaviour
+/// the whole company-specific guard exists to protect you from.
+const DEFAULT_SUGGESTION_LIMIT: usize = 5;
+const MAX_SUGGESTION_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnswersQuery {
+    /// The question being asked. Omit to list everything instead of ranking.
+    pub q: Option<String>,
+    /// The employer whose form this is. **Materially changes the result**: without it, an
+    /// answer written for a specific company is never offered, because we cannot tell whether
+    /// this is that company.
+    pub company: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// Two shapes from one route: ranked suggestions when `q` is given, the whole library when not.
+///
+/// Deliberately not two endpoints. The caller's question is "what do I have for this?", and
+/// "everything" is the answer when there is no particular question — splitting it would make
+/// the client decide which to call before it knows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum AnswersResponse {
+    Ranked { suggestions: Vec<Suggestion> },
+    All { answers: Vec<Answer> },
+}
+
+pub async fn list_answers(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Query(params): Query<AnswersQuery>,
+) -> Result<Json<AnswersResponse>, StatusCode> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SUGGESTION_LIMIT)
+        .min(MAX_SUGGESTION_LIMIT);
+
+    match params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(question) => {
+            let suggestions = answers::suggest(
+                &pool,
+                &user.id,
+                question,
+                params.company.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(internal("suggesting answers"))?;
+            Ok(Json(AnswersResponse::Ranked { suggestions }))
+        }
+        None => {
+            let all = answers::list(&pool, &user.id)
+                .await
+                .map_err(internal("listing answers"))?;
+            Ok(Json(AnswersResponse::All { answers: all }))
+        }
+    }
+}
+
+/// Save an answer. 400 if a field is empty or over its cap.
+pub async fn create_answer(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<NewAnswer>,
+) -> Result<(StatusCode, Json<Answer>), StatusCode> {
+    answers::save(&pool, &user.id, body, Utc::now())
+        .await
+        .map_err(internal("saving an answer"))?
+        .map(|answer| (StatusCode::CREATED, Json(answer)))
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditAnswerRequest {
+    pub answer_text: String,
+}
+
+/// Replace an answer's text, keeping the previous version.
+pub async fn edit_answer(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Json(body): Json<EditAnswerRequest>,
+) -> Result<Json<Answer>, StatusCode> {
+    // `None` covers both "no such answer" and "the text was empty or too long". They are
+    // different, so ask which before answering.
+    match answers::edit(&pool, &id, &user.id, &body.answer_text, Utc::now())
+        .await
+        .map_err(internal("editing an answer"))?
+    {
+        Some(answer) => Ok(Json(answer)),
+        None => {
+            let exists = answers::get(&pool, &id, &user.id)
+                .await
+                .map_err(internal("reading an answer"))?;
+            Err(if exists.is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::NOT_FOUND
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionsResponse {
+    pub revisions: Vec<AnswerRevision>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnswerRevision {
+    pub replaced_at: DateTime<Utc>,
+    pub answer_text: String,
+}
+
+/// Previous versions, newest first — so a rewrite you regret is recoverable.
+pub async fn answer_revisions(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<RevisionsResponse>, StatusCode> {
+    let rows = answers::revisions(&pool, &id, &user.id)
+        .await
+        .map_err(internal("reading answer revisions"))?;
+
+    Ok(Json(RevisionsResponse {
+        revisions: rows
+            .into_iter()
+            .map(|(replaced_at, answer_text)| AnswerRevision { replaced_at, answer_text })
+            .collect(),
+    }))
+}
+
+/// Record that an answer was actually used. Separate from being suggested, deliberately: a
+/// suggestion you ignored is not evidence the answer is any good.
+pub async fn use_answer(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if answers::mark_used(&pool, &id, &user.id, Utc::now())
+        .await
+        .map_err(internal("recording answer use"))?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+pub async fn delete_answer(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if answers::delete(&pool, &id, &user.id)
+        .await
+        .map_err(internal("deleting an answer"))?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }

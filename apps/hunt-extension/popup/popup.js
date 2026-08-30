@@ -436,3 +436,158 @@ void (async () => {
   const tab = await activeTab();
   if (tab) await offerTracking(tab.id).catch(() => {});
 })();
+
+
+// ------------------------------------------------------------------------------------------
+// The answer library (Phase 8g)
+// ------------------------------------------------------------------------------------------
+
+/*
+ * Retrieval, and nothing more. The extension never writes an answer into a form on its own and
+ * never generates one: free-text answers are the part of an application that is actually you,
+ * and a stale answer about a project you no longer care about is worse than an empty box
+ * because you will not notice it. So this surfaces what you have written before, and inserting
+ * one takes a click on that specific answer.
+ *
+ * The company is passed to the backend on every lookup and it matters: an answer written for
+ * one employer is never offered to another. "Why do you want to work at X" reads as the same
+ * question everywhere, which is exactly what makes reusing it verbatim so costly.
+ */
+
+const answersButton = document.getElementById("answers");
+const answerListEl = document.getElementById("answerList");
+const saveAnswersButton = document.getElementById("saveAnswers");
+const answerResultEl = document.getElementById("answerResult");
+
+/** The company this form belongs to, so the reuse guard can do its job. */
+async function companyForPage(tabId) {
+  const found = await identifyPage(tabId);
+  return found?.known?.company_name || found?.page?.company || null;
+}
+
+async function questionsOnPage(tabId) {
+  try {
+    const reply = await browser.tabs.sendMessage(tabId, { type: "hunt-questions" });
+    return reply?.questions || [];
+  } catch {
+    return [];
+  }
+}
+
+function renderSuggestions(tabId, question, suggestions) {
+  const heading = document.createElement("div");
+  heading.className = "question";
+  heading.textContent = question.question;
+  answerListEl.append(heading);
+
+  if (suggestions.length === 0) {
+    const none = document.createElement("div");
+    none.className = "none";
+    none.textContent = "nothing close enough — and a weak match is worse than none";
+    answerListEl.append(none);
+    return;
+  }
+
+  for (const suggestion of suggestions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "suggestion";
+    // The stored answer, trimmed for the button. Built with textContent, never innerHTML.
+    button.textContent = suggestion.answer_text.slice(0, 140);
+    button.addEventListener("click", async () => {
+      const result = await browser.tabs.sendMessage(tabId, {
+        type: "hunt-insert",
+        key: question.key,
+        text: suggestion.answer_text,
+      });
+      if (!result?.ok) {
+        answerResultEl.textContent = result?.reason || "could not insert that";
+        return;
+      }
+      answerResultEl.textContent = "Inserted — edit it before you send.";
+      // Used, not merely shown. A suggestion you ignored says nothing about the answer.
+      const config = await settings();
+      const base = config.backendUrl.replace(/\/+$/, "");
+      await fetch(`${base}/hunt/answers/${encodeURIComponent(suggestion.id)}/used`, {
+        method: "POST",
+        credentials: "include",
+        headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
+      }).catch(() => {});
+    });
+    answerListEl.append(button);
+  }
+}
+
+answersButton?.addEventListener("click", async () => {
+  answerListEl.replaceChildren();
+  answerResultEl.textContent = "Looking…";
+
+  const tab = await activeTab();
+  if (!tab) return;
+
+  const found = await questionsOnPage(tab.id);
+  if (found.length === 0) {
+    answerResultEl.textContent = "No free-text questions found on this page.";
+    return;
+  }
+
+  const company = await companyForPage(tab.id);
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+  const auth = config.token ? { Authorization: `Bearer ${config.token}` } : {};
+
+  for (const question of found) {
+    const url =
+      `${base}/hunt/answers?q=${encodeURIComponent(question.question)}` +
+      (company ? `&company=${encodeURIComponent(company)}` : "");
+    try {
+      const res = await fetch(url, { credentials: "include", headers: auth });
+      if (!res.ok) continue;
+      const body = await res.json();
+      renderSuggestions(tab.id, question, body.suggestions || []);
+    } catch {
+      // One question failing should not lose the others.
+    }
+  }
+
+  answerResultEl.textContent = `${found.length} question(s) on this form.`;
+  // Offered only once there is something to save from.
+  saveAnswersButton.hidden = !found.some((q) => q.value.trim().length > 0);
+});
+
+saveAnswersButton?.addEventListener("click", async () => {
+  answerResultEl.textContent = "Saving…";
+  const tab = await activeTab();
+  if (!tab) return;
+
+  const found = (await questionsOnPage(tab.id)).filter((q) => q.value.trim().length > 0);
+  const company = await companyForPage(tab.id);
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+
+  let saved = 0;
+  for (const question of found) {
+    try {
+      const res = await fetch(`${base}/hunt/answers`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          ...(config.token ? { Authorization: `Bearer ${config.token}` } : {}),
+        },
+        // The company travels with it, which is what lets the backend decide this answer is
+        // about a particular employer and refuse to offer it elsewhere.
+        body: JSON.stringify({
+          question_text: question.question,
+          answer_text: question.value,
+          company_name: company,
+        }),
+      });
+      if (res.ok) saved += 1;
+    } catch {
+      // Keep going; a partial save is better than none and nothing is lost by retrying.
+    }
+  }
+  answerResultEl.textContent = `Saved ${saved} of ${found.length}.`;
+  saveAnswersButton.hidden = true;
+});

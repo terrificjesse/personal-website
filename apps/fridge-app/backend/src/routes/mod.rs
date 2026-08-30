@@ -201,6 +201,16 @@ pub fn build_router(state: AppState) -> Router {
             get(hunt::get_profile).put(hunt::put_profile),
         )
         .route("/hunt/posting-for", get(hunt::posting_for_page))
+        .route(
+            "/hunt/answers",
+            get(hunt::list_answers).post(hunt::create_answer),
+        )
+        .route(
+            "/hunt/answers/{id}",
+            patch(hunt::edit_answer).delete(hunt::delete_answer),
+        )
+        .route("/hunt/answers/{id}/revisions", get(hunt::answer_revisions))
+        .route("/hunt/answers/{id}/used", post(hunt::use_answer))
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

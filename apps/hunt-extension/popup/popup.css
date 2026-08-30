@@ -126,3 +126,35 @@ footer a {
 .autofill .meta {
   margin: 0.35rem 0 0;
 }
+
+.answers {
+  margin-top: 0.4rem;
+}
+
+.answers .question {
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+
+.answers .suggestion {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-top: 0.25rem;
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.answers .suggestion:hover {
+  border-color: var(--accent);
+}
+
+.answers .none {
+  color: var(--muted);
+  font-size: 0.9em;
+}

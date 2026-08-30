@@ -204,6 +204,62 @@ function fill(profile) {
 }
 
 /**
+ * The free-text questions on this page that the mapper does not answer.
+ *
+ * These are the boxes the answer library is for: "tell us about a project", "why this role" —
+ * the parts of an application that are actually you, which no CV profile can fill. A field the
+ * mapper *does* handle is excluded, because a suggestion for your email address is noise.
+ *
+ * Each is tagged with a `data-hunt-q` so a later insert can find the same element without
+ * relying on an index that a re-render could invalidate.
+ */
+function questions() {
+  const { classify } = fields();
+  const found = [];
+
+  for (const element of candidates()) {
+    const isFreeText =
+      element instanceof HTMLTextAreaElement ||
+      (element instanceof HTMLInputElement &&
+        (element.getAttribute("type") || "text").toLowerCase() === "text");
+    if (!isFreeText) continue;
+
+    const label = labelFor(element);
+    const verdict = classify(label);
+    // Blocked stays blocked here too: a sensitive field is not a "question" to collect
+    // answers for, and neither is one the profile already covers.
+    if (verdict.kind !== "skip") continue;
+
+    const text = (label || "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+
+    // A textarea is always a question. A text input usually is not — "Company Name" and
+    // "Current company" are short factual boxes, and offering a stored essay for them is
+    // noise that makes the real suggestions harder to see. So a text input has to look like a
+    // question: it asks one, or it is long enough to be a prompt rather than a field name.
+    // Greenhouse's "Non-compete/Notice period comments" is a text input and a real question,
+    // which is why length is a signal and not just the tag.
+    const looksLikeAQuestion =
+      element instanceof HTMLTextAreaElement || text.includes("?") || text.length > 25;
+    if (!looksLikeAQuestion) continue;
+
+    const key = element.getAttribute("data-hunt-q") || String(found.length);
+    element.setAttribute("data-hunt-q", key);
+    found.push({ key, question: text, value: element.value || "" });
+  }
+
+  return found;
+}
+
+/** Put a chosen answer into the box it was chosen for. */
+function insertAnswer(key, text) {
+  const element = document.querySelector(`[data-hunt-q="${CSS.escape(key)}"]`);
+  if (!element) return { ok: false, reason: "that field is no longer on the page" };
+  setNativeValue(element, text);
+  return { ok: true };
+}
+
+/**
  * What this page appears to be an application for.
  *
  * A guess, and labelled as one: the popup shows it and you confirm before anything is written.
@@ -265,6 +321,16 @@ browser.runtime.onMessage.addListener((message) => {
   // listener returning `undefined` does not respond at all, so the frame holding the form wins
   // the broadcast rather than the empty top frame of an embed page.
   if (!hasFillableFields()) return undefined;
+
+  if (message?.type === "hunt-questions") {
+    return Promise.resolve({ questions: questions() });
+  }
+
+  if (message?.type === "hunt-insert") {
+    // Writes into the form, and only ever with text the user just clicked. Rule 12: nothing
+    // is inserted without a pick, and nothing here generates anything.
+    return Promise.resolve(insertAnswer(message.key, message.text));
+  }
 
   if (message?.type === "hunt-fill") {
     return Promise.resolve(fill(message.profile || {}));
