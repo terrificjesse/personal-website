@@ -1,0 +1,18 @@
+-- Which file a file-sourced blog post came from.
+--
+-- Added because the mirror sweep in `blog_files::sync` inferred "this file is gone" from
+-- "this file did not parse". It matched rows against the slugs of *successfully parsed*
+-- files, so a typo in the frontmatter of a live post deleted the post outright — and
+-- repairing the typo reinserted it under a fresh UUID, silently rotating its primary key.
+--
+-- Recording the filename makes the sweep's question answerable without parsing: a row is
+-- deleted only when its file is genuinely absent from the directory. A file that is present
+-- but broken keeps its post, and the parse failure is reported as a skip instead.
+--
+-- Slug alone could not carry this, because frontmatter may override the slug — a broken file
+-- with an explicit `slug:` cannot be matched back to its row at all once it stops parsing.
+--
+-- NULL means "not a file post", or "a file post written before this migration". The sweep
+-- falls back to the old slug matching for NULLs so upgrading deletes nothing; the next sync
+-- backfills them.
+ALTER TABLE blog_posts ADD COLUMN source_path TEXT;

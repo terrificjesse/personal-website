@@ -38,11 +38,16 @@ async fn main() -> anyhow::Result<()> {
     // Reconcile the blog with the markdown files in content/blog/. Deliberately not fatal:
     // the blog falling back to database-only posts shouldn't stop the fridge app from serving.
     match blog_files::sync(&pool).await {
-        Ok(report) if report == blog_files::SyncReport::default() => {}
-        Ok(report) => println!(
+        Ok(blog_files::SyncOutcome::Completed(report))
+            if report == blog_files::SyncReport::default() => {}
+        Ok(blog_files::SyncOutcome::Completed(report)) => println!(
             "blog sync: {} created, {} updated, {} deleted, {} skipped",
             report.created, report.updated, report.deleted, report.skipped
         ),
+        // Not a failure: the watcher will retry, so this is a state to report, not swallow.
+        Ok(blog_files::SyncOutcome::Deferred(reason)) => {
+            println!("blog sync: waiting — {reason}")
+        }
         Err(err) => eprintln!("blog sync failed, serving database posts only: {err:?}"),
     }
 

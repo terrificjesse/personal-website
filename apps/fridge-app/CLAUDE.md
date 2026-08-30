@@ -14,7 +14,8 @@ All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recomme
 writing them. Every phase was verified against real data, not just fixtures; the per-phase
 evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **141 passed, 0 failed**, clippy clean.
+`cargo test`: **635 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
+Phase 7 work from a parallel session plus the blog stress-test suite.)
 
 **Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
 statistics; weighting personal vs. global feedback in `rerank`); rate limiting on
@@ -150,8 +151,12 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   `fetch_visible_to` (own + public). **Picking the wrong one leaks a stranger's review into a
   personal view.**
 - `src/blog_files.rs` — `[gen]` markdown-file ingestion for the blog. Hand-rolled frontmatter
-  parser (no crate), `sync` (mirrors `content/blog/*.md` into `blog_posts`), and
+  parser (no crate), `sync`/`sync_in` (mirrors `content/blog/*.md` into `blog_posts`), and
   `spawn_watcher` (polls a `(name, mtime, size)` fingerprint every `BLOG_SYNC_INTERVAL_SECS`).
+  **Two invariants a 2026-08-30 stress test had to install — don't undo them:** the sweep
+  deletes on *file absence* (`source_path`, migration `0016`), never on parse failure; and
+  `watch_tick` advances its fingerprint only on `SyncOutcome::Completed`, never on `Deferred`.
+  Both bugs were the same mistake — treating "I looked" as "I succeeded".
   Read its module doc before changing it — the filename-not-title slug rule and the
   frontmatter-not-mtime date rule both look like details and are not.
   **`is_post_file` is deliberately shared** by the reader and the watcher; let those two drift
@@ -299,7 +304,14 @@ land immediately.
 - `auth::require_admin` is implemented (by the user, in the `[learn]` file `src/auth.rs`) —
   `Ok(())` when `is_admin`, else `Err(AuthError::Forbidden)` → **403**. Its doc comment is
   **stale**, still calling itself an unimplemented placeholder; leave it for the user to fix.
-- **Phase 6 is done.** Markdown rendering (frontend `react-markdown`), `?sort=`, `?q=`, and
+- **Validation lives in `models.rs`, once.** `exceeds_char_limit` (limits are **characters**;
+  `str::len()` is bytes and silently punished non-ASCII) and `is_blank` (empty-or-whitespace,
+  used to validate only — bodies are stored verbatim). Both exist because the same rule was
+  written twice, in the API path and the file path, and the copies drifted. **Add a call, not
+  a fifth copy.**
+- **Phase 6 is done, and was stress-tested on 2026-08-30** — five real bugs, all fixed; see
+  `docs/BLOG.md` § "Adversarial stress test" for the list and the two refuted hypotheses.
+  Markdown rendering (frontend `react-markdown`), `?sort=`, `?q=`, and
   `content/blog/*.md` ingestion all landed 2026-08-19. Two rules worth not rediscovering:
   file-sourced posts answer `PATCH`/`DELETE` with **409** (the next sync would overwrite the
   edit), and **there is no branch on `source` in the read path** — `list_posts` is one query
@@ -399,7 +411,11 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
+2. **Finish the blog stress test.** H8 (long tokens may overflow the post body) and H9 (a
+   failed search leaves stale results on screen) are found-but-unfixed, and the untested areas
+   — concurrency, sync × API interleaving, frontmatter fuzzing, and **no pagination on
+   `/blog/posts`** — are unexplored. `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
+3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.
 

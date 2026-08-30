@@ -309,6 +309,35 @@ pub struct UpdateBlogPostRequest {
 pub const MAX_BLOG_TITLE_LENGTH: usize = 200;
 pub const MAX_BLOG_BODY_LENGTH: usize = 100_000;
 
+/// Whether `text` is longer than `max` **characters**.
+///
+/// Exists because `str::len()` is a byte count, and using it here silently made the limits
+/// stricter for anyone not writing in ASCII: a 200-character CJK title is 600 bytes and was
+/// rejected, despite `docs/BLOG.md` documenting the limit in characters. The limits are a
+/// contract with the author about how much they may write, so characters is the honest unit.
+///
+/// `chars()` counts Unicode scalar values, not grapheme clusters — a family emoji or a
+/// combining accent still costs more than one. That is a far smaller discrepancy than
+/// bytes-vs-chars, and closing it would mean a dependency for a limit nobody writes up
+/// against.
+pub fn exceeds_char_limit(text: &str, max: usize) -> bool {
+    text.chars().count() > max
+}
+
+/// Whether `text` is empty or contains nothing but whitespace.
+///
+/// Named and shared because the two ingest paths disagreed: `create_post` tested
+/// `is_empty()`, so a body of `"   "` was a valid post through the API, while the file path
+/// tested `trim().is_empty()` and rejected the same content. The same post was simultaneously
+/// legal and illegal depending on how it arrived.
+///
+/// Only ever used to *validate*. The body is stored exactly as written — trimming it here
+/// would silently rewrite an author's markdown, and leading whitespace is significant to an
+/// indented code block.
+pub fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 /// Turns a title into a URL-safe slug: lowercased, runs of non-alphanumeric characters
 /// collapsed to a single hyphen, no leading or trailing hyphen. Not unique by itself — see
 /// `routes/blog.rs::unique_slug` for the collision handling a plain function can't do.
@@ -393,6 +422,42 @@ mod tests {
     // and that is decided by the derive, not by the wire format.
     fn parse_sort(value: &str) -> Result<SortOrder, serde_json::Error> {
         serde_json::from_value(serde_json::Value::String(value.to_string()))
+    }
+
+    #[test]
+    fn blankness_covers_every_flavour_of_whitespace() {
+        assert!(is_blank(""));
+        assert!(is_blank("   "));
+        assert!(is_blank("\t\n\r\n  "));
+        assert!(is_blank("\u{00a0}"), "a non-breaking space is still blank");
+
+        assert!(!is_blank("a"));
+        assert!(!is_blank("  a  "));
+    }
+
+    #[test]
+    fn limits_are_measured_in_characters_not_bytes() {
+        let ascii = "a".repeat(MAX_BLOG_TITLE_LENGTH);
+        let cjk = "字".repeat(MAX_BLOG_TITLE_LENGTH);
+
+        assert!(
+            cjk.len() > MAX_BLOG_TITLE_LENGTH,
+            "premise: bytes exceed chars"
+        );
+        assert!(!exceeds_char_limit(&ascii, MAX_BLOG_TITLE_LENGTH));
+        assert!(
+            !exceeds_char_limit(&cjk, MAX_BLOG_TITLE_LENGTH),
+            "a non-ASCII title at exactly the limit is within it"
+        );
+
+        assert!(exceeds_char_limit(
+            &"a".repeat(MAX_BLOG_TITLE_LENGTH + 1),
+            MAX_BLOG_TITLE_LENGTH
+        ));
+        assert!(exceeds_char_limit(
+            &"字".repeat(MAX_BLOG_TITLE_LENGTH + 1),
+            MAX_BLOG_TITLE_LENGTH
+        ));
     }
 
     #[test]

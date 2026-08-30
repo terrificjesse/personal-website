@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::blog_files::{self, SyncReport};
 use crate::models::{
     BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, CreateBlogPostRequest, ListPostsQuery,
-    MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, slugify,
+    MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, exceeds_char_limit,
+    is_blank, slugify,
 };
 use crate::routes::auth::{MaybeUser, RequireAdmin};
 
@@ -167,10 +168,10 @@ pub async fn create_post(
     Json(req): Json<CreateBlogPostRequest>,
 ) -> Result<(StatusCode, Json<BlogPost>), StatusCode> {
     let title = req.title.trim();
-    if title.is_empty() || title.len() > MAX_BLOG_TITLE_LENGTH {
+    if is_blank(title) || exceeds_char_limit(title, MAX_BLOG_TITLE_LENGTH) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if req.body.is_empty() || req.body.len() > MAX_BLOG_BODY_LENGTH {
+    if is_blank(&req.body) || exceeds_char_limit(&req.body, MAX_BLOG_BODY_LENGTH) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -239,13 +240,13 @@ pub async fn update_post(
 
     if let Some(title) = req.title {
         let title = title.trim().to_string();
-        if title.is_empty() || title.len() > MAX_BLOG_TITLE_LENGTH {
+        if is_blank(&title) || exceeds_char_limit(&title, MAX_BLOG_TITLE_LENGTH) {
             return Err(StatusCode::BAD_REQUEST);
         }
         post.title = title;
     }
     if let Some(body) = req.body {
-        if body.is_empty() || body.len() > MAX_BLOG_BODY_LENGTH {
+        if is_blank(&body) || exceeds_char_limit(&body, MAX_BLOG_BODY_LENGTH) {
             return Err(StatusCode::BAD_REQUEST);
         }
         post.body = body;
@@ -308,9 +309,12 @@ pub async fn sync_posts(
     State(pool): State<SqlitePool>,
     RequireAdmin(_user): RequireAdmin,
 ) -> Result<Json<SyncReport>, StatusCode> {
+    // `RequireAdmin` guarantees an admin exists, so the no-admin deferral is unreachable from
+    // this route; `report()` flattens any other deferral to zeros, which is what it did before.
     let report = blog_files::sync(&pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .report();
 
     Ok(Json(report))
 }
