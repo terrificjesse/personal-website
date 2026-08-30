@@ -672,11 +672,7 @@ reading `applied` for a job you already interviewed at.
 - [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
   table, which 8e built.
 - [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
-- [gen] **8f — Autofill.** Content script, label-based field mapper, `cv_profile`, and the
-  "track this application" offer that creates the tracker row from a page you actually applied
-  on. *Checkpoint:* fill a real Greenhouse, Lever and Ashby form **without submitting any of
-  them**; React-controlled inputs keep their values after a re-render; nothing fires on page
-  load and no EEO field is touched.
+- [gen] **8f — Autofill. — filling verified 2026-08-30**
 - [gen] **8g — The answer library.** Save answers, similarity retrieval, company-specific
   flagging. *Checkpoint:* a "why do you want to work here" answer stored against one company is
   **not** offered for another, and a genuinely reusable one ("a project you're proud of") is.
@@ -757,6 +753,41 @@ discarded before the extension could read them. **The durable fix is that all fo
 themselves distinctly** — `unpermitted`, `unreachable`, `no-token`, `token-rejected` — because
 one message covering four unrelated causes is what turned a ten-minute check into a day. 8f
 authenticates identically and inherits the diagnosis rather than the search.
+
+### 8f — the three ATSs fill, 2026-08-30
+
+Content script, label-based mapper, `cv_profile`, the `activeTab` path and the
+"track this application" offer. Full reference: `docs/HUNT.md`.
+
+**All three checkpoint ATSs fill from a real posting**, including the hardest variant: the
+Greenhouse one was reached through a *company careers page* (`jumptrading.com/hr/job?gh_jid=…`)
+that embeds `job-boards.greenhouse.io` in an iframe, exercising `activeTab`, cross-frame
+injection and frame selection at once. Lever and Ashby are direct ATS pages on the declarative
+path.
+
+**Reading the live forms before filling them found three defects a synthetic form could not**,
+and one was in the safety layer:
+
+- **The demographic blocklist silently failed on Lever.** It renders a `<select>`'s option text
+  into the label with no separator, so "Gender" arrives as `GenderSelect ...MaleFemale…` —
+  normalized `genderselect`, and `\bgender\b` never fires. Race the same. Veteran status was
+  caught *only* because its pattern happens to lack a word boundary, which is what made the
+  failure look like success. Refusal checks now also see the label with run-together words
+  split; matching deliberately does not, since the same split breaks `LinkedIn` and `GitHub`.
+- **"Other website" was filled with the portfolio URL**, and sits beside "Portfolio URL" on
+  Lever — one URL in two different questions.
+- **Ashby labels its name field simply "Name"**, which was excluded on purpose because it
+  matches inside "Company Name". Now an exact-only match, with tests holding that line.
+
+CAPTCHA fields are also refused outright: Ashby renders a real `g-recaptcha-response` textarea
+into the form. Nothing mapped to it, but "nothing happens to match" is not a policy and rule 11
+is.
+
+Every label from all three live forms is now a test — 79 checks against markup that exists.
+
+**Still to confirm by eye**, and deliberately not claimed here: that React-controlled values
+survive a re-render, and that nothing fires on page load. Both are checkpoint clauses; neither
+is provable from the classifier or from a form filled once.
 
 ### Open questions
 
