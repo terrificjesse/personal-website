@@ -25,6 +25,17 @@
       </label>
 
       <label>
+        Access token
+        <input id="token" type="password" autocomplete="off" spellcheck="false" />
+        <small>
+          From the site: sign in, then generate one under <b>Extension access</b>. The session
+          cookie cannot reach an extension — Firefox will not send a <code>SameSite=Lax</code>
+          cookie from a <code>moz-extension://</code> page — so this is how the backend knows
+          who you are. Shown once when created; generate a new one if you lose it.
+        </small>
+      </label>
+
+      <label>
         Check every
         <input id="pollMinutes" type="number" min="1" max="1440" step="1" required />
         <small>Minutes. Firefox will not run an alarm more often than once a minute.</small>

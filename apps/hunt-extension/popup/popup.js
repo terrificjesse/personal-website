@@ -12,7 +12,7 @@ const CACHE_KEY = "recentEvents";
 const STATUS_KEY = "status";
 const LIST_LIMIT = 25;
 
-const DEFAULTS = { backendUrl: "http://localhost:8080", siteUrl: "http://localhost:3000" };
+const DEFAULTS = { backendUrl: "http://localhost:8080", siteUrl: "http://localhost:3000", token: "" };
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("events");
@@ -83,6 +83,7 @@ async function load() {
     const base = config.backendUrl.replace(/\/+$/, "");
     response = await fetch(`${base}/hunt/events?include_acked=true&limit=${LIST_LIMIT}`, {
       credentials: "include",
+      headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
     });
   } catch (err) {
     // Same trap as the options page: an ungranted host permission and a dead backend both
@@ -106,7 +107,12 @@ async function load() {
   }
 
   if (response.status === 401) {
-    return say("Not signed in. Open the site, log in, then check again.", true);
+    return say(
+      config.token
+        ? "Access token rejected — generate a new one on the site."
+        : "No access token. Open Settings for how to get one.",
+      true,
+    );
   }
   if (response.status === 403) {
     return say("The backend refused the request.", true);

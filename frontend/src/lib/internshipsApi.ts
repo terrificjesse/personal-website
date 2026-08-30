@@ -459,3 +459,50 @@ export function daysUntil(value: string | null, now = new Date()): number | null
   if (Number.isNaN(parsed.getTime())) return null;
   return Math.ceil((parsed.getTime() - now.getTime()) / 86_400_000);
 }
+
+// ------------------------------------------------------------------------------------------
+// Extension access tokens (Phase 8e)
+// ------------------------------------------------------------------------------------------
+
+/**
+ * A token the Firefox extension authenticates with.
+ *
+ * The extension cannot use the session cookie: it is `SameSite=Lax`, and a request from a
+ * `moz-extension://` page is cross-site, so Firefox never attaches it. These are the fallback
+ * `apps/hunt-extension/CLAUDE.md` names, and they exist only because that was tried first.
+ */
+export type ExtensionToken = {
+  id: string;
+  label: string;
+  created_at: string;
+  /** `null` until the extension has actually used it — an unused token is visibly unused. */
+  last_used_at: string | null;
+};
+
+/** A freshly minted token. `secret` is returned **once** and is never recoverable. */
+export type MintedExtensionToken = ExtensionToken & { secret: string };
+
+export async function listExtensionTokens(): Promise<ExtensionToken[]> {
+  const res = await apiFetch("/hunt/tokens");
+  if (!res.ok) throw new Error(`Could not load extension tokens (${res.status})`);
+  return res.json();
+}
+
+export async function createExtensionToken(
+  label: string,
+): Promise<MintedExtensionToken> {
+  const res = await apiFetch("/hunt/tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label }),
+  });
+  if (!res.ok) throw new Error(`Could not create a token (${res.status})`);
+  return res.json();
+}
+
+export async function revokeExtensionToken(id: string): Promise<void> {
+  const res = await apiFetch(`/hunt/tokens/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`Could not revoke the token (${res.status})`);
+}

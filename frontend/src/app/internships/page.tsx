@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { PostingCard } from "./PostingCard";
 import { CollectionStatus } from "./CollectionStatus";
+import { ExtensionAccess } from "./ExtensionAccess";
 import { useApiError } from "@/lib/useApiError";
 import {
   createApplication,
@@ -271,6 +272,10 @@ export default function InternshipsPage() {
       </section>
 
       <CollectionStatus onUpdate={refresh} />
+
+      <div className="mt-4">
+        <ExtensionAccess />
+      </div>
 
       {error && (
         <p className="mt-4 rounded border border-red-500/40 bg-red-500/5 px-3 py-2 text-sm text-red-700 dark:text-red-400">

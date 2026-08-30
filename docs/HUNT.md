@@ -165,7 +165,35 @@ page arrives before anything is listening.
 **Notify, then ack — in that order.** At-least-once, deliberately. A failed ack costs a
 duplicate notification; acking first would cost a silently dropped alert.
 
-## Auth: the site's own session cookie
+## Auth: a bearer token, because the cookie cannot get there
+
+**The cookie was tried first and it does not work.** `fridge_session` is `SameSite=Lax`, a
+request from a `moz-extension://` page is cross-site, and Firefox therefore never attaches it.
+The backend saw an anonymous request and answered 401 while the user was demonstrably signed
+in on the site. That is the fallback condition `apps/hunt-extension/CLAUDE.md` anticipated.
+
+`hunt_tokens` (migration `0015`) holds SHA-256 hashes of long-lived bearer tokens. Minted from
+the site's **Extension access** panel on the internships tab, pasted into the extension's
+Settings, sent as `Authorization: Bearer …`.
+
+**This is a second credential, not a second auth system**, and the difference is what keeps the
+8e constraint honest:
+
+- Hashing and generation are `auth::session_token_hash` / `auth::generate_session_token` —
+  **called, never modified**; `src/auth.rs` is a `[learn]` file. One definition of "hash a
+  bearer credential" rather than two that drift.
+- The token is accepted inside the existing `MaybeUser` extractor, so every route keeps its
+  `CurrentUser` signature and **no route knows tokens exist**. A token is exactly as powerful
+  as a session and no more.
+- Minting requires being signed in already, so this widens how you prove who you are, never
+  who you can be.
+
+**No expiry column, deliberately.** A session expires because it rides in a browser you walk
+away from; this is a device credential, and a clock nobody watches would silently stop the
+notifier weeks later — a failure indistinguishable from a quiet job market. The control is
+revocation, which is explicit and visible.
+
+## The auth path that did not work, kept for the record
 
 `host_permissions` for the backend origin plus `fetch(..., { credentials: "include" })` puts the
 ordinary `fridge_session` cookie on the request. Signed in on the site means signed in in the

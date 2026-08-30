@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::hunt::events::{self, AckOutcome, EventQuery, HuntEvent};
+use crate::hunt::tokens::{self, HuntToken, MAX_LABEL_LENGTH, MintedToken};
 use crate::routes::auth::CurrentUser;
 
 /// How many events one poll returns when the caller doesn't say.
@@ -124,5 +125,68 @@ fn internal(context: &'static str) -> impl Fn(anyhow::Error) -> StatusCode {
     move |err| {
         eprintln!("hunt: {context} failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Extension tokens
+// ------------------------------------------------------------------------------------------
+
+/// Minting requires a **cookie** session by construction.
+///
+/// `CurrentUser` accepts a bearer token too, so in principle a token could mint another token.
+/// That is fine and deliberately not prevented: it grants nothing the caller does not already
+/// have, and blocking it would mean a second notion of "how did you authenticate" leaking into
+/// route signatures — the thing keeping this one auth system rather than two.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateTokenRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Mint a token. **The secret is in this response and nowhere else, ever.**
+pub async fn create_token(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<MintedToken>), StatusCode> {
+    let label = body.label.unwrap_or_default();
+    if label.len() > MAX_LABEL_LENGTH {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let minted = tokens::mint(&pool, &user.id, &label, Utc::now())
+        .await
+        .map_err(internal("minting a hunt token"))?;
+
+    Ok((StatusCode::CREATED, Json(minted)))
+}
+
+/// This user's live tokens. Carries labels and usage, never secrets.
+pub async fn list_tokens(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<Vec<HuntToken>>, StatusCode> {
+    tokens::list(&pool, &user.id)
+        .await
+        .map(Json)
+        .map_err(internal("listing hunt tokens"))
+}
+
+/// Revoke a token. Idempotent in effect: revoking an already-revoked or unknown token is 404,
+/// and either way that token no longer authenticates anything.
+pub async fn revoke_token(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let revoked = tokens::revoke(&pool, &id, &user.id, Utc::now())
+        .await
+        .map_err(internal("revoking a hunt token"))?;
+
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
 }

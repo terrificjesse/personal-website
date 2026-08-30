@@ -30,13 +30,14 @@ const SETTINGS_KEY = "settings";
 
 const DEFAULTS = {
   backendUrl: "http://localhost:8080",
+  token: "",
   siteUrl: "http://localhost:3000",
   pollMinutes: 5,
   kinds: { posting: true, email: true },
   maxNotificationsPerPoll: 3,
 };
 
-const fields = ["backendUrl", "siteUrl", "pollMinutes", "maxNotificationsPerPoll"];
+const fields = ["backendUrl", "siteUrl", "token", "pollMinutes", "maxNotificationsPerPoll"];
 const resultEl = document.getElementById("result");
 
 function say(text, tone = "") {
@@ -60,6 +61,7 @@ function fromForm() {
   return {
     backendUrl: document.getElementById("backendUrl").value.trim(),
     siteUrl: document.getElementById("siteUrl").value.trim(),
+    token: document.getElementById("token").value.trim(),
     pollMinutes: Math.max(1, Number(document.getElementById("pollMinutes").value) || 5),
     maxNotificationsPerPoll: Math.max(
       1,
@@ -121,7 +123,10 @@ document.getElementById("test").addEventListener("click", async () => {
 
   let response;
   try {
-    response = await fetch(`${base}/hunt/events?limit=1`, { credentials: "include" });
+    response = await fetch(`${base}/hunt/events?limit=1`, {
+      credentials: "include",
+      headers: settings.token ? { Authorization: `Bearer ${settings.token}` } : {},
+    });
   } catch (err) {
     // A credentialed cross-origin response with no `Access-Control-Allow-Origin` is DISCARDED
     // by the browser before this code can read it, and surfaces here as the same bare
@@ -145,9 +150,18 @@ document.getElementById("test").addEventListener("click", async () => {
   }
 
   if (response.status === 401) {
+    if (!settings.token) {
+      return say(
+        `${origin} is reachable but this extension has no access token. Sign in at ` +
+          `${settings.siteUrl}, generate one under "Extension access", and paste it above. ` +
+          `Signing in alone is not enough — Firefox will not send the site's cookie from an ` +
+          `extension page.`,
+        "bad",
+      );
+    }
     return say(
-      `${origin} is reachable but doesn't recognise the session. Open ${settings.siteUrl}, ` +
-        `sign in, then test again.`,
+      `${origin} rejected this access token. It may have been revoked, or mistyped — ` +
+        `generate a new one on the site and paste it above.`,
       "bad",
     );
   }

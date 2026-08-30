@@ -31,6 +31,10 @@ const UNSEEN_KEY = "unseenCount";
 
 const DEFAULT_SETTINGS = {
   backendUrl: "http://localhost:8080",
+  // The bearer token from the site's Settings page. The session cookie cannot reach an
+  // extension — `SameSite=Lax` means Firefox never attaches it to a request from a
+  // `moz-extension://` page — so this is how the backend knows who we are.
+  token: "",
   // Where "open the site" points. Used for a link only; nothing is fetched from it.
   siteUrl: "http://localhost:3000",
   // Firefox will not schedule an alarm more often than once a minute.
@@ -57,6 +61,16 @@ async function getSettings() {
 /** Trailing slashes are the classic way to end up requesting `//hunt/events`. */
 function apiUrl(settings, path) {
   return `${settings.backendUrl.replace(/\/+$/, "")}${path}`;
+}
+
+/**
+ * Headers for an authenticated call.
+ *
+ * `credentials: "include"` is kept alongside the token so a future same-site caller still
+ * works, but the token is what actually authenticates this extension.
+ */
+function authHeaders(settings) {
+  return settings.token ? { Authorization: `Bearer ${settings.token}` } : {};
 }
 
 /** The origin of a configured URL, or null if it isn't a URL at all. */
@@ -101,17 +115,20 @@ async function poll() {
 
   try {
     response = await fetch(apiUrl(settings, `/hunt/events?limit=${POLL_LIMIT}`), {
-      // The whole auth story. With host permissions for the backend origin this carries the
-      // ordinary `fridge_session` cookie, so being signed in on the site signs in the
-      // extension. No second token, no second auth path.
       credentials: "include",
+      headers: authHeaders(settings),
     });
   } catch (err) {
     return setStatus({ state: "unreachable", detail: String(err) });
   }
 
   if (response.status === 401) {
-    return setStatus({ state: "unauthenticated" });
+    // Distinguish "no token configured yet" from "the token was rejected". The first is
+    // setup you have not done; the second is a token that was revoked or mistyped, and
+    // sending you to the site to sign in again would be useless advice.
+    return setStatus({
+      state: settings.token ? "token-rejected" : "no-token",
+    });
   }
   if (!response.ok) {
     return setStatus({ state: "error", detail: `HTTP ${response.status}` });
@@ -183,6 +200,7 @@ async function ack(id, settings) {
     const response = await fetch(apiUrl(settings, `/hunt/events/${encodeURIComponent(id)}/ack`), {
       method: "POST",
       credentials: "include",
+      headers: authHeaders(settings),
     });
     if (!response.ok && response.status !== 404) {
       console.warn(`hunt: ack for ${id} answered HTTP ${response.status}`);

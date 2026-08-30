@@ -131,7 +131,10 @@ pub fn build_router(state: AppState) -> Router {
             is_allowed_origin(&configured, origin)
         }))
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PATCH])
-        .allow_headers([header::CONTENT_TYPE])
+        // AUTHORIZATION is here for the extension's bearer token. Without it the preflight
+        // refuses the header and the request never arrives — which looks, once again, exactly
+        // like a backend that is down.
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         // Enables the server to send a response to the client
         .allow_credentials(true);
 
@@ -179,6 +182,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/hunt/events", get(hunt::list_events))
         .route("/hunt/events/{id}/ack", post(hunt::ack_event))
+        .route(
+            "/hunt/tokens",
+            get(hunt::list_tokens).post(hunt::create_token),
+        )
+        .route("/hunt/tokens/{id}", delete(hunt::revoke_token))
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))
