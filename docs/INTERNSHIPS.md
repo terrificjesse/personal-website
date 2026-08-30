@@ -165,7 +165,7 @@ distinct from "there wasn't one".
 | Function | What it does |
 |---|---|
 | `canonical_url` | Strips the noise that silently breaks the join: Lever's `/apply` (579 records), Ashby's `/application`, `?gh_jid=` (544), `?mobile=` (574), `?ats=` (339) |
-| `ats_identity` | Recovers `(ats, board_slug, job_id)` from the URL. **Greenhouse, Lever and Ashby only** |
+| `ats_identity` | Recovers `(ats, board_slug, job_id)` from the URL. **Greenhouse, Lever, Ashby and SmartRecruiters** — four platforms over six hostnames, since `boards.`, `job-boards.` and `job-boards.eu.` all collapse to one Greenhouse host first |
 | `title_key`, `company_key` | Normalized forms for the fallback |
 | `dedup_key` | Primary: the ATS triple. Fallback: `(company_key, title_key)` |
 
@@ -396,8 +396,11 @@ ATS-triple coverage went 266/804 → 285/808.
   table and never implemented), plus `apply.workable.com` and `ats.rippling.com`. Everything
   else in the fallback is a company's own careers page, which correctly has no ATS identity.
   **Note for Phase 8f:** `apps/hunt-extension/CLAUDE.md` says to reuse this host list for
-  autofill and names seven hosts — the code parses **three platforms**. Take the list from the
-  code, and adding a host should stay a one-place change.
+  autofill and names seven hosts, including `apply.workable.com` and `ats.rippling.com` which
+  the code does not parse. What it actually handles is `boards.greenhouse.io`,
+  `job-boards.greenhouse.io`, `job-boards.eu.greenhouse.io`, `jobs.lever.co`,
+  `jobs.ashbyhq.com` and `jobs.smartrecruiters.com`. Take the list from the code, and adding a
+  host should stay a one-place change.
 - **Fuzzy company/title matching is unimplemented** (`dedup::FuzzyMatcher`), so `KLA` /
   `KLA Corporation` remain two postings.
 - Pay coverage in the verified run was 2 of 808 — an artefact of the board cap, not a defect.
