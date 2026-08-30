@@ -190,12 +190,29 @@ async function activeTab() {
  * The declarative hosts do not come through here; they already have the script from load.
  */
 async function injectInto(tabId) {
-  await browser.scripting.executeScript({
+  const results = await browser.scripting.executeScript({
     target: { tabId },
     // Order matters: fill.js reads the global fields.js defines.
     files: ["content/fields.js", "content/fill.js"],
   });
-  return isListening(tabId);
+
+  // executeScript resolves even when the injected code threw — the failure is reported per
+  // frame in the result, not as a rejection. Ignoring that turns a real error into a silent
+  // "the page must be blocking us", which is a guess dressed as an explanation.
+  const failed = (results || []).find((result) => result?.error);
+  if (failed) {
+    const detail = failed.error?.message || String(failed.error);
+    throw new Error(`the injected script threw: ${detail}`);
+  }
+
+  // A short retry rather than a single immediate ping. The listener registers at the end of
+  // fill.js and the message port is set up asynchronously, so one ping can lose a race that
+  // the very next one wins.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (await isListening(tabId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return false;
 }
 
 function describe(report) {
@@ -229,7 +246,16 @@ fillButton?.addEventListener("click", async () => {
     if (!(await isListening(tab.id))) {
       try {
         if (!(await injectInto(tab.id))) {
-          fillResultEl.textContent = "Could not read this page — it may block extensions.";
+          const where = (() => {
+            try {
+              return new URL(tab.url || "").origin;
+            } catch {
+              return "this page";
+            }
+          })();
+          fillResultEl.textContent =
+            `Injected into ${where} but it never answered. If this is a PDF, a frame-heavy ` +
+            `page, or a restricted Firefox page, that is expected.`;
           return;
         }
       } catch (err) {
