@@ -239,6 +239,39 @@ fn job_id_identity(job_id: String) -> AtsIdentity {
 ///
 /// Reading the id out of the query fixes the first without risking the second. Same shape as
 /// the `embed/job_app?token=` case: a parameter that is identity, not tracking.
+/// The Greenhouse job id a URL carries, whichever shape it is in and **whatever the host**.
+///
+/// # Why this is separate from [`ats_identity`] rather than folded into it
+///
+/// A company's own careers page can host a Greenhouse job:
+/// `www.jumptrading.com/hr/job?gh_jid=8007788` is the same job as
+/// `job-boards.greenhouse.io/jumptrading/jobs/8007788`. Teaching `ats_identity` to see that
+/// would be the obvious move and would be a mistake, because its output **is the dedup key**.
+/// Changing what it returns for existing URLs re-keys every Greenhouse posting in the corpus:
+/// the stored rows keep their old `dedup_key`, the next run computes new ones, and every one
+/// of them inserts as a new posting. A better identity, bought by duplicating the corpus.
+///
+/// So this exists for *lookup* — answering "is the page I am on one of the postings I already
+/// collected" — where a wrong answer costs a button that does not appear, not a table that
+/// doubles. If the merge key should ever learn this, it needs a migration that recomputes
+/// `dedup_key` for every row, which is its own deliberate change.
+///
+/// Greenhouse job ids are unique across the platform, so the board slug is not needed to make
+/// this a safe comparison.
+pub fn greenhouse_job_id(url: &str) -> Option<String> {
+    if let Some(token) = greenhouse_embed_token(url) {
+        return Some(token);
+    }
+    if let Some(id) = greenhouse_job_id_param(url) {
+        return Some(id);
+    }
+    // The path form, via the parser that already knows every Greenhouse hostname.
+    match ats_identity(url) {
+        Some(identity) if identity.ats == "greenhouse" => Some(identity.job_id),
+        _ => None,
+    }
+}
+
 fn greenhouse_job_id_param(url: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     let id = query
@@ -356,6 +389,50 @@ pub trait FuzzyMatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_greenhouse_job_id_is_recovered_from_every_shape_it_appears_in() {
+        // The three ways the same job can be linked, all of which must reduce to one id.
+        assert_eq!(
+            greenhouse_job_id("https://job-boards.greenhouse.io/jumptrading/jobs/8007788"),
+            Some("8007788".to_string())
+        );
+        assert_eq!(
+            greenhouse_job_id("https://www.jumptrading.com/hr/job?gh_jid=8007788"),
+            Some("8007788".to_string()),
+            "a company careers page hosting a Greenhouse job"
+        );
+        assert_eq!(
+            greenhouse_job_id("https://boards.greenhouse.io/embed/job_app?token=7231006"),
+            Some("7231006".to_string())
+        );
+    }
+
+    #[test]
+    fn a_company_page_and_its_ats_listing_resolve_to_the_same_job() {
+        // The point of the whole function: these two URLs are one job, and nothing else in
+        // this module can tell.
+        let company = "https://www.jumptrading.com/hr/job?gh_jid=8007788";
+        let ats = "https://job-boards.greenhouse.io/jumptrading/jobs/8007788";
+        assert_eq!(greenhouse_job_id(company), greenhouse_job_id(ats));
+        assert_ne!(
+            ats_identity(company),
+            ats_identity(ats),
+            "and ats_identity still does NOT equate them — the dedup key is unchanged"
+        );
+    }
+
+    #[test]
+    fn nothing_greenhouse_shaped_yields_no_job_id() {
+        for url in [
+            "https://jobs.lever.co/acme/2f8a1e00-0000-0000-0000-000000000000",
+            "https://careers.example.com/jobs/123",
+            "https://www.example.com/apply?utm_source=x",
+            "https://www.example.com/apply?gh_jid=",
+        ] {
+            assert_eq!(greenhouse_job_id(url), None, "{url} should yield nothing");
+        }
+    }
     use crate::internships::models::{ClassYearRange, Location};
 
     fn posting(company_key: &str, title: &str, url: &str) -> NormalizedPosting {

@@ -279,10 +279,15 @@ pub async fn posting_for_page(
     CurrentUser(user): CurrentUser,
     Query(params): Query<PostingForPageQuery>,
 ) -> Result<Json<PostingForPage>, StatusCode> {
-    use crate::internships::dedup::{ats_identity, canonical_url};
+    use crate::internships::dedup::{ats_identity, canonical_url, greenhouse_job_id};
 
     let wanted_identity = ats_identity(&params.url);
     let wanted_canonical = canonical_url(&params.url);
+    // A company careers page can host a Greenhouse job — jumptrading.com/hr/job?gh_jid=… is
+    // the same posting as job-boards.greenhouse.io/jumptrading/jobs/…, and neither the ATS
+    // identity nor the canonical URL can tell. See `dedup::greenhouse_job_id` for why this is
+    // a lookup concern and deliberately not part of the merge key.
+    let wanted_greenhouse = greenhouse_job_id(&params.url);
 
     let rows: Vec<(String, String, String)> =
         sqlx::query_as("SELECT id, canonical_url, company_name FROM internship_postings")
@@ -299,6 +304,13 @@ pub async fn posting_for_page(
             (Some(wanted), Some(found)) => *wanted == found,
             _ => canonical_url(url) == wanted_canonical,
         };
+        // Then the Greenhouse job id, which sees through the company-page/ATS-page split the
+        // two checks above cannot. Last, so it never overrides a stronger match.
+        let same = same
+            || match (&wanted_greenhouse, greenhouse_job_id(url)) {
+                (Some(wanted), Some(found)) => *wanted == found,
+                _ => false,
+            };
         if same {
             matched = Some(id.clone());
             break;
