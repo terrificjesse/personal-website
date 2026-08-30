@@ -236,6 +236,9 @@ pub async fn collect_with(
     // predicate below, and `recompute_company_signals` at the end. It reads a file, and a run
     // that inserts a few hundred postings would otherwise read it a few hundred times.
     let tiers = prestige::CompanyTiers::load();
+    // Read once per run rather than per row: it is an environment lookup, and a run is
+    // tens of thousands of rows.
+    let samples_per_reason = reject_samples_per_reason();
 
     let mut report = CollectionReport {
         run_id: run_id.clone(),
@@ -256,6 +259,9 @@ pub async fn collect_with(
 
         let source_run_id = Uuid::new_v4().to_string();
         let mut counts = QcCounts::default();
+        // Per source run, matching the (source_run_id, reason) partition `prune_rejects` uses,
+        // so the two halves cannot disagree about what a sample is.
+        let mut sampler = RejectSampler::default();
 
         // Open the `source_runs` row *before* QC, because every reject references it and
         // `posting_rejects.source_run_id` is a real enforced foreign key — sqlx turns
@@ -311,21 +317,26 @@ pub async fn collect_with(
                     }
                 }
                 QcOutcome::Filtered { reason, detail } => {
+                    // The count is unconditional; only the stored specimen is capped. That
+                    // split is the whole point — `source_runs.filtered_count` stays exact and
+                    // the accounting invariant holds however few payloads we keep.
                     counts.filtered += 1;
-                    record_reject(
-                        pool,
-                        &source_run_id,
-                        raw,
-                        RejectRecord {
-                            kind: "filtered",
-                            reason: &reason,
-                            field: None,
-                            detail: detail.as_deref(),
-                        },
-                        now,
-                    )
-                    .await
-                    .unwrap_or_else(log_reject_failure);
+                    if sampler.should_store("filtered", &reason, samples_per_reason) {
+                        record_reject(
+                            pool,
+                            &source_run_id,
+                            raw,
+                            RejectRecord {
+                                kind: "filtered",
+                                reason: &reason,
+                                field: None,
+                                detail: detail.as_deref(),
+                            },
+                            now,
+                        )
+                        .await
+                        .unwrap_or_else(log_reject_failure);
+                    }
                 }
                 QcOutcome::Rejected {
                     reason,
@@ -418,6 +429,42 @@ pub async fn collect_with(
 /// accepted, so the discrepancy is at least discoverable.
 fn log_reject_failure(err: anyhow::Error) {
     eprintln!("internships: FAILED TO RECORD A REJECTED ROW — it is now invisible: {err:?}");
+}
+
+/// Decides which rejects are worth *storing*, as they happen.
+///
+/// # Why this is a write-time decision and not a cleanup
+///
+/// It used to be cleanup: every filtered row was written with its `raw_json`, and
+/// [`prune_rejects`] deleted the bulk at the end of the run. That bounds the row count and
+/// **does not bound the file.** Measured on 2026-08-30: after pruning, `posting_rejects` held
+/// 490 rows — and `fridge.db` was 407 MB, because a run fetches ~49,000 rows, writes tens of
+/// thousands of 8 KB payloads, and SQLite keeps the high-water mark once the pages are freed.
+/// A 4.5 MB database went back to 400 MB in one run and stayed there.
+///
+/// Not writing the bulk in the first place fixes what deleting it afterwards could not.
+///
+/// `rejected` rows are never sampled — they are the defects, they are rare, and every one is
+/// evidence. Only `filtered` has a cap, per reason, because twenty examples of
+/// `not_an_internship` answer the same question twenty thousand do.
+#[derive(Debug, Default)]
+struct RejectSampler {
+    seen: std::collections::HashMap<String, i64>,
+}
+
+impl RejectSampler {
+    /// Whether to store this reject, counting it either way.
+    fn should_store(&mut self, kind: &str, reason: &str, samples_per_reason: i64) -> bool {
+        if kind != "filtered" {
+            return true;
+        }
+        if samples_per_reason <= 0 {
+            return true;
+        }
+        let count = self.seen.entry(reason.to_string()).or_insert(0);
+        *count += 1;
+        *count <= samples_per_reason
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1530,6 +1577,42 @@ mod integration_tests {
     async fn reject_count(pool: &SqlitePool, kind: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM posting_rejects WHERE kind = ?")
             .bind(kind).fetch_one(pool).await.expect("count")
+    }
+
+    #[test]
+    fn the_sampler_caps_filtered_specimens_but_never_defects() {
+        let mut sampler = RejectSampler::default();
+
+        // Filtered: the first N of each reason are kept, the rest counted and dropped.
+        let kept = (0..50)
+            .filter(|_| sampler.should_store("filtered", "not_an_internship", 5))
+            .count();
+        assert_eq!(kept, 5);
+
+        // A different reason gets its own allowance — otherwise a high-volume reason would
+        // starve every other one of examples.
+        let other = (0..50)
+            .filter(|_| sampler.should_store("filtered", "not_software", 5))
+            .count();
+        assert_eq!(other, 5);
+
+        // Rejected is never sampled. These are the defects; there is no such thing as
+        // enough examples of a bug.
+        let defects = (0..50)
+            .filter(|_| sampler.should_store("rejected", "unparseable_pay", 5))
+            .count();
+        assert_eq!(defects, 50);
+    }
+
+    #[test]
+    fn a_zero_sample_setting_stores_everything_rather_than_nothing() {
+        // Consistent with the retention knobs: 0 disables the capping, it does not mean
+        // "keep nothing". The safe reading for a setting that discards data.
+        let mut sampler = RejectSampler::default();
+        let kept = (0..20)
+            .filter(|_| sampler.should_store("filtered", "not_an_internship", 0))
+            .count();
+        assert_eq!(kept, 20);
     }
 
     #[tokio::test]
