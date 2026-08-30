@@ -75,5 +75,18 @@ eq("plain text input", inputIsBlocked({ type: "text", name: "first_name" }), fal
 console.log("\n-- normalization --");
 eq("strips markers", normalizeLabel("  First   Name * (required) "), "first name");
 
+console.log("\n-- labels taken verbatim from a live Greenhouse form (Jump Trading) --");
+eq("First Name*", classify("First Name*"), field("first_name"));
+eq("Location (City)*", classify("Location (City)*"), field("location"));
+eq("LinkedIn Profile", classify("LinkedIn Profile"), field("linkedin_url"));
+eq("expected graduation date", classify("What is your expected graduation date?*"), field("graduation_date"));
+eq("current school, long question", classify("Please select your current school from the list below:*"), field("school"));
+eq("degree, as a question", classify("What degree are you currently pursuing?*"), field("degree"));
+eq("sponsorship, as a question", classify("Will you require sponsorship for work authorization in "), field("needs_sponsorship"));
+// Things on that same form we must NOT touch.
+eq("Country* (not stored)", classify("Country*"), skip);
+eq("Non-compete comments", classify("Non-compete/Notice period comments*"), skip);
+eq("Acknowledge/Confirm", classify("Acknowledge/Confirm"), skip);
+
 console.log(fail === 0 ? "\n  ALL PASSED" : `\n  ${fail} FAILED`);
 process.exit(fail ? 1 : 0);

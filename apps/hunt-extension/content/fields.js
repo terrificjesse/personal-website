@@ -102,6 +102,9 @@ const SYNONYMS = {
   major: ["major", "field of study", "discipline", "course of study", "concentration"],
   gpa: ["gpa", "grade point average"],
   graduation_year: ["graduation year", "grad year", "expected graduation year", "year of graduation", "anticipated graduation year"],
+  // Real forms ask for a *date* more often than a year — Jump Trading's Greenhouse form says
+  // "What is your expected graduation date?". Rendered from month + year; see `renderValue`.
+  graduation_date: ["graduation date", "expected graduation date", "anticipated graduation date", "grad date", "expected graduation"],
   graduation_month: ["graduation month", "grad month", "expected graduation month"],
   github_url: ["github", "github url", "github profile", "github username"],
   linkedin_url: ["linkedin", "linkedin url", "linkedin profile"],

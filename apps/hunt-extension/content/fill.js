@@ -91,6 +91,18 @@ function setNativeValue(element, value) {
 
 /** The string to type for a profile value, or null if there is nothing to type. */
 function renderValue(key, profile) {
+  // A derived field: the profile stores month and year separately, because that is how they
+  // are asked for elsewhere, but plenty of forms want one date.
+  if (key === "graduation_date") {
+    const { graduation_month: month, graduation_year: year } = profile;
+    // Both or nothing. A bare year typed into a box labelled "date" looks like a complete
+    // answer and is not — and the whole point of never submitting is that you review what is
+    // there, which is harder when a field is confidently half right. If only the year is
+    // known, leave it empty so you notice.
+    if (!month || !year) return null;
+    return `${String(month).padStart(2, "0")}/${year}`;
+  }
+
   const value = profile[key];
   if (value === null || value === undefined) return null;
   if (key === "needs_sponsorship") return value ? "Yes" : "No";
