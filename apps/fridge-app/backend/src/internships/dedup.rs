@@ -99,11 +99,31 @@ pub fn canonical_url(url: &str) -> String {
     segments.retain(|s| !is_locale_segment(s));
 
     if segments.is_empty() {
-        host.to_string()
-    } else {
-        format!("{host}/{}", segments.join("/"))
+        return host.to_string();
     }
+
+    let joined = segments.join("/");
+    // Audit finding F7. The path is case-**sensitive** by default, because Ashby and Lever
+    // slugs genuinely are — `jobs.ashbyhq.com/Etched/...` is not the same board as `etched`,
+    // and folding it would point at nothing.
+    //
+    // Greenhouse is different, and this was measured rather than assumed: `boards-api
+    // .greenhouse.io/v1/boards/anthropic/jobs` and `.../Anthropic/jobs` both answer 200 with
+    // the same 571 jobs. So for that host alone, two URLs differing only in case are the same
+    // board, and keying on the raw case splits one job into two postings.
+    if HOSTS_WITH_CASE_INSENSITIVE_PATHS.contains(&host) {
+        return format!("{host}/{}", joined.to_lowercase());
+    }
+    format!("{host}/{joined}")
 }
+
+/// Hosts whose path may be case-folded, each verified against the live API rather than assumed.
+///
+/// **Adding a host here is a claim that must be tested**, because folding a case-sensitive
+/// slug merges two different boards — and over-merging destroys a posting, where under-merging
+/// only shows a duplicate. `docs/INTERNSHIP_SCRAPING.md` § C is explicit that under-merging is
+/// the safer failure.
+const HOSTS_WITH_CASE_INSENSITIVE_PATHS: &[&str] = &["job-boards.greenhouse.io"];
 
 /// `en-US`, `en_GB` and friends, which appear in Workday browse URLs and are not identity.
 fn is_locale_segment(segment: &str) -> bool {
@@ -136,14 +156,18 @@ pub fn ats_identity(url: &str) -> Option<AtsIdentity> {
     }
 
     let canonical = canonical_url(url);
-    let (host, path) = canonical.split_once('/')?;
+    let (host, path) = match canonical.split_once('/') {
+        Some(parts) => parts,
+        // No path at all, but a `?gh_jid=` may still identify the job.
+        None => return greenhouse_job_id_param(url).map(job_id_identity),
+    };
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     let identity = match host {
         // job-boards.greenhouse.io/{slug}/jobs/{id}
         "job-boards.greenhouse.io" => match segments.as_slice() {
             [slug, "jobs", id, ..] => (slug, id),
-            _ => return None,
+            _ => return greenhouse_job_id_param(url).map(job_id_identity),
         },
         // jobs.lever.co/{site}/{uuid}
         "jobs.lever.co" => match segments.as_slice() {
@@ -167,7 +191,9 @@ pub fn ats_identity(url: &str) -> Option<AtsIdentity> {
             }
             _ => return None,
         },
-        _ => return None,
+        // Not an ATS host. A Greenhouse job id in the query string still identifies the
+        // job — see `greenhouse_job_id_param`.
+        _ => return greenhouse_job_id_param(url).map(job_id_identity),
     };
 
     let ats = match host {
@@ -182,6 +208,45 @@ pub fn ats_identity(url: &str) -> Option<AtsIdentity> {
         board_slug: identity.0.to_string(),
         job_id: identity.1.to_string(),
     })
+}
+
+/// Identity for a Greenhouse job known only by its id, with no board slug available.
+///
+/// The pseudo-slug keeps this distinct from the path form `ats:greenhouse:{slug}:{id}`. That
+/// is an **under-merge on purpose**: treating the bare id as globally unique would merge two
+/// boards' jobs if Greenhouse ever reused an id across them, and § C is explicit that
+/// under-merging is the safer failure.
+fn job_id_identity(job_id: String) -> AtsIdentity {
+    AtsIdentity {
+        ats: "greenhouse".to_string(),
+        board_slug: "gh_jid".to_string(),
+        job_id,
+    }
+}
+
+/// A Greenhouse job id carried in a `gh_jid` query parameter.
+///
+/// Companies that host their own careers page but run hiring through Greenhouse link like
+/// `https://www.oldmissioncapital.com/careers/?gh_jid=7796180003`. `canonical_url` strips the
+/// query as tracking noise, which leaves `…/careers/` — an **index page shared by every one of
+/// that company's jobs**. Two consequences, both observed in live data:
+///
+/// - The same job listed by two sources with differently-worded titles split into two
+///   postings, because the fallback key had nothing but company and title to work with.
+/// - Keying on the bare canonical URL instead — the obvious repair — would have been far
+///   worse: `zipline.com/open-roles?gh_jid=7974897003` and `?gh_jid=7929236003` are two
+///   *different* jobs at one path, and merging them destroys a posting.
+///
+/// Reading the id out of the query fixes the first without risking the second. Same shape as
+/// the `embed/job_app?token=` case: a parameter that is identity, not tracking.
+fn greenhouse_job_id_param(url: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let id = query
+        .split(['&', '#'])
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| key.eq_ignore_ascii_case("gh_jid"))
+        .map(|(_, value)| value)?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| id.to_string())
 }
 
 /// The job id from a Greenhouse embed URL, if this is one.
@@ -352,6 +417,39 @@ mod tests {
     }
 
     #[test]
+    fn greenhouse_board_slug_casing_does_not_split_a_posting() {
+        // Audit finding F7. Verified against the live API before folding anything:
+        // `/v1/boards/anthropic/jobs` and `/v1/boards/Anthropic/jobs` both return 200 with the
+        // same 571 jobs, so these are one board and must be one posting.
+        let lower = posting("acme", "Software Engineer Intern",
+            "https://job-boards.greenhouse.io/acme/jobs/1");
+        let upper = posting("acme", "Software Engineer Intern",
+            "https://job-boards.greenhouse.io/ACME/jobs/1");
+        assert_eq!(dedup_key(&lower), dedup_key(&upper));
+        assert_eq!(
+            ats_identity("https://job-boards.greenhouse.io/ACME/jobs/1").unwrap().board_slug,
+            "acme"
+        );
+    }
+
+    #[test]
+    fn case_folding_does_not_leak_to_case_sensitive_hosts() {
+        // The guard on the fix. Ashby and Lever slugs really are case-sensitive, so folding
+        // them would merge two different boards — and over-merging destroys a posting, where
+        // under-merging only shows a duplicate.
+        for (lower_url, upper_url) in [
+            ("https://jobs.ashbyhq.com/etched/uuid-1", "https://jobs.ashbyhq.com/Etched/uuid-1"),
+            ("https://jobs.lever.co/acme/uuid-1", "https://jobs.lever.co/Acme/uuid-1"),
+        ] {
+            assert_ne!(
+                canonical_url(lower_url),
+                canonical_url(upper_url),
+                "{upper_url} must not be folded onto {lower_url}"
+            );
+        }
+    }
+
+    #[test]
     fn path_case_is_preserved_because_slugs_are_case_sensitive() {
         // Ashby org slugs like `Hippocratic AI` are case-sensitive; lowercasing the path
         // would point at a board that does not exist.
@@ -432,6 +530,57 @@ mod tests {
         let a = posting("acme", "SWE Intern", "https://boards.greenhouse.io/embed/job_app?token=7231006");
         let b = posting("acme", "SWE Intern", "https://boards.greenhouse.io/embed/job_app?token=7905463");
         assert_ne!(dedup_key(&a), dedup_key(&b));
+    }
+
+    #[test]
+    fn a_company_careers_page_keys_on_its_greenhouse_job_id() {
+        // Live example. The query is stripped as tracking noise, leaving `…/careers/` — an
+        // index page shared by every one of that company's jobs — so two sources wording the
+        // title differently produced two postings for one job.
+        let terse = posting("old mission", "SWE Intern",
+            "https://www.oldmissioncapital.com/careers/?gh_jid=7796180003");
+        let verbose = posting("old mission", "Software Engineer Intern, Summer 2027",
+            "https://www.oldmissioncapital.com/careers/?gh_jid=7796180003");
+        assert_eq!(dedup_key(&terse), dedup_key(&verbose));
+        assert!(dedup_key(&terse).starts_with("ats:greenhouse:gh_jid:"));
+    }
+
+    #[test]
+    fn two_jobs_sharing_one_careers_page_stay_distinct() {
+        // The guard, and the reason this is not fixed by keying on the canonical URL. Both of
+        // these live at `zipline.com/open-roles`; merging them would destroy a posting, which
+        // is the failure direction § C warns is unrecoverable.
+        let a = posting("zipline", "Software Engineer Intern",
+            "https://www.zipline.com/open-roles?gh_jid=7974897003");
+        let b = posting("zipline", "Software Engineer Intern",
+            "https://www.zipline.com/open-roles?gh_jid=7929236003");
+        assert_ne!(dedup_key(&a), dedup_key(&b));
+    }
+
+    #[test]
+    fn a_path_based_ats_identity_still_wins_over_the_query_parameter() {
+        // Ordering: the board slug is more specific than a bare id, so a real ATS URL must not
+        // be demoted to the `gh_jid` pseudo-slug just because the query also carries the id.
+        let identity = ats_identity(
+            "https://job-boards.greenhouse.io/acme/jobs/123?gh_jid=123",
+        )
+        .expect("the path form should be recognized");
+        assert_eq!(identity.board_slug, "acme");
+    }
+
+    #[test]
+    fn a_malformed_gh_jid_is_ignored_rather_than_keyed_on() {
+        for url in [
+            "https://acme.com/careers/?gh_jid=",
+            "https://acme.com/careers/?gh_jid=../../etc",
+            "https://acme.com/careers/?other=1",
+            "https://acme.com/careers/",
+        ] {
+            assert!(
+                ats_identity(url).is_none(),
+                "{url} should not produce an ATS identity"
+            );
+        }
     }
 
     // ---- the fallback key ----
