@@ -18,6 +18,46 @@
     "http://127.0.0.1:8080/*"
   ],
 
+  "//content_scripts": [
+    "Phase 8f. The six hostnames dedup::ats_identity actually parses — four platforms, since",
+    "boards., job-boards. and job-boards.eu. are all Greenhouse. Taken from the code rather",
+    "than from CLAUDE.md, which lists two hosts (workable, rippling) that nothing parses.",
+    "The script only registers a listener on load; filling happens on the popup's button.",
+    "NOT <all_urls>, and no activeTab yet — company careers pages come in a later step."
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://job-boards.eu.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://jobs.smartrecruiters.com/*"
+      ],
+      "js": ["content/fill.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "//web_accessible_resources": [
+    "fill.js imports fields.js at fill time, so it has to be fetchable by the content script.",
+    "It is pure matching logic with nothing secret in it."
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/fields.js"],
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://job-boards.eu.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://jobs.smartrecruiters.com/*"
+      ]
+    }
+  ],
+
   "background": {
     "scripts": ["background.js"]
   },

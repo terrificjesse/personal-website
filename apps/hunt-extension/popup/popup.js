@@ -143,3 +143,83 @@ document.getElementById("options").addEventListener("click", (event) => {
 // Clears the badge: the count is "raised since you last looked", and you are looking.
 browser.runtime.sendMessage({ type: "popup-opened" });
 load();
+
+
+// ------------------------------------------------------------------------------------------
+// Autofill (Phase 8f)
+// ------------------------------------------------------------------------------------------
+
+/*
+ * The button is the whole safety story. Nothing on an application page fills itself: the
+ * content script registers a listener on load and waits for this click, which is rule 10's
+ * "explicit user action, never on page load".
+ *
+ * The button only appears when the active tab actually has our content script in it — asking
+ * you to press something that cannot work is its own small lie.
+ */
+
+const autofillEl = document.getElementById("autofill");
+const fillButton = document.getElementById("fill");
+const fillResultEl = document.getElementById("fillResult");
+
+/** The active tab, if the content script answers a ping there. */
+async function fillableTab() {
+  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return null;
+  try {
+    const pong = await browser.tabs.sendMessage(tab.id, { type: "hunt-ping" });
+    return pong?.ready ? tab : null;
+  } catch {
+    // No content script in that tab. Not an error — most tabs are not applications.
+    return null;
+  }
+}
+
+function describe(report) {
+  const parts = [];
+  if (report.filled.length) {
+    parts.push(`filled ${report.filled.length}: ${report.filled.map((f) => f.label).join(", ")}`);
+  } else {
+    parts.push("filled nothing");
+  }
+  if (report.alreadyFilled) parts.push(`${report.alreadyFilled} already had values`);
+  // Named rather than counted: "3 refused" invites a shrug, "refused: password" does not.
+  if (report.blocked.length) {
+    parts.push(`refused ${report.blocked.length} sensitive field(s)`);
+  }
+  parts.push("nothing submitted — review before you send");
+  return parts.join(" · ");
+}
+
+fillButton?.addEventListener("click", async () => {
+  fillResultEl.textContent = "Filling…";
+  try {
+    const tab = await fillableTab();
+    if (!tab) {
+      fillResultEl.textContent = "This tab is not a supported application page.";
+      return;
+    }
+    const config = await settings();
+    const base = config.backendUrl.replace(/\/+$/, "");
+    const res = await fetch(`${base}/hunt/profile`, {
+      credentials: "include",
+      headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
+    });
+    if (!res.ok) {
+      fillResultEl.textContent = "Could not load your CV details.";
+      return;
+    }
+    const report = await browser.tabs.sendMessage(tab.id, {
+      type: "hunt-fill",
+      profile: await res.json(),
+    });
+    fillResultEl.textContent = describe(report);
+  } catch (err) {
+    fillResultEl.textContent = `Fill failed: ${err.message}`;
+  }
+});
+
+// Show the button only where it can do something.
+void (async () => {
+  if (await fillableTab()) autofillEl.hidden = false;
+})();
