@@ -762,11 +762,40 @@ pub struct RejectSummary {
 /// This endpoint is the reason `posting_rejects` keeps `raw_json`: a reject count tells you
 /// something went wrong and nothing at all about what. Note `kind` — `filtered` in bulk is
 /// healthy, `rejected` is a defect worth chasing.
+/// What a run threw away, plus whether we still hold the evidence.
+///
+/// `payloads_pruned` is the whole reason this is an envelope rather than a bare array. Old
+/// `filtered` payloads are deleted by `collector::prune_rejects`, and without this flag a
+/// pruned run and a run that filtered nothing return the identical empty list — which is
+/// precisely the ambiguity `posting_rejects` was built to prevent, reintroduced by the
+/// housekeeping that keeps it from eating the disk.
+///
+/// It is derived rather than stored: the run says it filtered rows, and none are here.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectsResponse {
+    pub rejects: Vec<RejectSummary>,
+    /// From `source_runs`, which pruning never touches. The accounting outlives the evidence.
+    pub filtered_count: i64,
+    pub rejected_count: i64,
+    pub payloads_pruned: bool,
+}
+
 pub async fn list_rejects(
     State(pool): State<SqlitePool>,
     CurrentUser(_user): CurrentUser,
     Path(source_run_id): Path<String>,
-) -> Result<Json<Vec<RejectSummary>>, StatusCode> {
+) -> Result<Json<RejectsResponse>, StatusCode> {
+    let counts: Option<(i64, i64)> =
+        sqlx::query_as("SELECT filtered_count, rejected_count FROM source_runs WHERE id = ?")
+            .bind(&source_run_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal("reading a source run"))?;
+
+    let Some((filtered_count, rejected_count)) = counts else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
     let rejects = sqlx::query_as::<_, RejectSummary>(
         "SELECT id, source, kind, reason, field, detail, url, external_id, raw_json, created_at
          FROM posting_rejects WHERE source_run_id = ?
@@ -778,7 +807,15 @@ pub async fn list_rejects(
     .await
     .map_err(internal("listing rejects"))?;
 
-    Ok(Json(rejects))
+    let filtered_present = rejects.iter().filter(|r| r.kind == "filtered").count() as i64;
+
+    Ok(Json(RejectsResponse {
+        rejects,
+        filtered_count,
+        rejected_count,
+        // Only `filtered` payloads are ever pruned, so only they can go missing.
+        payloads_pruned: filtered_count > 0 && filtered_present == 0,
+    }))
 }
 
 /// Logs a database error and turns it into a 500, so handlers don't each repeat the closure.
@@ -1040,6 +1077,7 @@ pub async fn collect_now(
         postings_created: report.postings_created,
         postings_updated: report.postings_updated,
         alerts_created: report.alerts_created,
+        rejects_pruned: report.rejects_pruned,
         marked_closed: report.marked_closed,
         swept_deadline: report.swept_deadline,
         swept_vanished: report.swept_vanished,
@@ -1059,6 +1097,8 @@ pub struct CollectionSummary {
     pub postings_updated: i64,
     /// Desktop-notification events this run raised. See `internships::alerts`.
     pub alerts_created: i64,
+    /// Old `filtered` reject payloads deleted. See `collector::prune_rejects`.
+    pub rejects_pruned: u64,
     pub marked_closed: u64,
     pub swept_deadline: u64,
     pub swept_vanished: u64,

@@ -71,6 +71,8 @@ pub struct CollectionReport {
     pub rejected: i64,
     pub postings_created: i64,
     pub postings_updated: i64,
+    /// Reject payloads this run pruned. See [`prune_rejects`].
+    pub rejects_pruned: u64,
     /// `hunt_events` rows this run wrote — see [`super::alerts`]. Reported rather than left
     /// to be counted by hand in `sqlite3`, because "a new tier-1/2 posting raises exactly one
     /// notification, and re-running raises none" is the checkpoint this producer has to meet,
@@ -398,6 +400,13 @@ pub async fn collect_with(
             report.swept_vanished = sweep.vanished;
         }
         Err(err) => eprintln!("internships: expiry sweep failed: {err:?}"),
+    }
+
+    // Housekeeping, not accounting. A failure here costs disk, never data the run produced,
+    // so it is logged and the run still reports success.
+    match prune_rejects(pool, reject_retention_runs(), reject_samples_per_reason()).await {
+        Ok(pruned) => report.rejects_pruned = pruned,
+        Err(err) => eprintln!("internships: pruning old reject payloads failed: {err:?}"),
     }
 
     Ok(report)
@@ -833,6 +842,128 @@ async fn recompute_company_signals(
     }
 
     Ok(())
+}
+
+/// How many recent collection runs keep their `filtered` reject payloads.
+pub const DEFAULT_REJECT_RETENTION_RUNS: i64 = 3;
+
+/// How many `filtered` payloads to keep per (source run, reason) inside that window.
+///
+/// A window alone does not bound anything: one uncapped run filters tens of thousands of rows,
+/// so three runs of them is still hundreds of megabytes. What a human actually does with this
+/// table is ask "show me what got filtered as `not_software`" — and twenty examples answer that
+/// as well as twenty thousand do. The **count** of what was filtered stays exact on
+/// `source_runs` either way; only the number of retained specimens is capped.
+pub const DEFAULT_REJECT_SAMPLES_PER_REASON: i64 = 20;
+
+/// Retention from the environment. `0` disables pruning entirely — nothing is ever deleted.
+///
+/// Zero means *off* rather than *keep nothing*, matching the interval variables. The safe
+/// reading of a misconfigured value for a destructive job is the one that deletes nothing.
+fn reject_retention_runs() -> i64 {
+    non_negative_from_env(
+        "INTERNSHIP_REJECT_RETENTION_RUNS",
+        DEFAULT_REJECT_RETENTION_RUNS,
+    )
+}
+
+/// Samples per (source run, reason) from the environment. `0` disables the sampling half.
+fn reject_samples_per_reason() -> i64 {
+    non_negative_from_env(
+        "INTERNSHIP_REJECT_SAMPLES_PER_REASON",
+        DEFAULT_REJECT_SAMPLES_PER_REASON,
+    )
+}
+
+fn non_negative_from_env(name: &str, default: i64) -> i64 {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(value) => match value.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                eprintln!(
+                    "internships: {name}={value:?} is not a non-negative number — using the \
+                     default of {default}"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// Drop the stored payloads of `filtered` rows from runs older than the retention window.
+///
+/// # Why this is needed, and why it deletes only one of the two kinds
+///
+/// `posting_rejects` exists so a discarded row can be **diagnosed** rather than merely
+/// counted — a scraper that silently drops half its input looks healthy right up until someone
+/// counts. That argument is about `kind = 'rejected'`, the rows that should have parsed and
+/// did not. Each one is a potential defect and they are rare: a real database on 2026-08-30
+/// held **zero** of them.
+///
+/// `kind = 'filtered'` is the opposite. It is correct exclusion — not an internship, not
+/// software — expected in bulk, and explicitly *not* a health signal. On that same database it
+/// was **90,040 rows averaging 8 KB of `raw_json`: 785 MB, 96% of the entire file**, growing
+/// by roughly 14 MB per run forever. The mechanism built to make dropped rows visible had
+/// become the largest thing in the database, and none of it was evidence of anything.
+///
+/// So: **`rejected` rows are never pruned, at any age.** Only `filtered` payloads age out, and
+/// only once their run leaves the retention window.
+///
+/// # The counts are not touched, and that is the point
+///
+/// `fetched = accepted + filtered + rejected` lives on `source_runs`, which this never writes
+/// to. Pruning removes *evidence*, never *accounting* — a run from last year still reports
+/// exactly how many rows it filtered, and `list_rejects` reports that its payloads were pruned
+/// rather than showing an empty list that reads as "nothing was filtered".
+async fn prune_rejects(pool: &SqlitePool, keep_runs: i64, samples: i64) -> Result<u64> {
+    let mut pruned = 0;
+
+    // 1. Whole runs that have aged out of the window.
+    if keep_runs > 0 {
+        pruned += sqlx::query(
+            "DELETE FROM posting_rejects
+              WHERE kind = 'filtered'
+                AND source_run_id IN (
+                    SELECT sr.id FROM source_runs sr
+                     WHERE sr.run_id NOT IN (
+                         SELECT id FROM collection_runs ORDER BY started_at DESC LIMIT ?1
+                     )
+                )",
+        )
+        .bind(keep_runs)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+
+    // 2. Within the window, keep a sample per reason. This is the half that actually bounds
+    //    the table: one uncapped run filters tens of thousands of rows, and without a cap the
+    //    window merely delays the growth rather than stopping it.
+    //
+    //    Oldest-first, so the specimens kept are the same ones across repeated prunes and the
+    //    table stops changing once it has settled — a sample that reshuffled every run would
+    //    make the same query answer differently for no reason.
+    if samples > 0 {
+        pruned += sqlx::query(
+            "DELETE FROM posting_rejects
+              WHERE kind = 'filtered'
+                AND id NOT IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY source_run_id, reason ORDER BY created_at, id
+                        ) AS rn
+                          FROM posting_rejects WHERE kind = 'filtered'
+                    ) WHERE rn <= ?1
+                )",
+        )
+        .bind(samples)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+
+    Ok(pruned)
 }
 
 /// Close out runs abandoned by a process that died.
@@ -1372,6 +1503,135 @@ mod integration_tests {
             .fetch_all(pool)
             .await
             .expect("events")
+    }
+
+    /// Seed a finished run with one filtered and one rejected payload, backdated so ordering
+    /// by `started_at` puts the oldest first.
+    async fn seed_run_with_rejects(pool: &SqlitePool, run: &str, days_ago: i64) -> String {
+        let at = (Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339();
+        let source_run = format!("sr-{run}");
+        sqlx::query("INSERT INTO collection_runs (id, started_at, finished_at, trigger) VALUES (?1,?2,?2,'manual')")
+            .bind(run).bind(&at).execute(pool).await.expect("run");
+        sqlx::query(
+            "INSERT INTO source_runs (id, run_id, source, started_at, outcome, counts_for_expiry,
+                                      fetched_count, accepted_count, filtered_count, rejected_count)
+             VALUES (?1, ?2, 'simplify', ?3, 'success', 1, 3, 1, 1, 1)")
+            .bind(&source_run).bind(run).bind(&at).execute(pool).await.expect("source run");
+        for (n, kind) in [("f", "filtered"), ("r", "rejected")] {
+            sqlx::query(
+                "INSERT INTO posting_rejects (id, source_run_id, source, kind, reason, raw_json, created_at)
+                 VALUES (?1, ?2, 'simplify', ?3, 'not_an_internship', '{\"big\":\"payload\"}', ?4)")
+                .bind(format!("{run}-{n}")).bind(&source_run).bind(kind).bind(&at)
+                .execute(pool).await.expect("reject");
+        }
+        source_run
+    }
+
+    async fn reject_count(pool: &SqlitePool, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM posting_rejects WHERE kind = ?")
+            .bind(kind).fetch_one(pool).await.expect("count")
+    }
+
+    #[tokio::test]
+    async fn old_filtered_payloads_are_pruned_and_recent_ones_kept() {
+        let pool = test_pool().await;
+        for (n, days) in [("r1", 9), ("r2", 6), ("r3", 3), ("r4", 1)] {
+            seed_run_with_rejects(&pool, n, days).await;
+        }
+
+        let pruned = prune_rejects(&pool, 2, 0).await.expect("prune");
+        assert_eq!(pruned, 2, "the two runs outside the window lose their filtered payload");
+        assert_eq!(reject_count(&pool, "filtered").await, 2, "the two newest runs keep theirs");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_payload_is_never_pruned_however_old() {
+        // `rejected` means the row should have parsed and did not — a potential defect, and
+        // rare: a real 90,040-row table held zero of them. Ageing those out would delete the
+        // only thing the table exists for while keeping the bulk it does not.
+        let pool = test_pool().await;
+        seed_run_with_rejects(&pool, "ancient", 400).await;
+        seed_run_with_rejects(&pool, "recent", 1).await;
+
+        prune_rejects(&pool, 1, 0).await.expect("prune");
+
+        assert_eq!(reject_count(&pool, "filtered").await, 1, "the old filtered one goes");
+        assert_eq!(
+            reject_count(&pool, "rejected").await,
+            2,
+            "both rejected payloads stay, including the 400-day-old one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sample_of_each_reason_survives_and_the_bulk_does_not() {
+        // The half that actually bounds the table. A window alone does not: one uncapped run
+        // filtered tens of thousands of rows, so three runs of them was still 383 MB.
+        let pool = test_pool().await;
+        let source_run = seed_run_with_rejects(&pool, "r1", 0).await;
+
+        for reason in ["not_an_internship", "not_software"] {
+            for n in 0..50 {
+                sqlx::query(
+                    "INSERT INTO posting_rejects (id, source_run_id, source, kind, reason, raw_json, created_at)
+                     VALUES (?1, ?2, 'simplify', 'filtered', ?3, '{}', ?4)")
+                    .bind(format!("{reason}-{n}"))
+                    .bind(&source_run)
+                    .bind(reason)
+                    .bind((Utc::now() + chrono::Duration::seconds(n)).to_rfc3339())
+                    .execute(&pool).await.expect("reject");
+            }
+        }
+
+        prune_rejects(&pool, 3, 5).await.expect("prune");
+
+        let per_reason: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT reason, count(*) FROM posting_rejects WHERE kind='filtered' GROUP BY reason")
+            .fetch_all(&pool).await.expect("counts");
+        for (reason, kept) in &per_reason {
+            assert!(*kept <= 5, "{reason} kept {kept}, expected at most 5 specimens");
+        }
+        assert_eq!(per_reason.len(), 2, "every reason keeps at least one example");
+
+        // Repeated pruning must settle rather than keep churning the sample.
+        assert_eq!(prune_rejects(&pool, 3, 5).await.expect("second"), 0);
+    }
+
+    #[tokio::test]
+    async fn pruning_never_touches_the_accounting() {
+        // THE invariant. `fetched = accepted + filtered + rejected` lives on `source_runs`,
+        // and pruning removes evidence, never accounting. A run from last year must still
+        // report exactly how many rows it filtered.
+        let pool = test_pool().await;
+        seed_run_with_rejects(&pool, "old", 90).await;
+
+        let before: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT fetched_count, accepted_count, filtered_count, rejected_count FROM source_runs")
+            .fetch_one(&pool).await.expect("counts");
+
+        prune_rejects(&pool, 1, 0).await.expect("prune");
+
+        let after: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT fetched_count, accepted_count, filtered_count, rejected_count FROM source_runs")
+            .fetch_one(&pool).await.expect("counts");
+
+        assert_eq!(before, after, "the counts must survive the pruning of their payloads");
+        assert_eq!(before.0, before.1 + before.2 + before.3, "and still balance");
+    }
+
+    #[tokio::test]
+    async fn pruning_is_idempotent_and_disabled_by_zero() {
+        let pool = test_pool().await;
+        seed_run_with_rejects(&pool, "old", 90).await;
+        seed_run_with_rejects(&pool, "new", 1).await;
+
+        assert_eq!(prune_rejects(&pool, 1, 0).await.expect("first"), 1);
+        assert_eq!(prune_rejects(&pool, 1, 0).await.expect("second"), 0, "nothing left to prune");
+
+        // Zero is off, not "keep nothing" — the safe reading for a destructive job.
+        seed_run_with_rejects(&pool, "older", 200).await;
+        assert_eq!(prune_rejects(&pool, 0, 0).await.expect("disabled"), 0);
+        assert_eq!(reject_count(&pool, "filtered").await, 2, "retention 0 deletes nothing");
     }
 
     #[tokio::test]

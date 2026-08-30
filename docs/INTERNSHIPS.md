@@ -315,6 +315,8 @@ is true. `posting_is_live` is three-valued and a `None` must never render as "Cl
 | `INTERNSHIP_MISS_THRESHOLD` | Consecutive expiry-eligible misses before a sighting counts as gone, default 3 |
 | `INTERNSHIP_MAX_BOARDS_PER_RUN` | Safety valve with a real cost — see below |
 | `INTERNSHIP_DISABLED_SOURCES` | Comma-separated. A disabled source still writes a `Skipped` run record |
+| `INTERNSHIP_REJECT_RETENTION_RUNS` | Collection runs whose `filtered` reject payloads are kept, default 3. `0` disables |
+| `INTERNSHIP_REJECT_SAMPLES_PER_REASON` | Specimens kept per (source run, reason) inside that window, default 20. `0` disables |
 
 **`INTERNSHIP_MAX_BOARDS_PER_RUN` makes expiry stop working.** The vendored directory holds
 ~2,084 board slugs; uncapped, a run is on the order of half an hour of continuous requests to
@@ -322,8 +324,40 @@ other people's servers. But a capped run **has not enumerated the source**, so i
 `Partial`, and a `Partial` run can never expire anything. Convenient for development, wrong for
 steady state.
 
-**None of these are in `.env.example`**, which `apps/fridge-app/CLAUDE.md` says documents every
-env var. Worth fixing.
+All are documented in `.env.example` as of 2026-08-30 — they had been missing, despite
+`apps/fridge-app/CLAUDE.md` saying that file documents every env var.
+
+### Reject retention — added 2026-08-30
+
+`posting_rejects` stores `raw_json` so a discarded row can be **diagnosed** rather than merely
+counted. That argument is about `kind = 'rejected'` — the rows that should have parsed and did
+not, each a potential defect. `kind = 'filtered'` is the opposite: correct exclusion, expected
+in bulk, explicitly not a health signal.
+
+With no retention policy, the bulk category ate the database. Measured on the real file:
+**90,040 filtered rows averaging 8 KB of `raw_json` — 785 MB, 96% of an 801 MB database, and
+zero `rejected` rows among them.** Everything the tab actually serves came to under a megabyte.
+
+Two rules, applied at the end of every run by `collector::prune_rejects`:
+
+1. **`rejected` payloads are never pruned, at any age.** They are the whole reason the table
+   exists and they are rare.
+2. **`filtered` payloads are kept for the last N runs, capped at M specimens per
+   (source run, reason).** The window alone bounds nothing — one uncapped run filters tens of
+   thousands of rows, and three of those was still 383 MB. The per-reason cap is what makes
+   the table stop growing: twenty examples answer "what got filtered as `not_software`" as
+   well as twenty thousand do.
+
+**The counts are never touched.** `fetched = accepted + filtered + rejected` lives on
+`source_runs`, and pruning removes evidence, never accounting — a run from last year still
+reports exactly how many rows it filtered. `GET /internships/runs/{id}/rejects` returns
+`filtered_count` and `rejected_count` alongside the specimens, plus `payloads_pruned`, so an
+empty list can never be misread as "this run filtered nothing" — which is the exact ambiguity
+the table was built to prevent, and would otherwise have been reintroduced by the housekeeping
+that keeps it from eating the disk.
+
+Result on the real database: **801 MB → 4.5 MB**, 407 specimens across 24 (run, reason) pairs,
+with `source_runs` still reporting all 85,716 filtered rows.
 
 ## Verification (2026-08-20)
 
