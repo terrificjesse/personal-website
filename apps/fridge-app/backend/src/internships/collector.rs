@@ -872,8 +872,48 @@ fn interval_from_env(name: &str, default_secs: u64) -> Option<Duration> {
 /// Two tasks rather than one because they answer to different clocks: collection is bounded by
 /// how often other people's job boards change, while a *deadline* passing needs no new data at
 /// all and should be noticed within the hour.
-pub fn spawn(pool: SqlitePool) {
-    match interval_from_env("INTERNSHIP_COLLECT_INTERVAL_SECS", DEFAULT_COLLECT_INTERVAL_SECS) {
+/// Start the internship subsystem: startup housekeeping, then scheduling.
+///
+/// Call once from `main`, awaited — the same shape as `auth::purge_expired_sessions`, and for
+/// the same reason: it is housekeeping that must happen before anything else reads the tables.
+pub async fn start(pool: SqlitePool) {
+    start_with(
+        pool,
+        interval_from_env("INTERNSHIP_COLLECT_INTERVAL_SECS", DEFAULT_COLLECT_INTERVAL_SECS),
+        interval_from_env("INTERNSHIP_EXPIRY_INTERVAL_SECS", DEFAULT_EXPIRY_INTERVAL_SECS),
+    )
+    .await;
+}
+
+/// [`start`] with the schedule injected, so the ordering below can be tested without touching
+/// process environment variables (racy against every other test in the binary) and without
+/// spawning anything that would reach the network.
+pub(crate) async fn start_with(
+    pool: SqlitePool,
+    collect_interval: Option<Duration>,
+    expiry_interval: Option<Duration>,
+) {
+    // **Unconditional, and outside every schedule check.** This used to live inside the
+    // collector task, which meant `INTERNSHIP_COLLECT_INTERVAL_SECS=0` skipped it entirely:
+    // runs abandoned by a killed process were never closed, the UI reported "Collecting…"
+    // forever, and `should_collect_on_startup` read the phantom as recent and declined to
+    // collect. That is the original lockout, reachable again through the one setting
+    // documented for keeping the collector quiet.
+    //
+    // A run cannot outlive its process, so this is true whatever the schedule says.
+    if let Err(err) = reconcile_interrupted_runs(&pool).await {
+        eprintln!("internships: could not reconcile abandoned runs: {err:?}");
+    }
+
+    spawn_scheduled(pool, collect_interval, expiry_interval);
+}
+
+fn spawn_scheduled(
+    pool: SqlitePool,
+    collect_interval: Option<Duration>,
+    expiry_interval: Option<Duration>,
+) {
+    match collect_interval {
         None => println!("internships: scheduled collection disabled — POST /internships/collect only"),
         Some(interval) => {
             println!(
@@ -897,10 +937,6 @@ pub fn spawn(pool: SqlitePool) {
                 // be a fresh sweep of other people's job boards. So the question asked is
                 // "is what we have older than the cadence?", which is false on a quick restart
                 // and true on a cold start or after a long gap.
-                if let Err(err) = reconcile_interrupted_runs(&pool).await {
-                    eprintln!("internships: could not reconcile abandoned runs: {err:?}");
-                }
-
                 if should_collect_on_startup(&pool, interval).await {
                     println!("internships: no recent collection — running one now");
                     match collect(&pool, "startup").await {
@@ -945,7 +981,7 @@ pub fn spawn(pool: SqlitePool) {
         }
     }
 
-    match interval_from_env("INTERNSHIP_EXPIRY_INTERVAL_SECS", DEFAULT_EXPIRY_INTERVAL_SECS) {
+    match expiry_interval {
         None => println!("internships: scheduled expiry sweep disabled"),
         Some(interval) => {
             tokio::spawn(async move {
@@ -1085,6 +1121,39 @@ mod integration_tests {
                 .unwrap();
         assert!(finished.is_some(), "an abandoned run must stop reading as in-flight");
         assert_eq!(interrupted, 1, "but must not read as completed either");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_abandoned_runs_even_when_scheduling_is_disabled() {
+        // The regression this pins: reconciliation used to sit *inside* the collector task, so
+        // `INTERNSHIP_COLLECT_INTERVAL_SECS=0` skipped it. A run abandoned by a killed process
+        // then stayed "in flight" forever — the UI showed "Collecting…" against a database
+        // where nothing was running, and `should_collect_on_startup` read the phantom as a
+        // recent run and declined to collect. Both intervals are `None` here, which is exactly
+        // that configuration, and also means no task is spawned and nothing reaches the
+        // network.
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO collection_runs (id, started_at, trigger) VALUES ('r1', ?1, 'startup')")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        start_with(pool.clone(), None, None).await;
+
+        let (finished, interrupted): (Option<String>, i64) =
+            sqlx::query_as("SELECT finished_at, interrupted FROM collection_runs WHERE id = 'r1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            finished.is_some(),
+            "an abandoned run must be closed even with the scheduler off"
+        );
+        assert_eq!(interrupted, 1);
+
+        // And the phantom must no longer suppress a real collection.
+        assert!(should_collect_on_startup(&pool, Duration::from_secs(21_600)).await);
     }
 
     #[tokio::test]

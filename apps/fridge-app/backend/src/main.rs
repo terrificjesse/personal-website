@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // Internship collection + the expiry sweep. Both are cadenced by env vars and both
     // disable cleanly; see `internships::collector`. Spawned rather than awaited — a slow or
     // blocked job board must never delay the server binding its port.
-    internships::collector::spawn(pool.clone());
+    internships::collector::start(pool.clone()).await;
 
     // Load the FoodKeeper and MealDB catalogs
     let catalog = Arc::new(foodkeeper::Catalog::load()?);
