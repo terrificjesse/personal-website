@@ -64,6 +64,29 @@ different Firefox profile needs its own entry.
 Backend URL at anything else and the fetch fails; **Test connection** says so explicitly rather
 than looking like a dead backend. Add the origin there and reload the extension.
 
+## Permissions, and why each one
+
+| Permission | For |
+|---|---|
+| `alarms`, `notifications`, `storage` | the 8e alert poll |
+| host `localhost:8080` | talking to the backend |
+| `activeTab` + `scripting` | 8f autofill on pages that are *not* a known ATS |
+
+`activeTab` grants access to **one tab, for one invocation**, when you click the toolbar
+button. It is not standing access. Phase 7 found company-owned careers pages are most of the
+corpus and cannot be enumerated into match patterns, so this is the only honest way to reach
+them; the alternative is `<all_urls>`, which is permanent access to every page you visit, and
+`CLAUDE.md` rules it out.
+
+The known ATS hosts are handled separately, by declarative `content_scripts` on the six
+hostnames `dedup::ats_identity` parses. The script only registers a listener on load — filling
+happens on the popup's button and nowhere else.
+
+**Changing permissions needs a fresh install, not a Reload.** Firefox computes a temporary
+add-on's permission grants when it is installed, so after a manifest permission change,
+`browser.scripting` and friends stay `undefined` until you **Remove** the add-on in
+`about:debugging` and **Load Temporary Add-on…** again.
+
 ## Not in this phase
 
 No content script, no autofill, no answer library (8f/8g), and nothing to do with Gmail

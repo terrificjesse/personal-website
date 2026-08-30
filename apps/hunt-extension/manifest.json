@@ -11,13 +11,6 @@
     }
   },
 
-  "//permissions": [
-    "activeTab + scripting are Phase 8f. activeTab grants access to ONE tab, for THIS",
-    "invocation, when you click the toolbar button — it is not standing access to anything.",
-    "Phase 7 found company careers pages are most of the corpus and cannot be enumerated, so",
-    "this is the only honest way to reach them. The alternative is <all_urls>, which is",
-    "permanent access to every page you visit, and CLAUDE.md rules it out."
-  ],
   "permissions": ["alarms", "notifications", "storage", "activeTab", "scripting"],
 
   "host_permissions": [
@@ -25,13 +18,6 @@
     "http://127.0.0.1:8080/*"
   ],
 
-  "//content_scripts": [
-    "Phase 8f. The six hostnames dedup::ats_identity actually parses — four platforms, since",
-    "boards., job-boards. and job-boards.eu. are all Greenhouse. Taken from the code rather",
-    "than from CLAUDE.md, which lists two hosts (workable, rippling) that nothing parses.",
-    "The script only registers a listener on load; filling happens on the popup's button.",
-    "NOT <all_urls>, and no activeTab yet — company careers pages come in a later step."
-  ],
   "content_scripts": [
     {
       "matches": [
