@@ -15,6 +15,7 @@
 //! therefore the record, and the client's storage is a cache. That is rule 6, and it is the
 //! reason this is a table rather than a queue in the extension.
 
+pub mod answers;
 pub mod events;
 pub mod profile;
 pub mod tokens;
