@@ -200,6 +200,7 @@ pub fn build_router(state: AppState) -> Router {
             "/hunt/profile",
             get(hunt::get_profile).put(hunt::put_profile),
         )
+        .route("/hunt/posting-for", get(hunt::posting_for_page))
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

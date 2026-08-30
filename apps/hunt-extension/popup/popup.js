@@ -271,3 +271,105 @@ void (async () => {
     ? "Known application site."
     : "Other page — filling will ask this tab for access.";
 })();
+
+
+/*
+ * "Track this application" — one click, never automatic.
+ *
+ * Filling a form is not applying. The extension has no way to know whether you pressed submit,
+ * and inventing an `internship_applications` row for a form you abandoned would corrupt the one
+ * table Phase 7 built to be trustworthy: `applied_at` is NOT NULL and means *you applied*.
+ * So this is offered and never assumed, which is also why it appears after a fill rather than
+ * as part of one.
+ *
+ * This is the legitimate way to create a tracker row, and it does not contradict the rule that
+ * `Hunt/Outreach` must never create one — there, nobody applied. It matters beyond convenience:
+ * an email can only be matched to an application that exists, so the rows this creates are what
+ * make the inbox agent work later.
+ */
+
+const trackButton = document.getElementById("track");
+const trackResultEl = document.getElementById("trackResult");
+
+/** What the backend and the page each think this application is. */
+async function identifyPage(tabId) {
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+  const auth = config.token ? { Authorization: `Bearer ${config.token}` } : {};
+
+  let page = null;
+  try {
+    page = await browser.tabs.sendMessage(tabId, { type: "hunt-describe" });
+  } catch {
+    // No content script yet; the fill path injects it. Nothing to describe until then.
+  }
+  if (!page?.url) return null;
+
+  const res = await fetch(`${base}/hunt/posting-for?url=${encodeURIComponent(page.url)}`, {
+    credentials: "include",
+    headers: auth,
+  });
+  const known = res.ok ? await res.json() : null;
+
+  return { page, known, base, auth };
+}
+
+async function offerTracking(tabId) {
+  const found = await identifyPage(tabId);
+  if (!found) return;
+
+  const { page, known } = found;
+  if (known?.already_tracked) {
+    trackResultEl.textContent = "Already in your tracker.";
+    return;
+  }
+  // Only offer when we can name a posting we collected. Without one there is nothing to
+  // snapshot from, and a tracker row of guesses is worse than no row — see the migration's
+  // note on internship_applications being renderable from itself alone.
+  if (!known?.posting_id) {
+    trackResultEl.textContent = "Not one of your collected postings — add it from the site.";
+    return;
+  }
+
+  trackButton.hidden = false;
+  trackButton.textContent = `Track: ${known.company_name || page.company || "this role"}`;
+  trackButton.dataset.postingId = known.posting_id;
+}
+
+trackButton?.addEventListener("click", async () => {
+  const postingId = trackButton.dataset.postingId;
+  if (!postingId) return;
+
+  trackResultEl.textContent = "Saving…";
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/internships/applications`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(config.token ? { Authorization: `Bearer ${config.token}` } : {}),
+      },
+      body: JSON.stringify({ posting_id: postingId }),
+    });
+    if (res.status === 409) {
+      trackResultEl.textContent = "Already in your tracker.";
+    } else if (!res.ok) {
+      trackResultEl.textContent = `Could not track it (${res.status}).`;
+      return;
+    } else {
+      trackResultEl.textContent = "Added to your tracker as applied.";
+    }
+    trackButton.hidden = true;
+  } catch (err) {
+    trackResultEl.textContent = `Could not track it: ${err.message}`;
+  }
+});
+
+// Offered on open, so it is available whether or not you used the fill button — you may well
+// have typed the form yourself.
+void (async () => {
+  const tab = await activeTab();
+  if (tab) await offerTracking(tab.id).catch(() => {});
+})();

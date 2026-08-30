@@ -191,11 +191,44 @@ function fill(profile) {
   return report;
 }
 
+/**
+ * What this page appears to be an application for.
+ *
+ * A guess, and labelled as one: the popup shows it and you confirm before anything is written.
+ * The backend does the authoritative work — it matches the URL against the collected corpus
+ * with the same `dedup` rules the collector uses — and this only has to be good enough for the
+ * cases that are *not* in the corpus, which Phase 7 found are most of them.
+ */
+function describePage() {
+  const meta = (name) =>
+    document.querySelector(`meta[property="${name}"], meta[name="${name}"]`)?.content?.trim() ||
+    null;
+
+  const heading = document.querySelector("h1")?.textContent?.trim() || null;
+
+  // The board slug is the company on every ATS we match — `/acme/jobs/123`, `/acme/uuid`.
+  // Taken from the path rather than from page text, which is styled differently on each.
+  const segments = location.pathname.split("/").filter(Boolean);
+  const slug = segments.length > 0 ? segments[0] : null;
+  const fromSlug = slug
+    ? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+    : null;
+
+  return {
+    url: location.href,
+    title: heading || meta("og:title") || document.title || null,
+    company: meta("og:site_name") || fromSlug || null,
+  };
+}
+
 // The only entry point. Nothing above runs until this message arrives, and the message only
 // comes from the popup's button.
 browser.runtime.onMessage.addListener((message) => {
   if (message?.type === "hunt-fill") {
     return Promise.resolve(fill(message.profile || {}));
+  }
+  if (message?.type === "hunt-describe") {
+    return Promise.resolve(describePage());
   }
   if (message?.type === "hunt-ping") {
     return Promise.resolve({ ready: true, host: location.host });

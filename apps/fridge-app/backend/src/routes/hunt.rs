@@ -121,6 +121,16 @@ pub async fn ack_event(
     }
 }
 
+/// Same as [`internal`], for the handlers that talk to sqlx directly rather than through a
+/// `hunt::` function. Two helpers because the two error types are genuinely different, not
+/// because anyone enjoys having two.
+fn sql(context: &'static str) -> impl Fn(sqlx::Error) -> StatusCode {
+    move |err| {
+        eprintln!("hunt: {context} failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// Log the cause, tell the client nothing. Mirrors `routes::internships::internal`.
 fn internal(context: &'static str) -> impl Fn(anyhow::Error) -> StatusCode {
     move |err| {
@@ -227,4 +237,103 @@ pub async fn put_profile(
     // `None` means a field was over the length cap — a client bug, so 400 rather than a
     // silent truncation that would put a half-written answer on a real application.
     saved.map(Json).ok_or(StatusCode::BAD_REQUEST)
+}
+
+// ------------------------------------------------------------------------------------------
+// "Track this application" (Phase 8f)
+// ------------------------------------------------------------------------------------------
+
+/// What we know about the page the user is applying on.
+#[derive(Debug, Clone, Serialize)]
+pub struct PostingForPage {
+    /// Present when this page is a posting we already collected. Passing it to
+    /// `POST /internships/applications` gets the full snapshot for free.
+    pub posting_id: Option<String>,
+    pub company_name: Option<String>,
+    pub title: Option<String>,
+    /// Set when the user has already tracked this posting, so the extension can say
+    /// "already tracked" rather than offering a button that will 409.
+    pub already_tracked: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostingForPageQuery {
+    pub url: String,
+}
+
+/// Match a page URL against the collected corpus.
+///
+/// # Why this reuses `dedup` rather than comparing strings
+///
+/// The URL in the address bar is never the one we stored: Lever appends `/apply`, Ashby
+/// `/application`, and real links carry `?gh_jid=`, `?mobile=` and `?ats=` tracking noise —
+/// all measured in `docs/INTERNSHIP_SCRAPING.md` § C, and all of it enough to make an equality
+/// test miss. `dedup::ats_identity` already knows how to reduce these to `(ats, board, job id)`,
+/// and using it here means one definition of "the same posting" instead of a second one that
+/// drifts.
+///
+/// A miss is a normal answer, not an error: Phase 7 found company-owned careers pages are the
+/// majority of the corpus, and none of them are in it.
+pub async fn posting_for_page(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Query(params): Query<PostingForPageQuery>,
+) -> Result<Json<PostingForPage>, StatusCode> {
+    use crate::internships::dedup::{ats_identity, canonical_url};
+
+    let wanted_identity = ats_identity(&params.url);
+    let wanted_canonical = canonical_url(&params.url);
+
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, canonical_url, company_name FROM internship_postings")
+            .fetch_all(&pool)
+            .await
+            .map_err(sql("scanning postings for this page"))?;
+
+    // A linear scan over a corpus this size (~1,400 rows) costs nothing and keeps the matching
+    // rule in one place. Indexing a derived key would mean storing it, and storing it would
+    // mean a migration whose only job is to speed up a query nobody has measured.
+    let mut matched = None;
+    for (id, url, _company) in &rows {
+        let same = match (&wanted_identity, ats_identity(url)) {
+            (Some(wanted), Some(found)) => *wanted == found,
+            _ => canonical_url(url) == wanted_canonical,
+        };
+        if same {
+            matched = Some(id.clone());
+            break;
+        }
+    }
+
+    let Some(posting_id) = matched else {
+        return Ok(Json(PostingForPage {
+            posting_id: None,
+            company_name: None,
+            title: None,
+            already_tracked: false,
+        }));
+    };
+
+    let details: Option<(String, String)> =
+        sqlx::query_as("SELECT company_name, title FROM internship_postings WHERE id = ?")
+            .bind(&posting_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(sql("reading the matched posting"))?;
+
+    let already_tracked: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM internship_applications WHERE user_id = ? AND posting_id = ?",
+    )
+    .bind(&user.id)
+    .bind(&posting_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(sql("checking whether this is already tracked"))?;
+
+    Ok(Json(PostingForPage {
+        posting_id: Some(posting_id),
+        company_name: details.as_ref().map(|d| d.0.clone()),
+        title: details.map(|d| d.1),
+        already_tracked: already_tracked.is_some(),
+    }))
 }
