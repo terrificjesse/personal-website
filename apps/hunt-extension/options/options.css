@@ -95,6 +95,7 @@ button {
 
 .result {
   min-height: 1.5rem;
+  white-space: pre-wrap;
   color: var(--muted);
 }
 

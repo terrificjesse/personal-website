@@ -98,7 +98,11 @@ async function load() {
     if (origin && !(await browser.permissions.contains({ origins: [`${origin}/*`] }))) {
       return say(`Access to ${origin} isn't granted — open Settings and press Test connection.`, true);
     }
-    return say(`Can't reach ${config.backendUrl} — is the backend running?`, true);
+    return say(
+      `${config.backendUrl} didn't answer. If the site works in a tab, open Settings and ` +
+        `press Test connection — it will print the exact fix.`,
+      true,
+    );
   }
 
   if (response.status === 401) {

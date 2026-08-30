@@ -123,6 +123,12 @@ document.getElementById("test").addEventListener("click", async () => {
   try {
     response = await fetch(`${base}/hunt/events?limit=1`, { credentials: "include" });
   } catch (err) {
+    // A credentialed cross-origin response with no `Access-Control-Allow-Origin` is DISCARDED
+    // by the browser before this code can read it, and surfaces here as the same bare
+    // TypeError a dead server produces. The backend's ALLOWED_ORIGINS has to name this
+    // extension, so print the origin it needs to be told about rather than making the user go
+    // digging for a per-profile UUID.
+    const self = browser.runtime.getURL("").replace(/\/$/, "");
     // Name the permission case explicitly: a blocked request and a dead server both arrive
     // here as a bare TypeError, and telling them apart by hand is what wasted the evening.
     const stillPermitted = await browser.permissions.contains(wanted);
@@ -130,8 +136,10 @@ document.getElementById("test").addEventListener("click", async () => {
       return say(`Access to ${origin} is not granted, so the request was blocked.`, "bad");
     }
     return say(
-      `Can't reach ${origin} — the request left the extension and got nothing back. ` +
-        `Is the backend running? (${err.name}: ${err.message})`,
+      `${origin} did not answer this extension. If the site itself works in a tab, the ` +
+        `backend is running and the response is being discarded for CORS — add this exact ` +
+        `origin to ALLOWED_ORIGINS in the backend .env and restart it:\n\n${self}\n\n` +
+        `(${err.name}: ${err.message})`,
       "bad",
     );
   }

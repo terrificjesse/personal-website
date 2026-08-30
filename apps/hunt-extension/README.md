@@ -37,6 +37,27 @@ alarms, so nothing it remembers can be trusted to still be there.
 Clicking a notification opens the posting. The popup lists recent alerts and says when the last
 check ran and how it went.
 
+## The backend has to allow the extension's origin
+
+`credentials: "include"` makes every request a **credentialed cross-origin** request. The
+browser discards the response unless it carries `Access-Control-Allow-Origin` naming the
+caller — and the backend's `ALLOWED_ORIGINS` lists the *site's* origins, not the extension's.
+A discarded response reaches JS as a bare `TypeError`, indistinguishable from a dead server,
+which is why the extension used to report "can't reach localhost" while `curl` got a 200.
+
+The extension's origin is `moz-extension://<uuid>`, where the UUID is generated per Firefox
+profile. Find it either way:
+
+- **Test connection** prints it in the failure message, or
+- `about:debugging#/runtime/this-firefox` → the extension card → **Internal UUID**
+
+Add it to `ALLOWED_ORIGINS` in `apps/fridge-app/backend/.env` and restart the backend:
+
+    ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,moz-extension://<uuid>
+
+It is stable for that profile, so this is a one-time step — but it is per-profile, so a
+different Firefox profile needs its own entry.
+
 ## Changing the backend origin
 
 `host_permissions` in `manifest.json` lists the origins the extension may talk to. Point the
