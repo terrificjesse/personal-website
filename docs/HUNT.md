@@ -171,17 +171,36 @@ duplicate notification; acking first would cost a silently dropped alert.
 ordinary `fridge_session` cookie on the request. Signed in on the site means signed in in the
 extension. **There is no extension token and no second auth path.**
 
-The risk, and the reason the options page has a **Test connection** button: that cookie is
-`SameSite=Lax`, and a request from a `moz-extension://` page to the backend is cross-site.
-Host permissions definitely exempt the request from CORS; whether Firefox also attaches a Lax
-cookie is the open question. The three failure modes all present as "no notifications" and have
-completely different fixes, so they are stored as distinct states and named explicitly:
+### Firefox does not grant `host_permissions` from the manifest
 
-| Symptom | Fix |
-|---|---|
-| origin not in `host_permissions` | add it to `manifest.json`, reload the extension |
-| backend unreachable | start it |
-| reachable, 401 | sign in on the site — **or this is the SameSite problem** |
+**Found the hard way on 2026-08-29, and it will bite Phase 8f the same way.** In Chrome,
+`host_permissions` are granted at install and `fetch` to that origin just works. **Firefox MV3
+treats them as optional** — the user grants them per origin — and until they do, the fetch
+fails with a bare `TypeError` that is *identical* to the one a dead backend produces. The
+first version of this extension assumed Chrome's behaviour and consequently reported "can't
+reach localhost" while the backend was serving 200s to `curl`.
+
+So the extension asks rather than assumes: **Test connection** calls `permissions.request`,
+which Firefox honours because it runs inside a click handler. The background page cannot ask —
+`permissions.request` requires a user gesture and an alarm is not one — so `poll()` checks
+`permissions.contains` first and reports the distinct `unpermitted` state instead of blaming
+the server.
+
+### The failure modes, kept distinct
+
+They all present as "no notifications" and have completely different fixes, so each is a
+separate stored state rather than one "error":
+
+| State | Meaning | Fix |
+|---|---|---|
+| `unpermitted` | the origin is requested but not granted | Test connection, and accept the prompt |
+| `unreachable` | the request left and got nothing back | start the backend |
+| `unauthenticated` | reachable, 401 | sign in on the site — **or this is the SameSite problem** |
+| `error` | reachable, unexpected status | read the status code |
+
+The remaining open question is the cookie: `fridge_session` is `SameSite=Lax` and a request
+from a `moz-extension://` page is cross-site. Host permissions exempt the request from CORS;
+whether Firefox also attaches a Lax cookie is what `unauthenticated` vs `ok` answers.
 
 ## Three rules worth not rediscovering
 

@@ -16,6 +16,17 @@ one. Rules and decisions live in `CLAUDE.md` next to this file; this is just how
 A temporary add-on is unloaded when Firefox closes. `browser_specific_settings.gecko.id` is
 set, so its stored settings survive being loaded again.
 
+**Step 4 is not optional, and it is not just a check.** Firefox MV3 treats `host_permissions`
+as *optional*: listing the backend origin in `manifest.json` requests it, it does not grant it.
+Until you grant it, every fetch fails with a bare `TypeError` that is indistinguishable from
+the backend being down. **Test connection** asks for the grant — Firefox will show a permission
+prompt the first time — because `permissions.request` only works from a user gesture, which an
+alarm in the background page is not. You can also grant it by hand from the 🧩 Extensions
+button → Internship Hunt → ⚙ → *Always Allow on localhost*.
+
+(This is a real difference from Chrome, where declaring a host permission grants it at install.
+The extension does not assume it; it asks.)
+
 ## What it does
 
 `browser.alarms` wakes the background page every few minutes. It fetches unacked events, shows

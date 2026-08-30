@@ -85,11 +85,27 @@ async function load() {
       credentials: "include",
     });
   } catch (err) {
+    // Same trap as the options page: an ungranted host permission and a dead backend both
+    // arrive here as a bare TypeError. Firefox MV3 does not grant host_permissions from the
+    // manifest alone, so say which one it is rather than blaming the server.
+    const origin = (() => {
+      try {
+        return new URL(config.backendUrl).origin;
+      } catch {
+        return null;
+      }
+    })();
+    if (origin && !(await browser.permissions.contains({ origins: [`${origin}/*`] }))) {
+      return say(`Access to ${origin} isn't granted — open Settings and press Test connection.`, true);
+    }
     return say(`Can't reach ${config.backendUrl} — is the backend running?`, true);
   }
 
   if (response.status === 401) {
     return say("Not signed in. Open the site, log in, then check again.", true);
+  }
+  if (response.status === 403) {
+    return say("The backend refused the request.", true);
   }
   if (!response.ok) {
     return say(`Backend answered HTTP ${response.status}.`, true);

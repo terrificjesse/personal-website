@@ -59,6 +59,15 @@ function apiUrl(settings, path) {
   return `${settings.backendUrl.replace(/\/+$/, "")}${path}`;
 }
 
+/** The origin of a configured URL, or null if it isn't a URL at all. */
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * One poll.
  *
@@ -75,6 +84,19 @@ function apiUrl(settings, path) {
  */
 async function poll() {
   const settings = await getSettings();
+
+  // Firefox MV3 treats host_permissions as OPTIONAL — declaring the backend origin in the
+  // manifest does not grant it, the user does, per origin. Checked before fetching because a
+  // blocked request throws exactly the same bare TypeError as a dead server, so without this
+  // the status would say "unreachable" and send you to restart a backend that is running.
+  //
+  // The grant can only be *asked for* from a user gesture, which an alarm is not. So this
+  // reports the state and the options page does the asking.
+  const origin = originOf(settings.backendUrl);
+  if (origin && !(await browser.permissions.contains({ origins: [`${origin}/*`] }))) {
+    return setStatus({ state: "unpermitted", detail: origin });
+  }
+
   let response;
 
   try {

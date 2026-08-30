@@ -1,12 +1,24 @@
 /*
  * Settings, plus the one diagnostic that matters.
  *
- * "Test connection" exists because the three ways this can be broken produce the same
- * symptom — no notifications — and they have completely different fixes:
+ * "Test connection" exists because the ways this can be broken produce the same symptom —
+ * no notifications — and they have completely different fixes:
  *
+ *   the origin isn't granted              -> grant it (this button asks; see below)
  *   the origin isn't in host_permissions  -> edit manifest.json and reload the extension
  *   the backend isn't running             -> start it
  *   the backend doesn't know who we are   -> sign in on the site
+ *
+ * # Firefox does NOT grant host_permissions just because the manifest asks
+ *
+ * This cost an evening. In Chrome, `host_permissions` in the manifest are granted at install
+ * and `fetch` to that origin just works. **Firefox MV3 treats them as optional** — the user
+ * grants them per-origin, and until they do, a fetch fails the same way an unreachable server
+ * does: a bare `TypeError`, with nothing to say permission was the problem.
+ *
+ * So this button asks for the grant rather than assuming it. `permissions.request` must be
+ * called from a user gesture, which a click on this button is; calling it from the background
+ * page's alarm would be rejected outright, and that is why the ask lives here and not there.
  *
  * The last one is the one to watch. The extension authenticates with the site's own
  * `fridge_session` cookie, which is `SameSite=Lax`, and a request from a `moz-extension://`
@@ -84,20 +96,44 @@ document.getElementById("test").addEventListener("click", async () => {
 
   // Asked first, because without it the fetch below fails in a way that looks exactly like
   // the backend being down.
-  const permitted = await browser.permissions.contains({ origins: [`${origin}/*`] });
+  const wanted = { origins: [`${origin}/*`] };
+  let permitted = await browser.permissions.contains(wanted);
+
   if (!permitted) {
-    return say(
-      `This extension has no permission for ${origin}. Add it to host_permissions in ` +
-        `manifest.json and reload the extension.`,
-      "bad",
-    );
+    try {
+      // The prompt. Firefox shows it because this is running inside a click handler.
+      permitted = await browser.permissions.request(wanted);
+    } catch (err) {
+      return say(
+        `${origin} is not one of this extension's host_permissions, so it cannot be ` +
+          `granted at runtime. Add it to manifest.json and reload the extension. (${err})`,
+        "bad",
+      );
+    }
+    if (!permitted) {
+      return say(
+        `Access to ${origin} was declined. The extension cannot poll for alerts without it — ` +
+          `press Test connection again to be asked once more.`,
+        "bad",
+      );
+    }
   }
 
   let response;
   try {
     response = await fetch(`${base}/hunt/events?limit=1`, { credentials: "include" });
   } catch (err) {
-    return say(`Can't reach ${origin}. Is the backend running? (${err})`, "bad");
+    // Name the permission case explicitly: a blocked request and a dead server both arrive
+    // here as a bare TypeError, and telling them apart by hand is what wasted the evening.
+    const stillPermitted = await browser.permissions.contains(wanted);
+    if (!stillPermitted) {
+      return say(`Access to ${origin} is not granted, so the request was blocked.`, "bad");
+    }
+    return say(
+      `Can't reach ${origin} — the request left the extension and got nothing back. ` +
+        `Is the backend running? (${err.name}: ${err.message})`,
+      "bad",
+    );
   }
 
   if (response.status === 401) {
