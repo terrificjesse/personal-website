@@ -672,7 +672,7 @@ reading `applied` for a job you already interviewed at.
 - [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
   table, which 8e built.
 - [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
-- [gen] **8f — Autofill. — filling verified 2026-08-30**
+- [gen] **8f — Autofill. — complete 2026-08-30**
 - [gen] **8g — The answer library.** Save answers, similarity retrieval, company-specific
   flagging. *Checkpoint:* a "why do you want to work here" answer stored against one company is
   **not** offered for another, and a genuinely reusable one ("a project you're proud of") is.
@@ -754,7 +754,7 @@ themselves distinctly** — `unpermitted`, `unreachable`, `no-token`, `token-rej
 one message covering four unrelated causes is what turned a ten-minute check into a day. 8f
 authenticates identically and inherits the diagnosis rather than the search.
 
-### 8f — the three ATSs fill, 2026-08-30
+### 8f — complete 2026-08-30
 
 Content script, label-based mapper, `cv_profile`, the `activeTab` path and the
 "track this application" offer. Full reference: `docs/HUNT.md`.
@@ -785,9 +785,13 @@ is.
 
 Every label from all three live forms is now a test — 79 checks against markup that exists.
 
-**Still to confirm by eye**, and deliberately not claimed here: that React-controlled values
-survive a re-render, and that nothing fires on page load. Both are checkpoint clauses; neither
-is provable from the classifier or from a form filled once.
+**The other three clauses hold too**, each confirmed on a live form rather than inferred:
+values survive clicking around a React-controlled form, so the native-setter path really does
+register with the framework rather than being wiped on the next render; nothing fires on page
+load, which is rule 10's core promise; and no EEO field is touched — refused by the classifier,
+pinned by tests, and visibly untouched on Lever's gender, race and veteran selects.
+
+Nothing was submitted on any of the three.
 
 ### Open questions
 

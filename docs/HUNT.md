@@ -27,7 +27,7 @@ edited.
 | Verified in Firefox itself | ⬜ **not yet** — see "What is not proven" below |
 | Email producer — OA / interview / offer mail | ⬜ 8d, writes to the same table |
 | Gmail OAuth, sync, classify, match, labels | ⬜ 8a–8c |
-| CV autofill on ATS pages | ⬜ 8f |
+| CV autofill on ATS pages | ✅ Greenhouse, Lever, Ashby — verified live 2026-08-30 |
 | Answer library | ⬜ 8g |
 
 ## The one structural idea
@@ -321,6 +321,58 @@ distinctly.** `unpermitted`, `unreachable`, `no-token`, `token-rejected`, each a
 stored state with its own message naming its own fix. A single "can't reach" covering four
 unrelated causes is what turned a ten-minute check into a day, and 8f authenticates the same
 way, so it inherits the diagnosis rather than the search.
+
+## Autofill (Phase 8f)
+
+`cv_profile` (migration `0017`) holds the details; the site's **CV details** panel edits them;
+the extension fills them into ATS forms **on a button press and nothing else**.
+
+| Piece | Where |
+|---|---|
+| What may be filled, and what must never be | `content/fields.js` — pure, no DOM |
+| Reading labels, setting values, reporting | `content/fill.js` |
+| The button, injection, the tracking offer | `popup/popup.js` |
+| The profile itself | `hunt::profile`, `GET`/`PUT /hunt/profile` |
+| Matching a page to a collected posting | `GET /hunt/posting-for` |
+
+**Labels, not selectors.** ATS markup is regenerated on every redesign; the visible label
+survives. Five sources in order: `label[for]`, a wrapping `<label>`, `aria-labelledby`,
+`aria-label`, `placeholder`, then `name`/`id` as a last resort.
+
+**The blocklist runs before any matching** — rule 10's "checked before the fuzzy mapper, not
+after". Reordering it is a silent safety regression that passes every happy-path test.
+
+**Three refusals beyond the blocklist**, each its own failure if missed: a field that already
+holds a value is never overwritten; radios and checkboxes are skipped entirely, which is where
+EEO questions live; nothing is ever clicked.
+
+### What reading three live forms caught
+
+None of it was visible against a synthetic form, and one was in the safety layer.
+
+| Form | Defect |
+|---|---|
+| Lever | **The demographic blocklist silently failed.** A `<select>`'s options are rendered into the label, so "Gender" arrives as `GenderSelect ...MaleFemale…` — normalized `genderselect`, and `\bgender\b` never fires. "Veteran status" matched *only* because its pattern happens to lack a word boundary, which is what made the failure look like success |
+| Lever | "Other website" sits beside "Portfolio URL" and both were filled with the portfolio |
+| Ashby | The name field is labelled simply "Name", excluded on purpose because it matches inside "Company Name" — now an exact-only match |
+| Ashby | A real `g-recaptcha-response` textarea is in the form. Nothing mapped to it, but rule 11 says do not touch CAPTCHAs, and "nothing happens to match" is not a policy |
+| Greenhouse | "What is your expected graduation date?" matched nothing. `graduation_date` is now derived as `MM/YYYY`, and fills **only** when both month and year are known — a bare year in a box labelled *date* looks like a complete answer and is not |
+
+Every label from all three is now a test: 79 checks in `content/fields.test.mjs`, runnable with
+`node content/fields.test.mjs`, against markup that exists rather than markup someone imagined.
+
+### Two Firefox defaults that both point the wrong way for embeds
+
+A company careers page often embeds the ATS rather than linking to it. `content_scripts`
+defaults `all_frames` to **false**, so a matching document only gets the script as a tab's top
+frame — an embedded Greenhouse form, whose URL matches perfectly, was skipped. And
+`activeTab` grants the top-level origin only, so `allFrames` on `executeScript` cannot reach a
+cross-origin iframe on its own. The declarative match with `all_frames: true` is what actually
+covers the embed.
+
+`scripting.executeScript` file paths also resolve relative to the **calling page**, not the
+extension root — from `popup/popup.html`, `content/fields.js` became `popup/content/fields.js`.
+Chrome resolves from the root, which is why every example omits the leading slash.
 
 ## Seams left for the rest of Phase 8
 
