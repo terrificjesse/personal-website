@@ -251,3 +251,262 @@ pub async fn live_source_names(pool: &SqlitePool) -> Result<Vec<String>> {
     .fetch_all(pool)
     .await?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use uuid::Uuid;
+
+    fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    /// A row with only the NOT NULL columns filled, for mutating per test.
+    fn row(id: &str) -> PostingRow {
+        PostingRow {
+            id: id.to_string(),
+            dedup_key: format!("key-{id}"),
+            company_key: "acme".into(),
+            company_name: "Acme".into(),
+            title: "Software Engineer Intern".into(),
+            canonical_url: "https://example.com/1".into(),
+            term_season: None,
+            term_year: None,
+            location_raw: None,
+            location_city: None,
+            location_region: None,
+            location_country: None,
+            is_remote: None,
+            pay_min: None,
+            pay_max: None,
+            pay_currency: None,
+            pay_period: None,
+            pay_raw: None,
+            class_year_min: None,
+            class_year_max: None,
+            class_year_raw: None,
+            posted_at: None,
+            posted_at_is_estimated: false,
+            deadline: None,
+            first_seen_at: at(2026, 8, 1),
+            last_seen_at: at(2026, 8, 20),
+            expired_at: None,
+            expiry_reason: None,
+        }
+    }
+
+    // --- the translation itself, tested directly ---
+    //
+    // `into_posting` is a pure function, which matters here: the interesting cases are rows
+    // the CHECK constraints in migration 0012 would refuse, so they cannot be reached by
+    // inserting and reading back. Constructing the row directly is the only way to prove the
+    // translation layer defends itself rather than trusting the database to have done it.
+
+    #[test]
+    fn a_full_row_round_trips_into_the_typed_model() {
+        let mut r = row("p1");
+        r.term_season = Some("summer".into());
+        r.term_year = Some(2027);
+        r.location_raw = Some("San Francisco, CA".into());
+        r.location_city = Some("San Francisco".into());
+        r.is_remote = Some(false);
+        r.pay_min = Some(45.0);
+        r.pay_max = Some(55.0);
+        r.pay_currency = Some("USD".into());
+        r.pay_period = Some("hour".into());
+        r.class_year_min = Some(2027);
+        r.deadline = Some(at(2026, 9, 1));
+
+        let p = r.into_posting();
+        assert_eq!(p.term_season, Some(Season::Summer));
+        assert_eq!(p.term_year, Some(2027));
+        assert_eq!(p.location.city.as_deref(), Some("San Francisco"));
+        assert_eq!(p.location.is_remote, Some(false));
+        let pay = p.pay.clone().expect("a complete pay tuple must survive");
+        assert_eq!((pay.min, pay.max, pay.period), (45.0, Some(55.0), PayPeriod::Hour));
+        assert_eq!(pay.currency, "USD");
+        assert_eq!(p.class_years.min, Some(2027));
+        assert!(p.is_live());
+    }
+
+    #[test]
+    fn pay_without_a_currency_becomes_no_pay_rather_than_half_a_figure() {
+        // Migration 0012 has a CHECK forbidding this, so it should be unreachable — which is
+        // exactly why it is worth pinning here. An amount with no currency is not a comparable
+        // quantity, and the type system must not be handed one.
+        let mut r = row("p1");
+        r.pay_min = Some(45.0);
+        r.pay_period = Some("hour".into());
+        assert!(r.into_posting().pay.is_none());
+    }
+
+    #[test]
+    fn pay_without_a_period_becomes_no_pay() {
+        let mut r = row("p1");
+        r.pay_min = Some(45.0);
+        r.pay_currency = Some("USD".into());
+        assert!(r.into_posting().pay.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_pay_period_degrades_to_unknown_rather_than_panicking() {
+        // `'hourly'` instead of `'hour'`. The CHECK makes it unreachable today; if a future
+        // migration widens the column, this must lose the pay quietly rather than crash a
+        // request — and `pay_raw` still carries the original text.
+        let mut r = row("p1");
+        r.pay_min = Some(45.0);
+        r.pay_currency = Some("USD".into());
+        r.pay_period = Some("hourly".into());
+        r.pay_raw = Some("USD 45.00 per hour".into());
+        let p = r.into_posting();
+        assert!(p.pay.is_none());
+        assert_eq!(p.pay_raw.as_deref(), Some("USD 45.00 per hour"));
+    }
+
+    #[test]
+    fn is_remote_keeps_all_three_states() {
+        // The distinction the whole phase turns on: unknown is not onsite.
+        for (stored, expected) in [(None, None), (Some(false), Some(false)), (Some(true), Some(true))] {
+            let mut r = row("p1");
+            r.is_remote = stored;
+            assert_eq!(r.into_posting().location.is_remote, expected);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_season_becomes_unknown_not_a_default() {
+        let mut r = row("p1");
+        r.term_season = Some("monsoon".into());
+        assert_eq!(r.into_posting().term_season, None, "never guess a season");
+    }
+
+    #[test]
+    fn every_expiry_reason_the_schema_allows_is_readable() {
+        // A reason the translation cannot read silently becomes a live posting, because
+        // `is_live` keys on `expired_at`. Drift between this match and the CHECK constraint in
+        // migration 0012 is the hazard.
+        for (text, expected) in [
+            ("deadline_passed", ExpiryReason::DeadlinePassed),
+            ("vanished_from_sources", ExpiryReason::VanishedFromSources),
+            ("source_marked_closed", ExpiryReason::SourceMarkedClosed),
+            ("manual", ExpiryReason::Manual),
+        ] {
+            let mut r = row("p1");
+            r.expired_at = Some(at(2026, 8, 20));
+            r.expiry_reason = Some(text.into());
+            let p = r.into_posting();
+            assert_eq!(p.expiry_reason, Some(expected), "{text} did not translate");
+            assert!(!p.is_live());
+        }
+    }
+
+    // --- the queries, against a real database ---
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("store-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn insert(pool: &SqlitePool, id: &str, expired: bool) {
+        sqlx::query(
+            "INSERT INTO internship_postings
+                 (id, dedup_key, company_key, company_name, title, canonical_url,
+                  first_seen_at, last_seen_at, created_at, updated_at, expired_at, expiry_reason)
+             VALUES (?1, ?2, 'acme', 'Acme', 'SWE Intern', 'https://x/1',
+                     ?3, ?3, ?3, ?3, ?4, ?5)",
+        )
+        .bind(id)
+        .bind(format!("key-{id}"))
+        .bind(at(2026, 8, 1).to_rfc3339())
+        .bind(expired.then(|| at(2026, 8, 20).to_rfc3339()))
+        .bind(expired.then_some("manual"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn sight(pool: &SqlitePool, posting: &str, source: &str, external: &str) {
+        sqlx::query(
+            "INSERT INTO posting_sightings
+                 (id, posting_id, source, external_id, url, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, 'https://x/1', ?5, ?5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(posting)
+        .bind(source)
+        .bind(external)
+        .bind(at(2026, 8, 1).to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_postings_are_excluded_from_the_live_list() {
+        let pool = pool().await;
+        insert(&pool, "live", false).await;
+        insert(&pool, "gone", true).await;
+        let loaded = load_live_postings(&pool, None).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "live");
+    }
+
+    #[tokio::test]
+    async fn the_source_filter_matches_through_sightings() {
+        let pool = pool().await;
+        insert(&pool, "gh-only", false).await;
+        insert(&pool, "ashby-only", false).await;
+        sight(&pool, "gh-only", "greenhouse", "g-1").await;
+        sight(&pool, "ashby-only", "ashby", "a-1").await;
+
+        let gh = load_live_postings(&pool, Some("greenhouse")).await.unwrap();
+        assert_eq!(gh.len(), 1);
+        assert_eq!(gh[0].id, "gh-only");
+        assert_eq!(load_live_postings(&pool, Some("nobody")).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_posting_carried_by_two_sources_is_returned_once() {
+        // `EXISTS` rather than a join, precisely so the row is not duplicated per sighting.
+        let pool = pool().await;
+        insert(&pool, "shared", false).await;
+        sight(&pool, "shared", "greenhouse", "g-1").await;
+        sight(&pool, "shared", "simplify", "s-1").await;
+        assert_eq!(load_live_postings(&pool, Some("greenhouse")).await.unwrap().len(), 1);
+        assert_eq!(load_live_postings(&pool, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_null_prestige_stays_unknown_rather_than_becoming_zero() {
+        // The rule the ranking depends on: a company we know nothing about is not a company we
+        // know to be bad.
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO company_signals (company_key, company_name, first_seen_at, computed_at)
+             VALUES ('acme', 'Acme', ?1, ?1)",
+        )
+        .bind(at(2026, 8, 1).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let signals = load_company_signals(&pool).await.unwrap();
+        let acme = signals.get("acme").expect("keyed by company_key");
+        assert_eq!(acme.prestige, None, "NULL prestige must not read as 0.0");
+        assert_eq!(acme.median_pay_hourly_usd, None);
+    }
+
+    #[tokio::test]
+    async fn source_names_come_from_live_postings_only() {
+        // A dropdown built from expired-only sources offers filters that return nothing.
+        let pool = pool().await;
+        insert(&pool, "live", false).await;
+        insert(&pool, "gone", true).await;
+        sight(&pool, "live", "greenhouse", "g-1").await;
+        sight(&pool, "gone", "deadsource", "d-1").await;
+        assert_eq!(live_source_names(&pool).await.unwrap(), vec!["greenhouse"]);
+    }
+}

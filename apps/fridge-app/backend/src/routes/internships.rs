@@ -652,7 +652,7 @@ struct CollectionRunRow {
     interrupted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunHealthQuery {
     /// How many recent runs to include. Clamped rather than rejected — an oversized `limit`
     /// is a UI bug, not a reason to fail the request.
@@ -819,7 +819,7 @@ fn internal(context: &'static str) -> impl Fn(sqlx::Error) -> StatusCode {
 ///
 /// `pay_unknown=drop` is the one users will reach for most — "only postings that actually say
 /// what they pay" is a reasonable thing to want, and it is one parameter away.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ListPostingsQuery {
     /// `composite` (default), `pay`, `posted`, `deadline`, `prestige`.
     pub sort: Option<String>,
@@ -1051,4 +1051,308 @@ pub struct CollectionSummary {
     pub marked_closed: u64,
     pub swept_deadline: u64,
     pub swept_vanished: u64,
+}
+
+/// Handler-level tests (audit finding F8).
+///
+/// `routes/internships.rs` had 1,051 lines and 8 tests, every one of them covering the
+/// class-year parser — so no HTTP handler was exercised at all. These call the handlers
+/// directly with constructed extractors, which is possible because `CurrentUser` and
+/// `RequireAdmin` are tuple structs with public fields.
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use crate::models::User;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("routes-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool, email: &str) -> CurrentUser {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(email)
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        CurrentUser(User {
+            id,
+            email: email.into(),
+            password_hash: None,
+            created_at: Utc::now(),
+            is_admin: false,
+        })
+    }
+
+    async fn posting(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO internship_postings
+                 (id, dedup_key, company_key, company_name, title, canonical_url,
+                  location_raw, pay_min, pay_max, pay_currency, pay_period,
+                  term_season, term_year, first_seen_at, last_seen_at, created_at, updated_at)
+             VALUES (?1, ?2, 'acme', 'Acme Corp', 'Software Engineer Intern',
+                     'https://acme.example/jobs/1', 'San Francisco, CA',
+                     45.0, 55.0, 'USD', 'hour', 'summer', 2027, ?3, ?3, ?3, ?3)",
+        )
+        .bind(id)
+        .bind(format!("key-{id}"))
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // --- the applied tracker: trap 1 and per-user scoping ---
+
+    #[tokio::test]
+    async fn applying_snapshots_the_posting_onto_the_application() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let (status, Json(app)) = create_application(
+            State(pool.clone()),
+            me,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: Some("first choice".into()),
+            }),
+        )
+        .await
+        .expect("apply should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        // Every field the tracker renders must be copied, not referenced.
+        assert_eq!(app.company_name, "Acme Corp");
+        assert_eq!(app.title, "Software Engineer Intern");
+        assert_eq!(app.url, "https://acme.example/jobs/1");
+        assert_eq!(app.pay_min, Some(45.0));
+        assert_eq!(app.pay_currency.as_deref(), Some("USD"));
+        assert_eq!(app.term_year, Some(2027));
+        assert_eq!(app.notes.as_deref(), Some("first choice"));
+        assert_eq!(app.posting_is_live, Some(true));
+    }
+
+    #[tokio::test]
+    async fn an_application_survives_its_posting_being_deleted() {
+        // Trap 1, at the handler rather than in SQL: the tracker must render from the snapshot
+        // alone. Foreign keys are enforced through sqlx, so this exercises `ON DELETE SET NULL`
+        // — the other reachable state, a dangling id, is what the `sqlite3` CLI produces.
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let _ = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM internship_postings WHERE id = 'p1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(apps) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(apps.len(), 1, "the application must outlive the posting");
+        assert_eq!(apps[0].company_name, "Acme Corp");
+        assert_eq!(apps[0].pay_min, Some(45.0));
+        assert_eq!(
+            apps[0].posting_is_live, None,
+            "unknown, not false — we cannot claim it closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn applications_are_scoped_to_their_owner() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let stranger = user(&pool, "b@test.local").await;
+
+        let _ = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: Some("mine".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(theirs) = list_applications(State(pool.clone()), stranger)
+            .await
+            .unwrap();
+        assert!(theirs.is_empty(), "a stranger must not see my applications");
+        let Json(mine) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(mine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_modify_or_delete_my_application() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let stranger = user(&pool, "b@test.local").await;
+        let (_, Json(app)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let updated = update_application(
+            State(pool.clone()),
+            stranger.clone(),
+            Path(app.id.clone()),
+            Json(UpdateApplicationRequest {
+                status: Some("offer".into()),
+                notes: Some("hijacked".into()),
+            }),
+        )
+        .await;
+        assert!(updated.is_err(), "a stranger must not update my application");
+
+        let deleted = delete_application(State(pool.clone()), stranger, Path(app.id.clone())).await;
+        assert!(deleted.is_err(), "a stranger must not delete my application");
+
+        // And it is genuinely untouched.
+        let Json(mine) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].status, "applied");
+        assert_eq!(mine[0].notes, None);
+    }
+
+    #[tokio::test]
+    async fn applying_twice_to_one_posting_is_refused() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let req = || {
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            })
+        };
+        let _ = create_application(State(pool.clone()), me.clone(), req())
+            .await
+            .unwrap();
+        let second = create_application(State(pool.clone()), me, req()).await;
+        assert_eq!(second.unwrap_err(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn applying_to_a_posting_that_does_not_exist_is_not_found() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+        let result = create_application(
+            State(pool.clone()),
+            me,
+            Json(CreateApplicationRequest {
+                posting_id: "nope".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // --- the ranked list: the 400 paths ---
+
+    #[tokio::test]
+    async fn malformed_filters_are_rejected_rather_than_silently_ignored() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+
+        let cases: Vec<(&str, ListPostingsQuery)> = vec![
+            ("unknown sort", ListPostingsQuery { sort: Some("bogus".into()), ..Default::default() }),
+            ("unknown season", ListPostingsQuery { term_season: Some("monsoon".into()), ..Default::default() }),
+            ("misspelled on_unknown", ListPostingsQuery { pay_min: Some(10.0), pay_unknown: Some("dorp".into()), ..Default::default() }),
+            ("inverted pay window", ListPostingsQuery { pay_min: Some(80.0), pay_max: Some(20.0), ..Default::default() }),
+            ("negative pay floor", ListPostingsQuery { pay_min: Some(-5.0), ..Default::default() }),
+            ("misspelled study year", ListPostingsQuery { class_year: Some("sophmore".into()), ..Default::default() }),
+        ];
+
+        for (label, query) in cases {
+            let result = list_postings(State(pool.clone()), me.clone(), Query(query)).await;
+            assert_eq!(
+                result.err(),
+                Some(StatusCode::BAD_REQUEST),
+                "{label} should be a 400, not a silently different result set"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_still_reports_the_live_total() {
+        // What stops "nothing matched" and "nothing collected yet" looking identical.
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let Json(body) = list_postings(
+            State(pool.clone()),
+            me,
+            Query(ListPostingsQuery {
+                company: Some("nobody-by-this-name".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.returned, 0);
+        assert_eq!(body.total_live, 1, "the denominator must survive filtering");
+        assert_eq!(body.sort, "composite");
+    }
+
+    // --- run health ---
+
+    #[tokio::test]
+    async fn an_unfinished_run_is_reported_as_in_progress() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+        sqlx::query("INSERT INTO collection_runs (id, started_at, trigger) VALUES ('r1', ?1, 'manual')")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(health) = run_health(State(pool.clone()), me.clone(), Query(RunHealthQuery::default()))
+            .await
+            .unwrap();
+        let progress = health.in_progress.expect("a live run should be reported");
+        assert_eq!(progress.run_id, "r1");
+        assert_eq!(progress.sources_done, 0);
+
+        // Once it finishes, the banner must clear.
+        sqlx::query("UPDATE collection_runs SET finished_at = ?1 WHERE id = 'r1'")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(health) = run_health(State(pool.clone()), me, Query(RunHealthQuery::default()))
+            .await
+            .unwrap();
+        assert!(health.in_progress.is_none());
+    }
 }

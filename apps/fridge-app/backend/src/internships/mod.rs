@@ -32,7 +32,6 @@
 //!    posting as having vanished, and that rule lives at exactly one write site — see
 //!    `posting_sightings.consecutive_misses` in migration `0012`.
 
-mod audit;
 pub mod alerts;
 pub mod collector;
 pub mod dedup;
