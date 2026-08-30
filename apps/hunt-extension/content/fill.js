@@ -13,13 +13,17 @@
  * The matching logic lives in `fields.js` as pure functions, imported here at fill time.
  */
 
-/** Loaded lazily so the page pays nothing for a script that may never be asked to do anything. */
-let fieldsModule = null;
-async function fields() {
-  if (!fieldsModule) {
-    fieldsModule = await import(browser.runtime.getURL("content/fields.js"));
-  }
-  return fieldsModule;
+/**
+ * The matching logic, injected alongside this file as a plain script.
+ *
+ * Not an `import()`: a module would need `web_accessible_resources`, and for the activeTab
+ * path that means declaring it reachable from every page — exposure bought for nothing when
+ * two scripts injected together need no declaration at all.
+ */
+function fields() {
+  const module = globalThis.HuntFields;
+  if (!module) throw new Error("hunt: fields.js was not injected alongside fill.js");
+  return module;
 }
 
 /**
@@ -127,8 +131,8 @@ function candidates() {
  * Skips controls that already hold a value. Overwriting something you typed would be the one
  * unrecoverable thing a fill can do, and "it was already right" is the common case.
  */
-async function fill(profile) {
-  const { classify, inputIsBlocked, normalizeLabel } = await fields();
+function fill(profile) {
+  const { classify, inputIsBlocked, normalizeLabel } = fields();
 
   const report = { filled: [], blocked: [], alreadyFilled: 0, unmatched: 0 };
 
@@ -191,7 +195,7 @@ async function fill(profile) {
 // comes from the popup's button.
 browser.runtime.onMessage.addListener((message) => {
   if (message?.type === "hunt-fill") {
-    return fill(message.profile || {});
+    return Promise.resolve(fill(message.profile || {}));
   }
   if (message?.type === "hunt-ping") {
     return Promise.resolve({ ready: true, host: location.host });

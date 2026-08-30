@@ -111,7 +111,7 @@ const SYNONYMS = {
 };
 
 /** Lowercase, strip punctuation and required-field markers, collapse whitespace. */
-export function normalizeLabel(raw) {
+function normalizeLabel(raw) {
   return (raw || "")
     .toLowerCase()
     .replace(/\*/g, " ")
@@ -134,7 +134,7 @@ function containsPhrase(text, needle) {
  *   { kind: "skip" }              — nothing of ours belongs here
  *   { kind: "field", key }        — fill from `cv_profile[key]`
  */
-export function classify(rawLabel) {
+function classify(rawLabel) {
   const label = normalizeLabel(rawLabel);
   if (!label) return { kind: "skip" };
 
@@ -181,7 +181,7 @@ export function classify(rawLabel) {
  * a label that says nothing suspicious, and the browser's own `autocomplete` hints are more
  * reliable than any wording.
  */
-export function inputIsBlocked({ type, autocomplete, name, id }) {
+function inputIsBlocked({ type, autocomplete, name, id }) {
   const kind = (type || "").toLowerCase();
   if (kind === "password" || kind === "hidden" || kind === "file") return true;
 
@@ -189,3 +189,14 @@ export function inputIsBlocked({ type, autocomplete, name, id }) {
   if (!hint) return false;
   return BLOCKED.some((pattern) => pattern.test(hint));
 }
+
+/*
+ * Exposed as a global rather than as an ES module, deliberately.
+ *
+ * A module would have to be reachable through `web_accessible_resources` so the content script
+ * could `import()` it — and for the activeTab path, that means declaring it reachable from
+ * every page, which is exposure bought for nothing. Two classic scripts injected together need
+ * no such declaration. `content/fields.test.mjs` evaluates this file and reads the same global,
+ * so the tests exercise exactly what ships.
+ */
+globalThis.HuntFields = { normalizeLabel, classify, inputIsBlocked };

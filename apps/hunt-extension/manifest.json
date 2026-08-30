@@ -11,7 +11,14 @@
     }
   },
 
-  "permissions": ["alarms", "notifications", "storage"],
+  "//permissions": [
+    "activeTab + scripting are Phase 8f. activeTab grants access to ONE tab, for THIS",
+    "invocation, when you click the toolbar button — it is not standing access to anything.",
+    "Phase 7 found company careers pages are most of the corpus and cannot be enumerated, so",
+    "this is the only honest way to reach them. The alternative is <all_urls>, which is",
+    "permanent access to every page you visit, and CLAUDE.md rules it out."
+  ],
+  "permissions": ["alarms", "notifications", "storage", "activeTab", "scripting"],
 
   "host_permissions": [
     "http://localhost:8080/*",
@@ -35,26 +42,8 @@
         "https://jobs.ashbyhq.com/*",
         "https://jobs.smartrecruiters.com/*"
       ],
-      "js": ["content/fill.js"],
+      "js": ["content/fields.js", "content/fill.js"],
       "run_at": "document_idle"
-    }
-  ],
-
-  "//web_accessible_resources": [
-    "fill.js imports fields.js at fill time, so it has to be fetchable by the content script.",
-    "It is pure matching logic with nothing secret in it."
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["content/fields.js"],
-      "matches": [
-        "https://boards.greenhouse.io/*",
-        "https://job-boards.greenhouse.io/*",
-        "https://job-boards.eu.greenhouse.io/*",
-        "https://jobs.lever.co/*",
-        "https://jobs.ashbyhq.com/*",
-        "https://jobs.smartrecruiters.com/*"
-      ]
     }
   ],
 

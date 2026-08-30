@@ -162,17 +162,40 @@ const autofillEl = document.getElementById("autofill");
 const fillButton = document.getElementById("fill");
 const fillResultEl = document.getElementById("fillResult");
 
-/** The active tab, if the content script answers a ping there. */
-async function fillableTab() {
-  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return null;
+/** Whether the content script is already listening in this tab. */
+async function isListening(tabId) {
   try {
-    const pong = await browser.tabs.sendMessage(tab.id, { type: "hunt-ping" });
-    return pong?.ready ? tab : null;
+    const pong = await browser.tabs.sendMessage(tabId, { type: "hunt-ping" });
+    return Boolean(pong?.ready);
   } catch {
-    // No content script in that tab. Not an error — most tabs are not applications.
-    return null;
+    // No content script there. Not an error — most tabs are not applications.
+    return false;
   }
+}
+
+/** The active tab, whatever it is. */
+async function activeTab() {
+  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  return tab?.id ? tab : null;
+}
+
+/**
+ * Put the content script into a tab that does not already have it.
+ *
+ * This is the `activeTab` path, for the company careers pages Phase 7 found are most of the
+ * corpus and which cannot be enumerated into match patterns. The permission is granted by
+ * **your click on the toolbar button**, applies to that one tab, and lapses — it is not
+ * standing access, and the extension cannot reach a page you have not asked it about.
+ *
+ * The declarative hosts do not come through here; they already have the script from load.
+ */
+async function injectInto(tabId) {
+  await browser.scripting.executeScript({
+    target: { tabId },
+    // Order matters: fill.js reads the global fields.js defines.
+    files: ["content/fields.js", "content/fill.js"],
+  });
+  return isListening(tabId);
 }
 
 function describe(report) {
@@ -194,10 +217,26 @@ function describe(report) {
 fillButton?.addEventListener("click", async () => {
   fillResultEl.textContent = "Filling…";
   try {
-    const tab = await fillableTab();
+    const tab = await activeTab();
     if (!tab) {
-      fillResultEl.textContent = "This tab is not a supported application page.";
+      fillResultEl.textContent = "No active tab.";
       return;
+    }
+
+    // Inject on demand for anything that is not a known ATS. The click that opened this popup
+    // is the gesture activeTab needs, so this is exactly the per-invocation access rule 10
+    // asks for rather than a permission held permanently.
+    if (!(await isListening(tab.id))) {
+      try {
+        if (!(await injectInto(tab.id))) {
+          fillResultEl.textContent = "Could not read this page — it may block extensions.";
+          return;
+        }
+      } catch (err) {
+        // Firefox refuses about:, view-source:, addons.mozilla.org and similar outright.
+        fillResultEl.textContent = `This page cannot be filled (${err.message}).`;
+        return;
+      }
     }
     const config = await settings();
     const base = config.backendUrl.replace(/\/+$/, "");
@@ -219,7 +258,16 @@ fillButton?.addEventListener("click", async () => {
   }
 });
 
-// Show the button only where it can do something.
+/*
+ * The button is always available now: on a known ATS the script is already there, and anywhere
+ * else the click both grants access and injects it. Hiding it until a ping succeeded would
+ * hide it on exactly the careers pages the activeTab path exists to reach.
+ */
 void (async () => {
-  if (await fillableTab()) autofillEl.hidden = false;
+  const tab = await activeTab();
+  if (!tab) return;
+  autofillEl.hidden = false;
+  fillResultEl.textContent = (await isListening(tab.id))
+    ? "Known application site."
+    : "Other page — filling will ask this tab for access.";
 })();

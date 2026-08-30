@@ -1,4 +1,15 @@
-import { classify, normalizeLabel, inputIsBlocked } from "./fields.js";
+/*
+ * Loads the shipped fields.js and reads the same global the content script reads, so these
+ * tests exercise exactly what runs on a page — not a copy that can drift from it.
+ */
+import fs from "node:fs";
+import vm from "node:vm";
+
+const source = fs.readFileSync(new URL("./fields.js", import.meta.url), "utf8");
+const sandbox = {};
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+const { classify, normalizeLabel, inputIsBlocked } = sandbox.HuntFields;
 
 let fail = 0;
 const eq = (name, actual, expected) => {
