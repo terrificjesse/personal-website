@@ -658,9 +658,19 @@ reading `applied` for a job you already interviewed at.
 
 ### Build order — classification earns write access, it does not start with it
 
-- [gen] **8a — Read-only pipeline.** OAuth, token storage, incremental sync on `historyId`,
-  `inbox_runs`. Classifier stub returns `Other`. *Checkpoint:* messages sync, the run shows in
-  status, **no writes anywhere.**
+- [gen] **8a — Read-only pipeline. — complete 2026-08-31.** Verified against the real burner
+  inbox: 10 messages synced and recorded, `outcome=success`, and a second pass reported
+  `already_seen=10, classified=0` — rule 4's no-op, live. Rule 7's invariant balanced
+  (`10 = 0+0+0+10`), the `historyId` watermark was stored for the next incremental pass, and
+  **nothing was written outside our own tables** — no labels, no status changes, no alerts.
+  Every message classified `disregarded` because the stub says so rather than guessing.
+
+  Two failures worth keeping: the callback read its state cookie *after* clearing the jar, so
+  every consent 400'd and the flow could not have worked once — invisible to 677 tests because
+  the path needs Google at the other end, which is the Phase 5 lesson in the same function it
+  was learned in. And a stale `cargo run` debug binary held port 8080, so a freshly built
+  release binary failed to bind and the *old* build kept answering, which read as a missing
+  route.
 - [gen] **8b — Classify + match, still no writes.** Rules first, Claude API on ambiguity.
   Verdicts stored. *Checkpoint:* against a hand-labelled set of **real burner-inbox mail across
   a whole two-week window**, not 50 curated job emails — a curated set contains no newsletters,
