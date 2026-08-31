@@ -172,27 +172,69 @@ pub async fn get_post(
     Ok(Json(post))
 }
 
-/// Appends `-2`, `-3`, ... until the slug is free. Collisions will be rare on a
-/// single-admin blog, but two posts sharing a title shouldn't 500.
-async fn unique_slug(pool: &SqlitePool, base: &str) -> Result<String, StatusCode> {
-    let mut candidate = base.to_string();
-    let mut suffix = 2;
+/// The most `-2`, `-3`, … suffixes to try before giving up.
+///
+/// A bound rather than an open loop: every retry here is driven by a database error, and if
+/// one ever arrives for a reason other than the slug — a corrupt index, say — an unbounded
+/// loop would spin against the database forever instead of failing.
+const MAX_SLUG_ATTEMPTS: u32 = 50;
 
-    loop {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blog_posts WHERE slug = ?)")
-                .bind(&candidate)
-                .fetch_one(pool)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+/// Inserts a post, letting the database pick the slug suffix.
+///
+/// This deliberately does **not** ask whether a slug is free first. It used to: a
+/// `SELECT EXISTS(...)` followed by an `INSERT`, with nothing holding between them. Two
+/// requests could both see the same slug free, and the loser hit the `UNIQUE` constraint and
+/// came back **500**. That is not a theoretical race — ten concurrent creates of the same
+/// title produced six 500s, and one double-clicked submit button is enough to reach it.
+///
+/// The constraint is the only thing that can decide atomically, so it decides. We attempt the
+/// insert and treat a unique violation as "someone took that one", trying the next suffix.
+/// Anything else is a real error.
+async fn insert_post_with_unique_slug(
+    pool: &SqlitePool,
+    id: &str,
+    author_id: &str,
+    title: &str,
+    base_slug: &str,
+    body: &str,
+    published: bool,
+    now: chrono::DateTime<Utc>,
+) -> Result<String, StatusCode> {
+    for attempt in 1..=MAX_SLUG_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            base_slug.to_string()
+        } else {
+            format!("{base_slug}-{attempt}")
+        };
 
-        if !exists {
-            return Ok(candidate);
+        let result = sqlx::query(
+            "INSERT INTO blog_posts \
+             (id, author_id, title, slug, body, published, created_at, updated_at, source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(author_id)
+        .bind(title)
+        .bind(&candidate)
+        .bind(body)
+        .bind(published)
+        .bind(now)
+        .bind(now)
+        .bind(BLOG_SOURCE_DB)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => return Ok(candidate),
+            // Only a *slug* collision is retryable. `is_unique_violation` would also fire on
+            // the `id` primary key, but `id` is a fresh v4 UUID and is not re-rolled here, so a
+            // genuine id collision exhausts the attempts and 500s rather than looping.
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => continue,
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
-
-        candidate = format!("{base}-{suffix}");
-        suffix += 1;
     }
+
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Creates a post. Admin-only.
@@ -213,28 +255,20 @@ pub async fn create_post(
     if base_slug.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let slug = unique_slug(&pool, &base_slug).await?;
-
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    sqlx::query(
-        "INSERT INTO blog_posts \
-         (id, author_id, title, slug, body, published, created_at, updated_at, source) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    let slug = insert_post_with_unique_slug(
+        &pool,
+        &id,
+        &user.id,
+        title,
+        &base_slug,
+        &req.body,
+        req.published,
+        now,
     )
-    .bind(&id)
-    .bind(&user.id)
-    .bind(title)
-    .bind(&slug)
-    .bind(&req.body)
-    .bind(req.published)
-    .bind(now)
-    .bind(now)
-    .bind(BLOG_SOURCE_DB)
-    .execute(&pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -376,6 +410,94 @@ mod tests {
     fn the_escape_character_is_escaped_before_the_wildcards() {
         assert_eq!(like_pattern(r"\"), r"%\\%");
         assert_eq!(like_pattern(r"a\%b"), r"%a\\\%b%");
+    }
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn pool_with_author() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply");
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, created_at, is_admin) \
+             VALUES ('a1', 'a@example.com', NULL, ?, 1)",
+        )
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .expect("author should insert");
+        pool
+    }
+
+    async fn insert(pool: &SqlitePool, base: &str) -> Result<String, StatusCode> {
+        insert_post_with_unique_slug(
+            pool,
+            &Uuid::new_v4().to_string(),
+            "a1",
+            "Race Me",
+            base,
+            "Body",
+            true,
+            Utc::now(),
+        )
+        .await
+    }
+
+    /// **J1.** Posts sharing a title must each get their own slug, and none may fail.
+    ///
+    /// The old implementation asked `SELECT EXISTS(...)` and then inserted. Nothing held
+    /// between the two, so under concurrency the loser hit the UNIQUE constraint and returned
+    /// 500 — six times out of ten in a ten-way race. Letting the constraint arbitrate is what
+    /// makes the suffix assignment atomic.
+    #[tokio::test]
+    async fn posts_sharing_a_title_each_get_their_own_slug() {
+        let pool = pool_with_author().await;
+
+        let mut slugs = Vec::new();
+        for _ in 0..5 {
+            slugs.push(
+                insert(&pool, "race-me")
+                    .await
+                    .expect("no create may fail because another took the slug"),
+            );
+        }
+
+        assert_eq!(
+            slugs,
+            vec![
+                "race-me",
+                "race-me-2",
+                "race-me-3",
+                "race-me-4",
+                "race-me-5"
+            ],
+            "the suffix sequence is unchanged from the check-then-insert version"
+        );
+    }
+
+    /// A slug already taken by a *file*-sourced post is skipped over just the same — the
+    /// constraint does not care which kind of post holds it.
+    #[tokio::test]
+    async fn a_slug_held_by_a_file_post_is_stepped_over() {
+        let pool = pool_with_author().await;
+        sqlx::query(
+            "INSERT INTO blog_posts \
+             (id, author_id, title, slug, body, published, created_at, updated_at, source) \
+             VALUES ('f1', 'a1', 'From File', 'race-me', 'B', 1, ?, ?, 'file')",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(insert(&pool, "race-me").await.unwrap(), "race-me-2");
     }
 
     #[test]
