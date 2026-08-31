@@ -175,6 +175,28 @@ pub async fn run(
         let stored = store_message(pool, user_id, &message, now).await?;
         if !stored {
             report.already_seen += 1;
+
+            // Seen before, but possibly never labelled: everything synced before labelling
+            // existed, and anything whose label write failed once. Skipping straight past
+            // these made the backlog permanently unlabellable — the label could only ever be
+            // written in the same pass that first stored the message.
+            //
+            // Classification is a pure function and cheap, so deciding the label again costs
+            // nothing. The verdict is NOT re-stored and the counts are not touched: those
+            // measure new work, and inflating them would break rule 7's invariant.
+            if let Some(ids) = &label_ids {
+                let verdict = classify::classify(
+                    message.from.as_deref(),
+                    message.subject.as_deref(),
+                    message.snippet.as_deref(),
+                    &context,
+                );
+                if let Err(err) =
+                    apply_label(pool, &client, &token, ids, &message, verdict.category, now).await
+                {
+                    eprintln!("inbox: could not label {}: {err:?}", message.id);
+                }
+            }
             continue;
         }
 

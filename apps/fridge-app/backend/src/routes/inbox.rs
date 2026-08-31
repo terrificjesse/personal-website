@@ -134,6 +134,14 @@ pub struct LastRun {
     /// Populated on a failed or partial run. **This is rule 5's whole point**: without it, a
     /// run that could not authenticate and a run that found nothing are the same empty row.
     pub error: Option<String>,
+    /// True when the account was reconnected *after* this run finished.
+    ///
+    /// Rule 5 says a broken sync must be visible — but a failure whose cause has already been
+    /// fixed is not visibility, it is a wrong answer. Reconnecting expires weekly while the
+    /// OAuth app is in Testing, so without this the interface tells you the token is dead for
+    /// up to fifteen minutes after you have replaced it, and the obvious conclusion is that
+    /// the reconnect did not work.
+    pub superseded_by_reconnect: bool,
     pub fetched: i64,
     pub classified: i64,
 }
@@ -147,16 +155,36 @@ pub async fn status(
         .await
         .map_err(internal("reading the connected account"))?;
 
+    // When the stored credential was last replaced. A failure older than this has already
+    // been addressed.
+    let reconnected_at: Option<String> =
+        sqlx::query_scalar("SELECT updated_at FROM gmail_accounts WHERE user_id = ?")
+            .bind(&user.id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|err| {
+                eprintln!("inbox: reading the account timestamp failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
     let last_run = sync::last_run(&pool, &user.id)
         .await
         .map_err(internal("reading the last inbox run"))?
-        .map(|(started_at, finished_at, outcome, error, fetched, classified)| LastRun {
-            started_at,
-            finished_at,
-            outcome,
-            error,
-            fetched,
-            classified,
+        .map(|(started_at, finished_at, outcome, error, fetched, classified)| {
+            // RFC3339 strings from the same source sort lexicographically in timestamp order,
+            // which is why every timestamp in this schema is stored that way.
+            let superseded = reconnected_at
+                .as_deref()
+                .is_some_and(|reconnected| reconnected > started_at.as_str());
+            LastRun {
+                started_at,
+                finished_at,
+                outcome,
+                error,
+                superseded_by_reconnect: superseded,
+                fetched,
+                classified,
+            }
         });
 
     Ok(Json(InboxStatus { account, last_run }))

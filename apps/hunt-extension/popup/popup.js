@@ -627,6 +627,10 @@ void (async () => {
     const run = status.last_run;
     if (!run) {
       inboxEl.textContent = `Inbox: ${status.account}, no sync yet.`;
+    } else if (run.superseded_by_reconnect && run.error) {
+      // The account was reconnected after this run failed. Showing the old reason would say
+      // the token is dead when it has just been replaced.
+      inboxEl.textContent = "Inbox: reconnected — will sync shortly.";
     } else if (run.error) {
       // The failure line. Shown in full rather than summarised — "the stored Gmail token no
       // longer works, reconnect the account" is actionable, and "sync failed" is not.

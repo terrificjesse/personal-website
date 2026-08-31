@@ -120,8 +120,17 @@ export function InboxPanel() {
         )}
       </p>
 
+      {/* Reconnected since the failure: say so instead of showing a reason that no longer
+          applies. Left unhandled, the panel insists the token is dead for up to fifteen
+          minutes after you replaced it. */}
+      {status?.last_run?.superseded_by_reconnect && status.last_run.error && (
+        <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
+          Reconnected since the last run — it will sync within 15 minutes.
+        </p>
+      )}
+
       {/* The line rule 5 exists for. A stopped agent must not read as a quiet inbox. */}
-      {status?.last_run?.error && (
+      {status?.last_run?.error && !status.last_run.superseded_by_reconnect && (
         <p className="mt-1 rounded border border-red-500/40 bg-red-500/5 px-2 py-1 text-sm text-red-700 dark:text-red-400">
           {status.last_run.error}
         </p>

@@ -695,6 +695,8 @@ export type InboxStatus = {
     outcome: string;
     /** Set on a failed or partial run. Without it, "could not authenticate" and "found nothing" are the same empty row. */
     error: string | null;
+    /** True when the account was reconnected after this run — the failure has been addressed. */
+    superseded_by_reconnect: boolean;
     fetched: number;
     classified: number;
   } | null;
