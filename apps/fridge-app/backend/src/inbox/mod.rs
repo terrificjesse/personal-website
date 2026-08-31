@@ -15,6 +15,8 @@
 //!
 //! - [`oauth`] — connecting the account, and keeping the access token fresh.
 //! - [`gmail`] — the Gmail API surface actually used. Read-only in this phase, by construction.
+//! - [`labels`] — the ONLY module that modifies a mailbox. Adds labels; never removes,
+//!   never archives, never touches a disregarded message.
 //! - [`sync`] — the pass: fetch, record, count. Owns `inbox_runs`.
 //! - [`classify`] — the rules layer.
 //! - [`advance`] — matching, and what an email may do to a status. Rules 2 and 3, pure.
@@ -30,5 +32,6 @@
 pub mod advance;
 pub mod classify;
 pub mod gmail;
+pub mod labels;
 pub mod oauth;
 pub mod sync;

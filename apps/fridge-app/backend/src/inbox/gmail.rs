@@ -186,13 +186,26 @@ mod tests {
     /// passing. Reading the source is crude and it is also exactly what
     /// `sources::adapters_do_not_build_their_own_http_client` does one subsystem over, for the
     /// same reason — a rule the compiler cannot state is better checked than trusted.
+    /// The module's code with comment lines removed.
+///
+/// Scanning raw source made a doc comment explaining what this module does *not* do fail the
+/// check that it does not do it. Prose about a forbidden call is not the call.
+fn code_only(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
     #[test]
     fn this_module_makes_no_write_calls_to_gmail() {
         let source = include_str!("gmail.rs");
-        let body = source
-            .split("mod tests")
-            .next()
-            .expect("the module above its tests");
+        // Comments stripped for the same reason as in `labels.rs`: this file's own doc says
+        // it contains no `modify`, and prose about a call is not the call.
+        let body = code_only(
+            source.split("mod tests").next().expect("the module above its tests"),
+        );
 
         for forbidden in [".post(", ".put(", ".patch(", ".delete(", "/modify", "/trash", "/send"] {
             assert!(
