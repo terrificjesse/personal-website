@@ -371,9 +371,12 @@ it can be suggested elsewhere (see above).
 
 ---
 
-## Data model sketch — migration `0015_create_inbox.sql`
+## Data model sketch — migration `0019_create_inbox.sql` *(written 2026-08-30)*
 
 Not final. Argue with it before writing it.
+
+**Numbers, as actually built:** `0014` hunt_events, `0015` hunt_tokens, `0016` blog source
+path, `0017` cv_profile, `0018` the answer library, `0019` these inbox tables.
 
 **`hunt_events` is not in this migration — it shipped ahead of it, in `0014_create_hunt_events.sql`.**
 8e needed the table and the inbox did not exist yet, and it belongs on its own regardless: it
@@ -400,8 +403,8 @@ Track B's `cv_profile` moves along with them.
   `UNIQUE (kind, subject_id)`, the rendered `title`/`body`/`url`, `payload_json`,
   `created_at`, `acked_at`. Rule 6 lives here. 8d writes to it rather than altering it.
 
-Track B, which may well land first — put it in its own migration, `0016_create_cv_profile.sql`,
-rather than bundling it with the inbox tables:
+Track B landed first, as expected — `cv_profile` in `0017` and the answer library in `0018`,
+each in its own migration rather than bundled with the inbox tables:
 
 - `cv_profile` — `user_id`, and the flat fields an ATS asks for: name, email, phone, location,
   school, grad date, links (GitHub/LinkedIn/portfolio), work authorization. One row per user.
