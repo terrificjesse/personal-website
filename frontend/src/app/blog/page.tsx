@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchPosts, type BlogPost, type BlogSortOrder } from "@/lib/blogApi";
+import { BLOG_PAGE_SIZE, fetchPosts, type BlogPost, type BlogSortOrder } from "@/lib/blogApi";
 import { fetchMe } from "@/lib/authApi";
 
 /** How long to wait after the last keystroke before searching. */
@@ -22,10 +22,15 @@ export default function BlogPage() {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
+  const [total, setTotal] = useState(0);
+  // Offset is reset by the controls that change what is being asked for, not by an effect
+  // reacting to them — resetting in an effect would fire a wasted request at the old offset
+  // first.
+  const [offset, setOffset] = useState(0);
 
   // Identifies the request the current controls call for. Anything not yet settled at this
   // key is in flight.
-  const requestKey = `${sort}\u0000${debouncedQuery.trim()}`;
+  const requestKey = `${sort}\u0000${debouncedQuery.trim()}\u0000${offset}`;
   const loading = settledKey !== requestKey;
 
   // Purely so an admin has a way *into* the editor — `/blog/admin` linked out to here but
@@ -63,12 +68,15 @@ export default function BlogPage() {
     // Both controls feed one request. Sorting and searching compose in the backend's single
     // query, so there's nothing to merge or re-sort here — including across posts that came
     // from markdown files rather than the editor.
-    fetchPosts({ sort, q: debouncedQuery })
-      .then((data) => {
+    fetchPosts({ sort, q: debouncedQuery, limit: BLOG_PAGE_SIZE, offset })
+      .then((page) => {
         // The cancelled flag matters more now than it did: typing fires overlapping requests,
         // and without it a slow early response could land after a newer one and win.
         if (cancelled) return;
-        setPosts(data);
+        // Offset 0 is a fresh question, so it replaces; anything else is another page of the
+        // same question, so it appends.
+        setPosts((current) => (offset === 0 ? page.posts : [...current, ...page.posts]));
+        setTotal(page.total);
         setError(null);
       })
       .catch(() => {
@@ -77,6 +85,7 @@ export default function BlogPage() {
         // Clear the list too. Leaving the previous query's results under an error banner
         // presents stale content as though it answered the current search.
         setPosts([]);
+        setTotal(0);
       })
       .finally(() => {
         if (!cancelled) setSettledKey(key);
@@ -88,9 +97,10 @@ export default function BlogPage() {
     // `requestKey` is derived from the other two, so listing it changes nothing at runtime
     // — it is here because the effect reads it, and a dependency array that lies is how the
     // next person gets a stale closure.
-  }, [sort, debouncedQuery, requestKey]);
+  }, [sort, debouncedQuery, offset, requestKey]);
 
   const searching = debouncedQuery.trim().length > 0;
+  const hasMore = posts.length < total;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
@@ -110,7 +120,10 @@ export default function BlogPage() {
         <input
           type="search"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOffset(0);
+          }}
           placeholder="Search posts…"
           aria-label="Search posts"
           className="min-w-0 flex-1 rounded border border-black/10 dark:border-white/10 bg-transparent px-3 py-2 text-sm"
@@ -120,7 +133,10 @@ export default function BlogPage() {
             <button
               key={option}
               type="button"
-              onClick={() => setSort(option)}
+              onClick={() => {
+                setSort(option);
+                setOffset(0);
+              }}
               aria-pressed={sort === option}
               className={
                 sort === option
@@ -136,7 +152,11 @@ export default function BlogPage() {
 
       {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
 
-      {loading ? (
+      {/* Only take over the page when there is nothing to show yet. While *appending* a
+          page, the list stays put and the Load more button carries the loading state — a
+          spinner that replaces results the reader is already looking at is a worse answer
+          than one that sits under them. */}
+      {loading && posts.length === 0 ? (
         <p className="mt-6 text-sm opacity-60">Loading…</p>
       ) : posts.length === 0 && !error ? (
         <p className="mt-6 text-sm opacity-60">
@@ -156,6 +176,24 @@ export default function BlogPage() {
             </li>
           ))}
         </ul>
+      )}
+
+      {posts.length > 0 && (
+        <div className="mt-6 flex items-center justify-between gap-4 text-xs opacity-60">
+          <span>
+            Showing {posts.length} of {total}
+          </span>
+          {hasMore && (
+            <button
+              type="button"
+              onClick={() => setOffset(posts.length)}
+              disabled={loading}
+              className="rounded border border-black/20 dark:border-white/20 px-3 py-1.5 text-sm opacity-100 disabled:opacity-50"
+            >
+              {loading ? "Loading…" : "Load more"}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

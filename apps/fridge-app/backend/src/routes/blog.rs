@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 use crate::blog_files::{self, SyncReport};
 use crate::models::{
-    BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, CreateBlogPostRequest, ListPostsQuery,
-    MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, exceeds_char_limit,
-    is_blank, slugify,
+    BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, BlogPostPage, CreateBlogPostRequest,
+    DEFAULT_BLOG_PAGE_SIZE, ListPostsQuery, MAX_BLOG_BODY_LENGTH, MAX_BLOG_PAGE_SIZE,
+    MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, exceeds_char_limit, is_blank, slugify,
 };
 use crate::routes::auth::{MaybeUser, RequireAdmin};
 
@@ -60,8 +60,17 @@ pub async fn list_posts(
     State(pool): State<SqlitePool>,
     MaybeUser(user): MaybeUser,
     Query(params): Query<ListPostsQuery>,
-) -> Result<Json<Vec<BlogPost>>, StatusCode> {
+) -> Result<Json<BlogPostPage>, StatusCode> {
     let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
+
+    let limit = params.limit.unwrap_or(DEFAULT_BLOG_PAGE_SIZE);
+    // Refused rather than clamped. A caller who asks for 1000 and silently receives 100
+    // believes it now holds every post — the same looks-complete-but-isn't failure that makes
+    // an unrecognized `?sort=` a 400 instead of a quiet fallback.
+    if limit == 0 || limit > MAX_BLOG_PAGE_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let offset = params.offset.unwrap_or(0);
 
     // One statement over one table covers both post kinds. That is the entire reason
     // file-sourced posts are rows rather than a second store read at request time: search and
@@ -90,11 +99,29 @@ pub async fn list_posts(
         format!(" WHERE {}", conditions.join(" AND "))
     };
 
+    // The count reuses the *same* WHERE, draft filter included. Counting without it would tell
+    // a signed-out visitor exactly how many unpublished posts exist — the number leaks what
+    // the rows themselves are hidden to protect.
+    let count_sql = format!("SELECT COUNT(*) FROM blog_posts{where_clause}");
+    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(pattern) = &search {
+        count_query = count_query.bind(pattern).bind(pattern);
+    }
+    let total = count_query
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     // `sql_direction` returns a `&'static str` from a two-variant enum: `ORDER BY` can't take
     // a bind parameter, so this is the only user-influenced part of the statement that is
     // interpolated, and the enum is what keeps it from being user-*supplied*.
+    //
+    // `id` breaks ties, and paging is why it has to. File posts take `created_at` from a
+    // frontmatter *day*, so they are all midnight and ties are the norm rather than the
+    // exception; without a total order two pages can repeat a post and skip another.
     let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM blog_posts{where_clause} ORDER BY created_at {} ",
+        "SELECT {SELECT_COLUMNS} FROM blog_posts{where_clause} \
+         ORDER BY created_at {}, id ASC LIMIT ? OFFSET ?",
         params.sort.sql_direction()
     );
 
@@ -106,11 +133,18 @@ pub async fn list_posts(
     }
 
     let posts = query
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(posts))
+    Ok(Json(BlogPostPage {
+        posts,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 /// A single post by its slug. A draft 404s for a non-admin rather than answering with

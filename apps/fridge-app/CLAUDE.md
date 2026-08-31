@@ -14,7 +14,7 @@ All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recomme
 writing them. Every phase was verified against real data, not just fixtures; the per-phase
 evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **642 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
+`cargo test`: **663 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
 Phase 7 work from a parallel session plus the blog stress-test suite.)
 
 **Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
@@ -334,6 +334,12 @@ land immediately.
   `fetch_visible_to` above.
 - `slug` is stored at creation and **never rewritten** on a title edit, so a published URL
   stays stable. `unique_slug` appends `-2`, `-3`, … on collision.
+- **`GET /blog/posts` is paginated** (`limit`/`offset`, default 20, max 100, envelope
+  `{posts,total,limit,offset}`). Three rules not to undo: over-limit is a **400, not a clamp**;
+  `total` reuses the page's `WHERE` so it never leaks the draft count to a non-admin; and
+  **`ORDER BY created_at …, id ASC`** — file posts all share a midnight timestamp, so without
+  the `id` tiebreaker paging repeats one post and drops another. It is also a **coupled**
+  change: an old backend binary serving a bare array breaks the frontend outright.
 - **Verify authorization with `curl`, not the browser.** `proxy.ts` and the admin page's
   `is_admin` check are both optimistic UI; only `RequireAdmin` enforces, and only curl skips
   the other two.
@@ -411,11 +417,9 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **Add pagination to `GET /blog/posts`.** It returns every matching post in one response.
-   Invisible at current volume; the only *design* hole the blog stress test left open, as
-   opposed to a merely untested area. The rest of that table — concurrency, sync × API
-   interleaving, frontmatter fuzzing, volume — is unexplored;
-   `docs/BLOG_STRESS_TEST_PLAN.md` has the method for a second pass.
+2. **A second blog stress-test pass**, if wanted — concurrency, sync × API interleaving,
+   frontmatter fuzzing, and volume are all still unexplored.
+   `docs/BLOG_STRESS_TEST_PLAN.md` has the method. Lower expected yield than the first pass.
 3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.

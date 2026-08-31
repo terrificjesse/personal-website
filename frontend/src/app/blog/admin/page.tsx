@@ -6,6 +6,7 @@ import { fetchMe, type AuthenticatedUser } from "@/lib/authApi";
 import {
   createPost,
   deletePost,
+  BLOG_ADMIN_PAGE_LIMIT,
   fetchPosts,
   syncBlogFiles,
   updatePost,
@@ -24,6 +25,7 @@ import { PostForm } from "./PostForm";
 export default function BlogAdminPage() {
   const [user, setUser] = useState<AuthenticatedUser | null | undefined>(undefined);
   const [posts, setPosts] = useState<BlogPost[]>([]);
+  const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -45,9 +47,15 @@ export default function BlogAdminPage() {
     if (!user?.is_admin) return;
     let cancelled = false;
 
-    fetchPosts()
-      .then((data) => {
-        if (!cancelled) setPosts(data);
+    // The editor asks for the largest page the backend allows rather than paging: this list
+    // is a management view for one author, and `MAX_BLOG_PAGE_SIZE` is well past what a
+    // personal blog reaches. `total` is still rendered, so if it is ever exceeded the UI says
+    // so instead of quietly showing a prefix.
+    fetchPosts({ limit: BLOG_ADMIN_PAGE_LIMIT })
+      .then((page) => {
+        if (cancelled) return;
+        setPosts(page.posts);
+        setTotal(page.total);
       })
       .catch((err) => {
         if (!cancelled) setError(handleApiError(err, "Couldn't load posts"));
@@ -157,6 +165,13 @@ export default function BlogAdminPage() {
       </div>
 
       {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
+
+      {total > posts.length && (
+        <p className="mt-6 text-xs text-amber-700 dark:text-amber-500">
+          Showing {posts.length} of {total} posts. This view is capped at{" "}
+          {BLOG_ADMIN_PAGE_LIMIT}; the rest are reachable through the public list.
+        </p>
+      )}
 
       <ul className="mt-6 divide-y divide-black/10 dark:divide-white/10">
         {posts.map((post) =>

@@ -1059,6 +1059,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Paging over a tie-heavy ordering must not repeat or skip a post.
+    ///
+    /// File posts take `created_at` from a frontmatter *day*, so every one of them is midnight
+    /// and ties are the norm. `ORDER BY created_at` alone leaves their relative order
+    /// undefined, and SQLite is free to answer page 2 in a different order than page 1 — which
+    /// shows one post twice and silently drops another. The `id` tiebreaker is what makes the
+    /// ordering total.
+    #[tokio::test]
+    async fn paging_a_tie_heavy_ordering_covers_every_post_exactly_once() {
+        let dir = temp_dir("paging-ties");
+        let pool = pool_with_admin().await;
+
+        // Nine posts, all the same date: nothing but `id` can order them.
+        for i in 0..9 {
+            write_raw(
+                &dir,
+                &format!("post-{i}.md"),
+                "---\ntitle: Same Day\ndate: 2026-08-19\npublished: true\n---\n\nBody.\n",
+            );
+        }
+        sync_in(&pool, &dir).await.unwrap();
+        assert_eq!(count_posts(&pool).await, 9, "precondition");
+
+        let mut seen: Vec<String> = Vec::new();
+        for offset in [0, 4, 8] {
+            let page: Vec<String> = sqlx::query_scalar(
+                "SELECT slug FROM blog_posts ORDER BY created_at DESC, id ASC LIMIT 4 OFFSET ?",
+            )
+            .bind(offset)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            seen.extend(page);
+        }
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            (seen.len(), unique.len()),
+            (9, 9),
+            "three pages must cover all nine posts with no repeat and no gap; got {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **H1c.** The case that made `source_path` necessary rather than merely tidy.
     ///
     /// When a file overrides its slug in frontmatter, a broken version of that file cannot be

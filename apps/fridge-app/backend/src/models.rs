@@ -288,6 +288,46 @@ pub struct ListPostsQuery {
     pub sort: SortOrder,
     /// Free-text search across title and body. Whitespace-only is treated as absent.
     pub q: Option<String>,
+    /// How many posts to return. Absent means `DEFAULT_BLOG_PAGE_SIZE`.
+    ///
+    /// `u32` rather than `i64` so a negative value is rejected by the `Query` extractor as a
+    /// 400 before it can reach SQL, where `LIMIT -1` means *no limit*.
+    pub limit: Option<u32>,
+    /// How many to skip. Absent means 0.
+    pub offset: Option<u32>,
+}
+
+/// Returned when no `limit` is given.
+pub const DEFAULT_BLOG_PAGE_SIZE: u32 = 20;
+
+/// The largest page a caller may ask for.
+///
+/// Asking for more is a **400, not a silent clamp**. A clamp would hand back 100 posts to a
+/// caller who asked for 1000 and believes it now holds everything — the same
+/// looks-complete-but-isn't failure that makes `?sort=oldset` a 400 rather than a quiet
+/// fallback to newest.
+pub const MAX_BLOG_PAGE_SIZE: u32 = 100;
+
+/// A default larger than the maximum would make every unparameterised request a 400. Checked
+/// at compile time rather than in a test, so it cannot be broken by an edit that skips `cargo
+/// test`.
+const _: () = assert!(DEFAULT_BLOG_PAGE_SIZE <= MAX_BLOG_PAGE_SIZE);
+
+/// One page of posts.
+///
+/// An envelope rather than a bare array because the count is not derivable from the page: a
+/// full page tells you nothing about whether more exist, and the admin view needs to say how
+/// many posts there are. Sending it in a header instead would need
+/// `Access-Control-Expose-Headers`, and a header the browser silently refuses to expose is a
+/// worse failure than a slightly larger body.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlogPostPage {
+    pub posts: Vec<BlogPost>,
+    /// Total matching posts **the requester may see** — filtered exactly like the page, so it
+    /// never reveals how many drafts exist to someone who cannot read them.
+    pub total: i64,
+    pub limit: u32,
+    pub offset: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,6 +498,22 @@ mod tests {
             &"字".repeat(MAX_BLOG_TITLE_LENGTH + 1),
             MAX_BLOG_TITLE_LENGTH
         ));
+    }
+
+    #[test]
+    fn paging_params_default_and_are_bounded() {
+        let q: ListPostsQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, None, "absent means the handler's default");
+        assert_eq!(q.offset, None);
+
+        let q: ListPostsQuery = serde_json::from_str(r#"{"limit":50,"offset":100}"#).unwrap();
+        assert_eq!((q.limit, q.offset), (Some(50), Some(100)));
+
+        // `u32`, so a negative never reaches SQL — where `LIMIT -1` means *no limit*, which
+        // would turn a typo into "return everything" rather than an error.
+        assert!(serde_json::from_str::<ListPostsQuery>(r#"{"limit":-1}"#).is_err());
+        assert!(serde_json::from_str::<ListPostsQuery>(r#"{"offset":-1}"#).is_err());
+        assert!(serde_json::from_str::<ListPostsQuery>(r#"{"limit":"20"}"#).is_err());
     }
 
     #[test]

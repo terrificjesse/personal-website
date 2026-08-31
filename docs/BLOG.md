@@ -52,7 +52,7 @@ means every new account is a non-admin without anyone remembering to set it.
 
 | Function | What it does |
 |---|---|
-| `list_posts` | `GET /blog/posts?sort=&q=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
+| `list_posts` | `GET /blog/posts?sort=&q=&limit=&offset=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
 | `like_pattern` | Escapes `\`, `%`, `_` and wraps in `%…%`, paired with `ESCAPE '\'`. Without it, searching `100%` returns every post. Unit-tested. |
 | `reject_if_file_sourced` | The **409** on a file-sourced post. Called by `update_post` and `delete_post`. |
 | `sync_posts` | `POST /blog/sync`. Admin-only. Re-runs the file sync and returns `{created, updated, deleted, skipped}` so a push can publish without a backend restart. |
@@ -110,7 +110,9 @@ Rules that are easy to break by "simplifying":
 | `BlogPost.source` | `"db"` or `"file"`; serialized to JSON, which is how the admin UI knows to hide Edit/Delete |
 | `BLOG_SOURCE_DB` / `BLOG_SOURCE_FILE` | The two values, named once |
 | `SortOrder` | `newest` / `oldest` enum. Being an enum is the point: `Query` rejects `?sort=oldset` as **400** rather than silently defaulting to newest |
-| `ListPostsQuery` | `{ sort, q }`, both optional |
+| `ListPostsQuery` | `{ sort, q, limit, offset }`, all optional. `limit`/`offset` are `u32`, so a negative is a 400 before it reaches SQL — where `LIMIT -1` means *no limit*, turning a typo into "return everything" |
+| `DEFAULT_BLOG_PAGE_SIZE` / `MAX_BLOG_PAGE_SIZE` | 20 / 100. A `const _: () = assert!(default <= max)` fails the *build*, not a test |
+| `BlogPostPage` | `{ posts, total, limit, offset }` — the response envelope |
 | `User.is_admin` | The flag, read fresh from the DB on every request |
 | `BlogPost` | The row struct — serialized straight to JSON as the API response |
 | `CreateBlogPostRequest` | `{ title, body, published }`; `published` defaults false |
@@ -211,6 +213,39 @@ Three designs were considered (`docs/PLAN.md` lists all three). Sync-into-one-ta
 it is the only one where sort and search are written *once*: read-through and the GitHub API
 both merge two stores in the query layer, so every future query feature gets implemented twice.
 The cost is that changes need a sync rather than being live.
+
+## Pagination
+
+`GET /blog/posts?limit=&offset=` returning `{ posts, total, limit, offset }`. Default 20, max
+100. Four decisions, each with a plausible-looking wrong answer:
+
+- **An envelope, not a bare array plus `X-Total-Count`.** A custom header needs
+  `Access-Control-Expose-Headers` to be readable cross-origin, and a header the browser
+  silently declines to expose is a worse failure mode than a slightly larger body. The count
+  is also not derivable from the page — a full page says nothing about whether more exist.
+- **Over-limit is a 400, not a clamp.** `?limit=1000` quietly returning 100 hands the caller a
+  partial answer it believes is complete. Same reasoning as `?sort=oldset` being a 400 rather
+  than a silent fallback to newest.
+- **`total` reuses the page's `WHERE`, draft filter included.** Counting without it would tell
+  a signed-out visitor exactly how many unpublished posts exist — the number leaks precisely
+  what hiding the rows protects. Verified: 25 published + 2 drafts reads as `total=25` to anon
+  and `total=27` to an admin.
+- **`ORDER BY created_at …, id ASC` — the tiebreaker is load-bearing.** File posts take
+  `created_at` from a frontmatter *day*, so they are all midnight and ties are the norm, not
+  the exception. Without a total order SQLite may answer page 2 in a different order than page
+  1, **showing one post twice and silently dropping another**. Verified by paging 25 tied posts
+  at `limit=7` across no-search, `?q=`, and `sort=oldest`: every case covered all 25 exactly
+  once.
+
+Frontend: `/blog` appends with a Load more button and a "Showing 20 of 23" line, resetting to
+offset 0 whenever the search or sort changes. The loading state only takes over the page when
+there is nothing to show yet — while *appending*, the list stays and the button carries it.
+`/blog/admin` asks for `BLOG_ADMIN_PAGE_LIMIT` (100) in one go rather than paging, and renders
+a visible warning if `total` exceeds it instead of silently showing a prefix.
+
+**This is a coupled change.** The frontend requires the envelope, so a backend still running a
+pre-pagination binary breaks `/blog` outright — restart the backend and the dev server
+together.
 
 ## Why `LIKE` and not FTS5
 
@@ -387,7 +422,7 @@ into `docs/PLAN.md` § Phase 7 — which was authored *after* this code shipped 
 **H3 and H5 also share a cause:** one rule written twice, in two places, which then drifted.
 Both were fixed by extracting a named predicate rather than patching the copy that was wrong.
 
-`cargo test`: **642 passed, 0 failed**, clippy clean, `tsc` clean, lint back to exactly the 2
+`cargo test`: **663 passed, 0 failed**, clippy clean, `tsc` clean, lint back to exactly the 2
 pre-existing errors. The five backend fixes were re-verified end-to-end against a copy of the
 real `fridge.db` over HTTP; H8 and H9 are frontend and were verified in the browser, since
 there is no JS test harness in this project.
@@ -402,9 +437,6 @@ there is no JS test harness in this project.
 
 ### Still open from that pass
 
-- **No pagination on `GET /blog/posts`** — every matching post comes back in one response.
-  Invisible at current volume, and the one item here that is a design hole rather than an
-  untested hypothesis.
 - Untested areas: concurrency (racing `unique_slug` → UNIQUE violation → 500?), sync × API
   interleaving, frontmatter fuzzing (BOM, CRLF, duplicate keys, non-UTF-8, symlinks), and
   volume (1,000 posts).

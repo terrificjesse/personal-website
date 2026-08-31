@@ -25,7 +25,29 @@ export type BlogSortOrder = "newest" | "oldest";
 export type ListPostsOptions = {
   sort?: BlogSortOrder;
   q?: string;
+  limit?: number;
+  offset?: number;
 };
+
+/** One page of posts. `total` counts what the requester may see, drafts included only for admins. */
+export type BlogPostPage = {
+  posts: BlogPost[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+/** The backend's page size when none is asked for — mirrors `DEFAULT_BLOG_PAGE_SIZE`. */
+export const BLOG_PAGE_SIZE = 20;
+
+/**
+ * What the admin editor asks for in one go — the backend's `MAX_BLOG_PAGE_SIZE`.
+ *
+ * Deliberately not paged: it is a management view for a single author, and a personal blog
+ * will not pass this. The page renders `total` regardless, so exceeding it shows a warning
+ * rather than silently truncating.
+ */
+export const BLOG_ADMIN_PAGE_LIMIT = 100;
 
 /** What one run of the file sync changed. */
 export type BlogSyncReport = {
@@ -57,12 +79,14 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
  * non-admin, drafts included for an admin. Uses a plain `fetch` rather than `apiFetch` —
  * this route works signed-out, so a missing cookie is the ordinary case, not a 401 to raise.
  */
-export async function fetchPosts(options: ListPostsOptions = {}): Promise<BlogPost[]> {
+export async function fetchPosts(options: ListPostsOptions = {}): Promise<BlogPostPage> {
   const params = new URLSearchParams();
   // Only send what was actually asked for: an empty `q=` is not a search for the empty
   // string, and omitting `sort` lets the backend's own default (newest) stand.
   if (options.sort) params.set("sort", options.sort);
   if (options.q?.trim()) params.set("q", options.q.trim());
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.offset) params.set("offset", String(options.offset));
 
   const query = params.toString();
   const res = await fetch(`${apiBase()}/blog/posts${query ? `?${query}` : ""}`, {

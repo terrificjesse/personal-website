@@ -180,7 +180,7 @@ Where I have no specific hypothesis but the code is under-exercised:
 | **Concurrency** | Two `POST /blog/posts` with the same title racing `unique_slug` → UNIQUE violation → 500? Sync running while an admin PATCHes? |
 | **Sync × API interleaving** | Delete a file and `PATCH` its post in the same window. Create a db post whose slug a pending file wants. |
 | **Frontmatter fuzzing** | Fence with trailing spaces (`--- `), CRLF mixed with LF, BOM, duplicate keys, `key:` with no value, a 1MB single line, non-UTF-8 bytes, a symlink, a `.md` directory. |
-| **Search edge cases** | `q` at 100KB; `q` of only `%`/`_`/`\`; combining characters; `q` matching 1,000 posts (no pagination exists). |
+| **Search edge cases** | `q` at 100KB; `q` of only `%`/`_`/`\`; combining characters; `q` matching 1,000 posts — paging now exists, so check `total` against a page. |
 | **Volume** | 1,000 file posts: sync duration, watcher tick cost, unpaginated list response size. |
 | **Auth boundaries** | Revoke `is_admin` mid-session → does the open editor degrade correctly? Draft visibility for a *second* admin. |
 | **Expiry of assumptions** | `BLOG_CONTENT_DIR` pointing at a file, a missing dir, a dir that disappears while the watcher runs, a dir with no read permission. |
