@@ -334,9 +334,16 @@ land immediately.
   `fetch_visible_to` above.
 - `slug` is stored at creation and **never rewritten** on a title edit, so a published URL
   stays stable. `unique_slug` appends `-2`, `-3`, … on collision.
-- **`GET /blog/posts` is paginated** (`limit`/`offset`, default 20, max 100, envelope
-  `{posts,total,limit,offset}`). Three rules not to undo: over-limit is a **400, not a clamp**;
-  `total` reuses the page's `WHERE` so it never leaks the draft count to a non-admin; and
+- **Never re-introduce a check-then-insert for slugs.** `create_post` attempts the insert and
+  lets the `UNIQUE` constraint pick the suffix. The previous `SELECT EXISTS` + `INSERT` returned
+  **500 six times out of ten** under a ten-way race — a double-clicked submit button reaches it.
+  A prior SELECT can never be atomic with the INSERT after it.
+- **`GET /blog/posts` is paginated by keyset** (`limit`/`cursor`, default 20, max 100, envelope
+  `{posts,total,limit,next_cursor}`). It shipped with `offset` and that repeated rows under
+  concurrent publishing — **do not go back to offset.** Three more rules not to undo:
+  over-limit is a **400, not a clamp**;
+  `total` is counted **without the cursor** but **with** the draft filter, so it neither counts
+  down as you page nor leaks the draft count to a non-admin; and
   **`ORDER BY created_at …, id ASC`** — file posts all share a midnight timestamp, so without
   the `id` tiebreaker paging repeats one post and drops another. It is also a **coupled**
   change: an old backend binary serving a bare array breaks the frontend outright.
@@ -417,9 +424,10 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **A second blog stress-test pass**, if wanted — concurrency, sync × API interleaving,
-   frontmatter fuzzing, and volume are all still unexplored.
-   `docs/BLOG_STRESS_TEST_PLAN.md` has the method. Lower expected yield than the first pass.
+2. **Two findings from the second blog stress pass, unfixed** — J2 (duplicate frontmatter keys
+   silently take the last, though an unknown key is a hard error) and J12 (a bad frontmatter
+   `slug:` blames the filename). Both cosmetic. See
+   `docs/BLOG_STRESS_TEST_PLAN.md` § Second pass.
 3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.

@@ -47,10 +47,10 @@ export default function BlogAdminPage() {
     if (!user?.is_admin) return;
     let cancelled = false;
 
-    // The editor asks for the largest page the backend allows rather than paging: this list
-    // is a management view for one author, and `MAX_BLOG_PAGE_SIZE` is well past what a
-    // personal blog reaches. `total` is still rendered, so if it is ever exceeded the UI says
-    // so instead of quietly showing a prefix.
+    // The editor asks for the largest page the backend allows rather than following cursors:
+    // this list is a management view for one author, and `MAX_BLOG_PAGE_SIZE` is well past
+    // what a personal blog reaches. `total` is still rendered, so if it is ever exceeded the
+    // UI says so instead of quietly showing a prefix.
     fetchPosts({ limit: BLOG_ADMIN_PAGE_LIMIT })
       .then((page) => {
         if (cancelled) return;

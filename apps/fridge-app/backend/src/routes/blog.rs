@@ -11,7 +11,8 @@ use crate::blog_files::{self, SyncReport};
 use crate::models::{
     BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, BlogPostPage, CreateBlogPostRequest,
     DEFAULT_BLOG_PAGE_SIZE, ListPostsQuery, MAX_BLOG_BODY_LENGTH, MAX_BLOG_PAGE_SIZE,
-    MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, exceeds_char_limit, is_blank, slugify,
+    MAX_BLOG_TITLE_LENGTH, SortOrder, UpdateBlogPostRequest, decode_cursor, encode_cursor,
+    exceeds_char_limit, is_blank, slugify,
 };
 use crate::routes::auth::{MaybeUser, RequireAdmin};
 
@@ -70,7 +71,12 @@ pub async fn list_posts(
     if limit == 0 || limit > MAX_BLOG_PAGE_SIZE {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let offset = params.offset.unwrap_or(0);
+
+    // A cursor that cannot be read is a caller error, not an empty first page.
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(decode_cursor(raw).ok_or(StatusCode::BAD_REQUEST)?),
+    };
 
     // One statement over one table covers both post kinds. That is the entire reason
     // file-sourced posts are rows rather than a second store read at request time: search and
@@ -93,17 +99,20 @@ pub async fn list_posts(
         conditions.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')");
     }
 
-    let where_clause = if conditions.is_empty() {
+    // Everything above describes the whole result set; the cursor narrows it to one page. The
+    // count below therefore uses only what is above, so "showing 20 of 143" keeps saying 143
+    // as you advance rather than counting down what is left.
+    let count_where = if conditions.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", conditions.join(" AND "))
     };
 
-    // The count reuses the *same* WHERE, draft filter included. Counting without it would tell
-    // a signed-out visitor exactly how many unpublished posts exist — the number leaks what
-    // the rows themselves are hidden to protect.
-    let count_sql = format!("SELECT COUNT(*) FROM blog_posts{where_clause}");
+    let count_sql = format!("SELECT COUNT(*) FROM blog_posts{count_where}");
     let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+    // The count reuses the same draft filter and search. Counting without the draft filter
+    // would tell a signed-out visitor exactly how many unpublished posts exist — the number
+    // leaks what the rows themselves are hidden to protect.
     if let Some(pattern) = &search {
         count_query = count_query.bind(pattern).bind(pattern);
     }
@@ -112,38 +121,66 @@ pub async fn list_posts(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // The cursor condition has to mirror the ORDER BY exactly, and the ORDER BY is mixed —
+    // `created_at` follows the sort direction while `id` is always ascending — so this cannot
+    // be written as a single row-value comparison. Getting it wrong does not error; it
+    // silently skips or repeats rows, which is the bug this replaced.
+    if cursor.is_some() {
+        conditions.push(match params.sort {
+            SortOrder::Newest => "(created_at < ? OR (created_at = ? AND id > ?))",
+            SortOrder::Oldest => "(created_at > ? OR (created_at = ? AND id > ?))",
+        });
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
     // `sql_direction` returns a `&'static str` from a two-variant enum: `ORDER BY` can't take
     // a bind parameter, so this is the only user-influenced part of the statement that is
     // interpolated, and the enum is what keeps it from being user-*supplied*.
     //
     // `id` breaks ties, and paging is why it has to. File posts take `created_at` from a
     // frontmatter *day*, so they are all midnight and ties are the norm rather than the
-    // exception; without a total order two pages can repeat a post and skip another.
+    // exception; without a total order there is no single "next row" for a cursor to name.
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM blog_posts{where_clause} \
-         ORDER BY created_at {}, id ASC LIMIT ? OFFSET ?",
+         ORDER BY created_at {}, id ASC LIMIT ?",
         params.sort.sql_direction()
     );
 
     let mut query = sqlx::query_as::<_, BlogPost>(&sql);
-    // Bound twice, as two separate `?` placeholders, because sqlx binds positionally in call
-    // order — a numbered `?1` reused across both sides would not line up with one `.bind`.
+    // Bound in the order the conditions were pushed, because sqlx binds positionally: search
+    // first (twice, as two separate `?`), then the cursor's three.
     if let Some(pattern) = &search {
         query = query.bind(pattern).bind(pattern);
     }
+    if let Some((created_at, id)) = &cursor {
+        query = query.bind(created_at).bind(created_at).bind(id);
+    }
 
-    let posts = query
-        .bind(limit)
-        .bind(offset)
+    // One more than asked for: whether a further page exists is not answerable from a full
+    // page, and `total` cannot answer it either once a cursor is in play.
+    let mut posts = query
+        .bind(limit + 1)
         .fetch_all(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let has_more = posts.len() > limit as usize;
+    posts.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| posts.last())
+        .flatten()
+        .map(|post| encode_cursor(post.created_at, &post.id));
 
     Ok(Json(BlogPostPage {
         posts,
         total,
         limit,
-        offset,
+        next_cursor,
     }))
 }
 
@@ -190,21 +227,26 @@ const MAX_SLUG_ATTEMPTS: u32 = 50;
 /// The constraint is the only thing that can decide atomically, so it decides. We attempt the
 /// insert and treat a unique violation as "someone took that one", trying the next suffix.
 /// Anything else is a real error.
-async fn insert_post_with_unique_slug(
-    pool: &SqlitePool,
-    id: &str,
-    author_id: &str,
-    title: &str,
-    base_slug: &str,
-    body: &str,
+/// Everything a new post needs, bundled so the insert takes two arguments rather than eight.
+struct NewPost<'a> {
+    id: &'a str,
+    author_id: &'a str,
+    title: &'a str,
+    base_slug: &'a str,
+    body: &'a str,
     published: bool,
     now: chrono::DateTime<Utc>,
+}
+
+async fn insert_post_with_unique_slug(
+    pool: &SqlitePool,
+    post: &NewPost<'_>,
 ) -> Result<String, StatusCode> {
     for attempt in 1..=MAX_SLUG_ATTEMPTS {
         let candidate = if attempt == 1 {
-            base_slug.to_string()
+            post.base_slug.to_string()
         } else {
-            format!("{base_slug}-{attempt}")
+            format!("{}-{attempt}", post.base_slug)
         };
 
         let result = sqlx::query(
@@ -212,14 +254,14 @@ async fn insert_post_with_unique_slug(
              (id, author_id, title, slug, body, published, created_at, updated_at, source) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(id)
-        .bind(author_id)
-        .bind(title)
+        .bind(post.id)
+        .bind(post.author_id)
+        .bind(post.title)
         .bind(&candidate)
-        .bind(body)
-        .bind(published)
-        .bind(now)
-        .bind(now)
+        .bind(post.body)
+        .bind(post.published)
+        .bind(post.now)
+        .bind(post.now)
         .bind(BLOG_SOURCE_DB)
         .execute(pool)
         .await;
@@ -260,13 +302,15 @@ pub async fn create_post(
 
     let slug = insert_post_with_unique_slug(
         &pool,
-        &id,
-        &user.id,
-        title,
-        &base_slug,
-        &req.body,
-        req.published,
-        now,
+        &NewPost {
+            id: &id,
+            author_id: &user.id,
+            title,
+            base_slug: &base_slug,
+            body: &req.body,
+            published: req.published,
+            now,
+        },
     )
     .await?;
 
@@ -438,13 +482,15 @@ mod tests {
     async fn insert(pool: &SqlitePool, base: &str) -> Result<String, StatusCode> {
         insert_post_with_unique_slug(
             pool,
-            &Uuid::new_v4().to_string(),
-            "a1",
-            "Race Me",
-            base,
-            "Body",
-            true,
-            Utc::now(),
+            &NewPost {
+                id: &Uuid::new_v4().to_string(),
+                author_id: "a1",
+                title: "Race Me",
+                base_slug: base,
+                body: "Body",
+                published: true,
+                now: Utc::now(),
+            },
         )
         .await
     }

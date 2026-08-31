@@ -26,15 +26,21 @@ export type ListPostsOptions = {
   sort?: BlogSortOrder;
   q?: string;
   limit?: number;
-  offset?: number;
+  /** The `next_cursor` from the previous page. Opaque — hand back what you were given. */
+  cursor?: string;
 };
 
 /** One page of posts. `total` counts what the requester may see, drafts included only for admins. */
 export type BlogPostPage = {
   posts: BlogPost[];
+  /**
+   * Size of the whole result set, not what remains — counted without the cursor, so
+   * "showing 20 of 143" keeps saying 143 as you page.
+   */
   total: number;
   limit: number;
-  offset: number;
+  /** Pass as `cursor` for the next page. `null` means this was the last one. */
+  next_cursor: string | null;
 };
 
 /** The backend's page size when none is asked for — mirrors `DEFAULT_BLOG_PAGE_SIZE`. */
@@ -86,7 +92,7 @@ export async function fetchPosts(options: ListPostsOptions = {}): Promise<BlogPo
   if (options.sort) params.set("sort", options.sort);
   if (options.q?.trim()) params.set("q", options.q.trim());
   if (options.limit !== undefined) params.set("limit", String(options.limit));
-  if (options.offset) params.set("offset", String(options.offset));
+  if (options.cursor) params.set("cursor", options.cursor);
 
   const query = params.toString();
   const res = await fetch(`${apiBase()}/blog/posts${query ? `?${query}` : ""}`, {

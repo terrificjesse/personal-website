@@ -23,14 +23,15 @@ export default function BlogPage() {
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
   const [total, setTotal] = useState(0);
-  // Offset is reset by the controls that change what is being asked for, not by an effect
-  // reacting to them — resetting in an effect would fire a wasted request at the old offset
-  // first.
-  const [offset, setOffset] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  // What the *current* request should resume from. Cleared by the controls that change the
+  // question being asked, not by an effect reacting to them — resetting in an effect would
+  // fire a wasted request at the stale cursor first.
+  const [cursor, setCursor] = useState<string | null>(null);
 
   // Identifies the request the current controls call for. Anything not yet settled at this
   // key is in flight.
-  const requestKey = `${sort}\u0000${debouncedQuery.trim()}\u0000${offset}`;
+  const requestKey = `${sort}\u0000${debouncedQuery.trim()}\u0000${cursor ?? ""}`;
   const loading = settledKey !== requestKey;
 
   // Purely so an admin has a way *into* the editor — `/blog/admin` linked out to here but
@@ -68,15 +69,16 @@ export default function BlogPage() {
     // Both controls feed one request. Sorting and searching compose in the backend's single
     // query, so there's nothing to merge or re-sort here — including across posts that came
     // from markdown files rather than the editor.
-    fetchPosts({ sort, q: debouncedQuery, limit: BLOG_PAGE_SIZE, offset })
+    fetchPosts({ sort, q: debouncedQuery, limit: BLOG_PAGE_SIZE, cursor: cursor ?? undefined })
       .then((page) => {
         // The cancelled flag matters more now than it did: typing fires overlapping requests,
         // and without it a slow early response could land after a newer one and win.
         if (cancelled) return;
-        // Offset 0 is a fresh question, so it replaces; anything else is another page of the
-        // same question, so it appends.
-        setPosts((current) => (offset === 0 ? page.posts : [...current, ...page.posts]));
+        // No cursor is a fresh question, so it replaces; a cursor is another page of the same
+        // question, so it appends.
+        setPosts((current) => (cursor === null ? page.posts : [...current, ...page.posts]));
         setTotal(page.total);
+        setNextCursor(page.next_cursor);
         setError(null);
       })
       .catch(() => {
@@ -86,6 +88,7 @@ export default function BlogPage() {
         // presents stale content as though it answered the current search.
         setPosts([]);
         setTotal(0);
+        setNextCursor(null);
       })
       .finally(() => {
         if (!cancelled) setSettledKey(key);
@@ -97,10 +100,12 @@ export default function BlogPage() {
     // `requestKey` is derived from the other two, so listing it changes nothing at runtime
     // — it is here because the effect reads it, and a dependency array that lies is how the
     // next person gets a stale closure.
-  }, [sort, debouncedQuery, offset, requestKey]);
+  }, [sort, debouncedQuery, cursor, requestKey]);
 
   const searching = debouncedQuery.trim().length > 0;
-  const hasMore = posts.length < total;
+  // Whether more exist is the server's answer, not arithmetic on `total` — under concurrent
+  // publishing those two disagree, and the server is the one that actually looked.
+  const hasMore = nextCursor !== null;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
@@ -122,7 +127,7 @@ export default function BlogPage() {
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
-            setOffset(0);
+            setCursor(null);
           }}
           placeholder="Search posts…"
           aria-label="Search posts"
@@ -135,7 +140,7 @@ export default function BlogPage() {
               type="button"
               onClick={() => {
                 setSort(option);
-                setOffset(0);
+                setCursor(null);
               }}
               aria-pressed={sort === option}
               className={
@@ -186,7 +191,7 @@ export default function BlogPage() {
           {hasMore && (
             <button
               type="button"
-              onClick={() => setOffset(posts.length)}
+              onClick={() => setCursor(nextCursor)}
               disabled={loading}
               className="rounded border border-black/20 dark:border-white/20 px-3 py-1.5 text-sm opacity-100 disabled:opacity-50"
             >

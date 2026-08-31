@@ -52,7 +52,7 @@ means every new account is a non-admin without anyone remembering to set it.
 
 | Function | What it does |
 |---|---|
-| `list_posts` | `GET /blog/posts?sort=&q=&limit=&offset=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
+| `list_posts` | `GET /blog/posts?sort=&q=&limit=&cursor=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
 | `like_pattern` | Escapes `\`, `%`, `_` and wraps in `%…%`, paired with `ESCAPE '\'`. Without it, searching `100%` returns every post. Unit-tested. |
 | `reject_if_file_sourced` | The **409** on a file-sourced post. Called by `update_post` and `delete_post`. |
 | `sync_posts` | `POST /blog/sync`. Admin-only. Re-runs the file sync and returns `{created, updated, deleted, skipped}` so a push can publish without a backend restart. |
@@ -110,9 +110,10 @@ Rules that are easy to break by "simplifying":
 | `BlogPost.source` | `"db"` or `"file"`; serialized to JSON, which is how the admin UI knows to hide Edit/Delete |
 | `BLOG_SOURCE_DB` / `BLOG_SOURCE_FILE` | The two values, named once |
 | `SortOrder` | `newest` / `oldest` enum. Being an enum is the point: `Query` rejects `?sort=oldset` as **400** rather than silently defaulting to newest |
-| `ListPostsQuery` | `{ sort, q, limit, offset }`, all optional. `limit`/`offset` are `u32`, so a negative is a 400 before it reaches SQL — where `LIMIT -1` means *no limit*, turning a typo into "return everything" |
+| `ListPostsQuery` | `{ sort, q, limit, cursor }`, all optional. `limit` is `u32`, so a negative is a 400 before it reaches SQL — where `LIMIT -1` means *no limit*, turning a typo into "return everything". A malformed `cursor` is also a 400, not an empty first page |
+| `encode_cursor` / `decode_cursor` | Hex-encoded `(created_at, id)` — the sort key, because a cursor that doesn't match the `ORDER BY` can't name a position in it. Hex rather than base64 to avoid a crate for the job |
 | `DEFAULT_BLOG_PAGE_SIZE` / `MAX_BLOG_PAGE_SIZE` | 20 / 100. A `const _: () = assert!(default <= max)` fails the *build*, not a test |
-| `BlogPostPage` | `{ posts, total, limit, offset }` — the response envelope |
+| `BlogPostPage` | `{ posts, total, limit, next_cursor }` — the response envelope. `next_cursor` is `null` on the last page |
 | `User.is_admin` | The flag, read fresh from the DB on every request |
 | `BlogPost` | The row struct — serialized straight to JSON as the API response |
 | `CreateBlogPostRequest` | `{ title, body, published }`; `published` defaults false |
@@ -216,8 +217,8 @@ The cost is that changes need a sync rather than being live.
 
 ## Pagination
 
-`GET /blog/posts?limit=&offset=` returning `{ posts, total, limit, offset }`. Default 20, max
-100. Four decisions, each with a plausible-looking wrong answer:
+`GET /blog/posts?limit=&cursor=` returning `{ posts, total, limit, next_cursor }`. Default 20,
+max 100. Four decisions, each with a plausible-looking wrong answer:
 
 - **An envelope, not a bare array plus `X-Total-Count`.** A custom header needs
   `Access-Control-Expose-Headers` to be readable cross-origin, and a header the browser
@@ -230,15 +231,22 @@ The cost is that changes need a sync rather than being live.
   a signed-out visitor exactly how many unpublished posts exist — the number leaks precisely
   what hiding the rows protects. Verified: 25 published + 2 drafts reads as `total=25` to anon
   and `total=27` to an admin.
+- **Keyset, not offset.** It shipped with `offset` and that was wrong: an offset is a position
+  in a list that moves. Publishing a post mid-browse shifted every row down one, so the next
+  page re-served the last row of the previous one and Load more showed it twice (finding J17).
+  The cursor carries `(created_at, id)` — the sort key itself — and `next_cursor` is `null` on
+  the last page, so "is there more" is the server's answer rather than arithmetic on `total`.
+  The predicate has to mirror the *mixed* `ORDER BY` (`created_at <dir>, id ASC`), so it cannot
+  be one row-value comparison; getting it wrong silently skips or repeats rather than erroring.
 - **`ORDER BY created_at …, id ASC` — the tiebreaker is load-bearing.** File posts take
   `created_at` from a frontmatter *day*, so they are all midnight and ties are the norm, not
   the exception. Without a total order SQLite may answer page 2 in a different order than page
-  1, **showing one post twice and silently dropping another**. Verified by paging 25 tied posts
-  at `limit=7` across no-search, `?q=`, and `sort=oldest`: every case covered all 25 exactly
-  once.
+  1, **showing one post twice and silently dropping another** — and with keyset paging there
+  would be no single "next row" for a cursor to name at all. Verified by paging 25 tied posts
+  across no-search, `?q=`, and `sort=oldest`: every case covered all 25 exactly once.
 
-Frontend: `/blog` appends with a Load more button and a "Showing 20 of 23" line, resetting to
-offset 0 whenever the search or sort changes. The loading state only takes over the page when
+Frontend: `/blog` appends with a Load more button and a "Showing 20 of 23" line, clearing the
+cursor whenever the search or sort changes. The loading state only takes over the page when
 there is nothing to show yet — while *appending*, the list stays and the button carries it.
 `/blog/admin` asks for `BLOG_ADMIN_PAGE_LIMIT` (100) in one go rather than paging, and renders
 a visible warning if `total` exceeds it instead of silently showing a prefix.
@@ -434,6 +442,28 @@ there is no JS test harness in this project.
   unbroken token.
 - `pre` keeps `overflow-wrap: normal` **on purpose**. Prose wraps; code scrolls. Re-flowing a
   code block changes what it appears to say.
+
+### Second pass (2026-08-31)
+
+The "areas to probe" table, worked through: **four findings, five refutations**. Full detail in
+`docs/BLOG_STRESS_TEST_PLAN.md` § Second pass.
+
+| # | Finding | State |
+|---|---|---|
+| J1 | `create_post` returned **500 under contention** — `SELECT EXISTS` then `INSERT`, with nothing holding between. Ten concurrent creates of one title gave **six 500s** | **Fixed** — the `UNIQUE` constraint arbitrates; 10× 201 after |
+| J17 | Offset paging repeated a post if something published mid-browse | **Fixed** — keyset `cursor` replaces `offset` |
+| J2 | Duplicate frontmatter keys silently take the last, though an *unknown* key is a hard error | Open |
+| J12 | A bad frontmatter `slug:` reports "**filename** produces an empty slug" | Open |
+
+Refuted: auth revocation (immediate, no re-login), pagination edges, hostile input, and sync ×
+API collision. Most usefully, **volume**: 1000 file posts sync in 380ms, re-sync in 127ms, and
+every read takes 9ms; a quiet watcher tick over 1006 files is 2.1ms. That is measured evidence
+for two decisions that had only been argued — **LIKE over FTS5**, and **polling over `notify`**.
+
+**One documented-behaviour gap:** removing the *entire* content directory keeps every post,
+while removing one file deletes its post. Conservative and consistent with the principle that
+fixed H1 — an I/O failure is not evidence of absence — but it does contradict the flat claim
+that sync "mirrors" the directory.
 
 ### Still open from that pass
 

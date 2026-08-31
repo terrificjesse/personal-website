@@ -9,7 +9,16 @@
 > |---|---|
 > | **Confirmed & fixed** | H1, H1b, H1c, H2, H3, H5, H7, H8, H9 |
 > | **Refuted** | H4 (ordering is correct despite mixed encodings), H6 (`react-markdown` strips unsafe URL protocols) |
-> | **Not yet attempted** | everything under "Areas to probe beyond the ranked list" |
+> | **Not yet attempted** | — |
+>
+> **Second pass, 2026-08-31** — the "areas to probe" table, worked through. Four findings, five
+> refutations. See "Second pass" below.
+>
+> | | |
+> |---|---|
+> | **Confirmed & fixed** | J1 (concurrent creates returned 500), J17 (paging could repeat a post) |
+> | **Confirmed, not fixed** | J2 (duplicate frontmatter keys), J12 (misleading skip reason) |
+> | **Refuted** | J19 auth revocation, J16 pagination edges, J21 volume, J3/J4 bad input, J14 sync × API |
 
 **Goal: find what's broken.** Not to re-confirm the Phase 6 checkpoint, which passed and
 proved only that the paths I designed work when driven the way I designed them. Every
@@ -228,3 +237,99 @@ Four of the five bugs fall into two pairs, and both pairs are general:
 
 The checkpoint that "passed" was written by whoever designed the feature, and so tested the
 paths as designed. That is the structural reason this pass found anything at all.
+
+---
+
+# Second pass — 2026-08-31
+
+The first pass drained the ranked hypotheses. This one worked through the "areas to probe"
+table, which had no specific suspicions attached — so the expected yield was lower, and was.
+Everything below ran against a throwaway copy of `fridge.db` on an isolated port.
+
+## Confirmed
+
+### J1 — concurrent creates returned 500 🔴 — FIXED
+
+`unique_slug` ran `SELECT EXISTS(...)` to find a free slug, then `create_post` inserted, with
+nothing holding between the two. Both requests could see the same slug free; the loser hit the
+`UNIQUE` constraint, which mapped to 500.
+
+**Not theoretical.** Ten concurrent creates of the same title produced **six 500s and only four
+posts**. One double-clicked submit button reaches it.
+
+**Fix:** the constraint is the only thing that can decide atomically, so it decides.
+`insert_post_with_unique_slug` attempts the insert and treats a unique violation as "someone
+took that one", stepping to the next suffix. Bounded at 50 attempts — every retry is driven by
+a database error, and `is_unique_violation` also covers the `id` primary key, which is not
+re-rolled, so an unbounded loop could spin forever on a non-slug cause. Re-running the
+identical race: **10× 201, ten distinct slugs, zero 500s.**
+
+### J17 — paging can show the same post twice 🟠 — FIXED
+
+Offset pagination over a list sorted newest-first. Publish a post while someone is browsing and
+every row shifts down one, so page 2 re-serves the last row of page 1. Demonstrated:
+`race-me` appeared in both pages, and the accumulated Load more list renders it twice. The
+mirror-image failure — a post *skipped* — happens when a row is removed mid-browse.
+
+Inherent to offset pagination — an offset is a position in a list that moves.
+
+**Fix: keyset paging.** `offset` is replaced by an opaque `cursor` carrying the
+`(created_at, id)` of the last row on the page — the sort key itself, because a cursor that
+does not match the `ORDER BY` cannot describe a position in it. The response carries
+`next_cursor`, `null` on the last page, so "is there more" is the server's answer rather than
+arithmetic on `total` that concurrent publishing invalidates.
+
+Two things the fix had to get right:
+
+- **`total` is counted without the cursor**, so "showing 20 of 143" keeps saying 143 as you
+  page instead of counting down what is left. Verified: publishing mid-walk moved it 30 → 31.
+- **The cursor predicate mirrors the mixed `ORDER BY`.** Sorting is `created_at <dir>, id ASC`
+  — direction varies on one column but not the other — so it cannot be a single row-value
+  comparison and is written as `(created_at <op> ? OR (created_at = ? AND id > ?))`. Getting
+  this wrong does not error; it silently skips or repeats, which is the bug being fixed.
+
+Verified: publishing between page 1 and page 2 now yields **no overlap**, and a full walk in
+4-row pages while publishing every third page covered all 30 originals with **zero duplicates**
+in both sort directions. Malformed cursors are 400, not an empty first page.
+
+### J2 — duplicate frontmatter keys silently take the last 🟡
+
+`title: First` … `title: Second` stores "Second" with no warning. This contradicts the parser's
+own governing rule: an **unknown** key is a hard error precisely to catch typos, but a
+**duplicated** key — equally likely a mistake — passes silently.
+
+### J12 — misleading skip reason 🟡
+
+A frontmatter `slug: "!!!"` that slugifies to nothing is skipped with *"filename produces an
+empty slug"*. The filename was fine; the frontmatter was not. The reader renames the wrong
+thing.
+
+## Refuted
+
+- **J19 — auth revocation.** Immediate and complete with no re-login: drafts 7→6, draft slug
+  404s, `create` 403s, regrant restores. Exactly as `docs/BLOG.md` claims.
+- **J16 — pagination edges.** Offset past the end returns empty with a correct total; `u32`
+  max is 200; overflow is 400.
+- **J21 — volume.** 1000 file posts: initial sync **380ms**, no-op re-sync **127ms**, every
+  read (page 1, search, deep offset) **9ms**. A quiet watcher tick over 1006 files is
+  **2.1ms**. This is direct evidence for two earlier decisions that were argued rather than
+  measured: **LIKE over FTS5**, and **polling over `notify`**.
+- **J3 / J4 — hostile input.** Invalid UTF-8, a directory named `*.md`, and a 100KB query are
+  all handled with accurate reasons (the query gets a 414 from the server, not a crash).
+- **J14 — sync × API collision.** A file and an API create racing for the same slug resolved
+  cleanly: the API create won, sync skipped with a correct log line.
+
+## A documented-behaviour gap, not a bug
+
+**Removing the entire content directory keeps every post; removing one file deletes its post.**
+With 1007 posts synced, moving the directory away left all 1007 in place, and an explicit sync
+reported all zeros. The conservative choice is right — a missing directory is ambiguous between
+"content deleted" and "disk unmounted", and this is the same principle that fixed H1 — but it
+contradicts the flat claim that sync "mirrors" the directory. Stated here so it is a decision
+rather than a surprise.
+
+## Still unexplored
+
+Frontmatter fuzzing was only partly covered (BOM, CRLF, duplicate keys, non-UTF-8, directories
+and empty slugs were tested; symlinks and megabyte-single-line files were not), and nothing
+here touched the *frontend* beyond what the first pass covered.
