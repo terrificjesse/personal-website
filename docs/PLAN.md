@@ -851,16 +851,30 @@ single accuracy figure to quote instead of them. It keeps a ledger beside the la
 recording the fingerprint of the rules each grading ran under, so a set that was graded and then
 tuned against reports itself as in-sample rather than silently passing as fresh.
 
-Two things it surfaced immediately, neither yet fixed:
+It surfaced two defects before a single message had been labelled.
 
-- `guess_company` matches a known company as a bare substring of the sender, with a 3-character
-  floor. On the live inbox that makes `systemmessage@paycomonline.com` name **Sage** (from
-  "mes*sage*") and `donotreply@msg.paycomonline.com` name **KLA** (from "O*kla*homa City
-  Thunder"). Neither flips a category today — both senders are on an ATS domain and reach
-  outreach anyway — but `company_guess` is the matcher's hint, so a wrong one is a rule 2 risk:
-  an email matched to the wrong application. `jobs@ziprecruiter.com` naming **Zip** is the same
-  bug pointed at the relevance gate, caught today only when a BULK marker happens to fire first.
-- `is_machine_sender` does not know `systemmessage@`, so that sender reads as a person.
+**Fixed — `guess_company` matched a company as a bare substring** (2026-08-31). The known-company
+list is real and holds 586 names, including three-letter ones, so a bare `contains` matched the
+*inside of ordinary words*. The worst case was not in the sender at all: **PPL** is a utility in
+the corpus, and "a*ppl*y" / "a*ppl*ication" appear in **9 of the 14** messages in the burner
+inbox. Longest-match-wins hid it in eight of them; in the ninth it was the guess, and
+`company_guess` is what `advance::match_application` keys on — rule 2's failure exactly, an
+email matched to a company it has nothing to do with. Three more, all verbatim from live mail:
+`systemmessage@paycomonline.com` named **Sage** ("mes*sage*"), `donotreply@msg.paycomonline.com`
+named **KLA** ("O*kla*homa City Thunder"), and `jobs@ziprecruiter.com` named **Zip** — the last
+being the same bug pointed at the relevance gate, where a job-board digest "names a specific
+employer" and stops looking like junk.
+
+The fix requires a non-alphanumeric boundary on both sides of the match, compared as `char`s
+rather than bytes so a two-byte letter is not mistaken for a delimiter. Measured over every real
+message: **11 of 14 guesses unchanged, 3 changed** — two false positives removed, and one *true*
+positive recovered (`Zip Hiring Team <no-reply@ashbyhq.com>` guessed `ppl` before and now
+guesses `zip`). Every legitimate match in the corpus — Roblox, Tesla, Jump Trading, Epic Games,
+Google — survives, via a whole domain label or a display-name word.
+
+**Still open — `is_machine_sender` does not know `systemmessage@`**, so that sender reads as a
+person. No effect on today's mail (`paycomonline.com` is an ATS domain and reaches outreach
+either way), but it is the same shape of gap.
 
 ### Open questions
 

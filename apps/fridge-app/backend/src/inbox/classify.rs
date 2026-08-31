@@ -367,12 +367,59 @@ fn guess_company(sender: &str, text: &str, context: &Context<'_>) -> Option<Stri
             continue;
         }
         let squashed = company.replace(' ', "");
-        let mentioned = text.contains(company.as_str()) || sender.contains(squashed.as_str());
+        let mentioned =
+            contains_whole_word(text, company.as_str()) || contains_whole_word(sender, &squashed);
         if mentioned && best.is_none_or(|current| company.len() > current.len()) {
             best = Some(company);
         }
     }
     best.cloned()
+}
+
+/// Whether `needle` occurs in `haystack` bounded by non-alphanumeric characters on both sides.
+///
+/// # Why a bare `contains` was wrong
+///
+/// The company list is real and contains three-letter names — `exa`, `kla`, `zip`, `imc`,
+/// `amd`, `sage`. As bare substrings those match the *inside of ordinary words*, and every one
+/// of these was observed on live burner-inbox mail:
+///
+/// | Sender | Matched | Because |
+/// |---|---|---|
+/// | `systemmessage@paycomonline.com` | Sage | "mes**sage**" |
+/// | `oklahoma city thunder <donotreply@…>` | KLA | "o**kla**homa" |
+/// | `jobs@ziprecruiter.com` | Zip | "**zip**recruiter" |
+///
+/// That is not a cosmetic defect. `company_guess` is the hint `advance::match_application`
+/// keys on, so a name invented out of the middle of a word is rule 2's failure — an email
+/// matched to an application it has nothing to do with. Pointed at the relevance gate it is
+/// the other one: a job-board digest that "names a specific employer" is exactly the junk that
+/// is supposed to fall through to disregarded.
+///
+/// Requiring a boundary keeps every true positive in the live corpus, because a company name
+/// that is really there is delimited by something — `@`, `.`, a space, or the end of the
+/// string. `no-reply@jumptrading.com` still finds Jump Trading via the squashed form, and a
+/// display name like `Zip Hiring Team <no-reply@ashbyhq.com>` still finds Zip.
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        // Both indices land on char boundaries — `find` returns one, and the other is the end
+        // of the matched needle — so these slices are safe. Compared as `char`s rather than
+        // bytes: a byte-level check reads the second half of a two-byte letter like `ç` as a
+        // non-alphanumeric and would call the middle of "çzip" a word boundary.
+        let open = haystack[..start].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let close = haystack[end..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if open && close {
+            return true;
+        }
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -665,5 +712,69 @@ mod tests {
             &Context { known_companies: &known },
         );
         assert_eq!(verdict.company_guess.as_deref(), Some("jump trading"));
+    }
+
+    /// The company list really does contain three-letter names, and these three senders are
+    /// verbatim from the burner inbox. Each one used to "name a company" out of the middle of
+    /// an ordinary word.
+    #[test]
+    fn a_company_name_inside_an_ordinary_word_is_not_a_company_mention() {
+        let known: Vec<String> =
+            ["sage", "kla", "zip", "exa"].iter().map(|c| c.to_string()).collect();
+        let context = Context { known_companies: &known };
+
+        for (from, subject) in [
+            // "mes-SAGE-".
+            ("systemmessage@paycomonline.com", "Your application"),
+            // "o-KLA-homa".
+            ("Oklahoma City Thunder <donotreply@msg.paycomonline.com>", "Thanks"),
+            // "ZIP-recruiter" — a job board, not the company called Zip.
+            ("jobs@ziprecruiter.com", "Openings near you"),
+            // "-EXA-mple".
+            ("hr@somecorp.example", "Hello"),
+        ] {
+            let verdict = classify(Some(from), Some(subject), Some(""), &context);
+            assert_eq!(
+                verdict.company_guess, None,
+                "{from} should name no company, got {:?}",
+                verdict.company_guess
+            );
+        }
+    }
+
+    /// The other half of the same fix: a name that is genuinely there is still found, whether
+    /// it arrives in the domain or in the display name.
+    #[test]
+    fn a_company_named_at_a_word_boundary_is_still_found() {
+        let known: Vec<String> =
+            ["zip", "roblox", "jump trading"].iter().map(|c| c.to_string()).collect();
+        let context = Context { known_companies: &known };
+
+        // Squashed, as a whole domain label.
+        let from_domain = classify(Some("no-reply@jumptrading.com"), Some("Hi"), Some(""), &context);
+        assert_eq!(from_domain.company_guess.as_deref(), Some("jump trading"));
+
+        // In the display name, where the domain belongs to the ATS rather than the employer.
+        let from_display =
+            classify(Some("Zip Hiring Team <no-reply@ashbyhq.com>"), Some("Hi"), Some(""), &context);
+        assert_eq!(from_display.company_guess.as_deref(), Some("zip"));
+
+        // In the subject line.
+        let from_text = classify(Some("a@b.test"), Some("Roblox Week @ CMU"), Some(""), &context);
+        assert_eq!(from_text.company_guess.as_deref(), Some("roblox"));
+    }
+
+    #[test]
+    fn whole_word_matching_handles_the_edges() {
+        assert!(contains_whole_word("zip hiring team", "zip"), "start of string");
+        assert!(contains_whole_word("team at zip", "zip"), "end of string");
+        assert!(contains_whole_word("a@zip.com", "zip"), "delimited by punctuation");
+        assert!(!contains_whole_word("ziprecruiter", "zip"), "prefix of a longer word");
+        assert!(!contains_whole_word("unzip", "zip"), "suffix of a longer word");
+        assert!(!contains_whole_word("message", "sage"), "inside a word");
+        assert!(!contains_whole_word("anything", ""), "an empty needle names nothing");
+        // A non-ASCII neighbour is a boundary, and must not panic on a byte index mid-char.
+        assert!(contains_whole_word("café zip", "zip"));
+        assert!(!contains_whole_word("çzip", "zip"));
     }
 }
