@@ -25,8 +25,10 @@ use uuid::Uuid;
 
 use crate::hunt::events::{self, EventKind, NewHuntEvent};
 
+use crate::internships::models::ApplicationStatus;
+
 use super::classify::{self, Category};
-use super::{gmail, oauth};
+use super::{advance, gmail, oauth};
 
 /// How many messages one pass will look at.
 ///
@@ -118,6 +120,17 @@ pub async fn run(
     .unwrap_or_default();
     let context = classify::Context { known_companies: &known_companies };
 
+    // The applications an email can be matched to. Loaded once, like the company list — the
+    // matcher is a pure function and everything it needs arrives as an argument.
+    let applications: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, company_name FROM internship_applications WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let threshold = auto_apply_threshold();
+
     let client = reqwest::Client::new();
     let ids = match gmail::list_message_ids(&client, &token, max_messages).await {
         Ok(ids) => ids,
@@ -172,12 +185,19 @@ pub async fn run(
         // Rule 8 is why this does not wait for a match: an unmatched interview invite is the
         // single most costly thing this tool could drop, and the category was decided from the
         // email alone precisely so the alert does not depend on the matcher succeeding.
-        if verdict.category.is_pressing() {
-            if let Err(err) = raise_alert(pool, user_id, &message, &verdict, now).await {
+        // 8c, the reversible half: propose a status change, never make one silently.
+        if let Err(err) =
+            propose_status(pool, user_id, &message, &verdict, &applications, threshold, now).await
+        {
+            eprintln!("inbox: could not record a status proposal: {err:?}");
+        }
+
+        if verdict.category.is_pressing()
+            && let Err(err) = raise_alert(pool, user_id, &message, &verdict, now).await
+        {
                 // An undelivered notification is a worse day, not lost data — the message and
                 // its verdict are already stored. Same posture as the posting producer.
-                eprintln!("inbox: could not raise an alert for {}: {err:?}", message.id);
-            }
+            eprintln!("inbox: could not raise an alert for {}: {err:?}", message.id);
         }
 
         // Rejection folds into the confirmation counter rather than getting its own: rule 7
@@ -274,6 +294,116 @@ async fn store_message(
     .rows_affected();
 
     Ok(inserted > 0)
+}
+
+/// The confidence at which a forward status change may be applied without review.
+///
+/// **`None` by default, so nothing auto-applies.** The open question in
+/// `apps/hunt-extension/CLAUDE.md` says to set this after 8b gives real numbers, and 8b's
+/// checkpoint is not met — guessing it would be inventing the measurement it is meant to come
+/// from. Set `INBOX_AUTO_APPLY_CONFIDENCE` to enable it once there is a number.
+fn auto_apply_threshold() -> Option<f64> {
+    std::env::var("INBOX_AUTO_APPLY_CONFIDENCE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| (0.0..=1.0).contains(value))
+}
+
+/// Record what this email implies about an application's status. **Rule 2.**
+///
+/// A misclassification must never silently rewrite the tracker, so every email-driven change
+/// is a row that names the verdict that caused it. **The link from the change back to the
+/// email is what makes it reversible** — without it, a false positive that flips
+/// `applied -> rejected` destroys real state with no record of why.
+///
+/// Returns without writing when there is nothing to propose: no match, no implied status, or a
+/// move rule 3 forbids.
+async fn propose_status(
+    pool: &SqlitePool,
+    user_id: &str,
+    message: &gmail::Message,
+    verdict: &classify::EmailVerdict,
+    applications: &[(String, String)],
+    threshold: Option<f64>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let Some(to_status) = advance::implied_status(verdict.category) else {
+        return Ok(false);
+    };
+    let Some(application_id) =
+        advance::match_application(verdict.company_guess.as_deref(), applications)
+    else {
+        // Rule 8: no match is not a failure. The email is classified, stored and — if
+        // pressing — alerted regardless. It simply proposes nothing.
+        return Ok(false);
+    };
+
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM internship_applications WHERE id = ? AND user_id = ?",
+    )
+    .bind(application_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+
+    let Some(from_status) = current.as_deref().and_then(ApplicationStatus::parse) else {
+        return Ok(false);
+    };
+
+    // Rule 3, applied before anything is written.
+    if !advance::may_advance(from_status, to_status) {
+        return Ok(false);
+    }
+
+    let verdict_id: Option<String> = sqlx::query_scalar(
+        "SELECT v.id FROM email_verdicts v
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE m.gmail_message_id = ? ORDER BY v.created_at DESC LIMIT 1",
+    )
+    .bind(&message.id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(verdict_id) = verdict_id else {
+        return Ok(false);
+    };
+
+    let auto = advance::may_auto_apply(to_status, verdict.confidence, threshold);
+
+    sqlx::query(
+        "INSERT INTO status_proposals
+             (id, application_id, verdict_id, from_status, to_status,
+              applied_automatically, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(application_id)
+    .bind(&verdict_id)
+    .bind(from_status.as_str())
+    .bind(to_status.as_str())
+    .bind(i64::from(auto))
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    if auto {
+        // Only ever a forward, non-terminal move above the threshold — `may_auto_apply`
+        // guarantees all three. `status_changed_at` moves with it, because Phase 7 made that
+        // column mean "how long have I been at this stage".
+        sqlx::query(
+            "UPDATE internship_applications
+                SET status = ?1, status_changed_at = ?2, updated_at = ?2
+              WHERE id = ?3 AND user_id = ?4",
+        )
+        .bind(to_status.as_str())
+        .bind(now.to_rfc3339())
+        .bind(application_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(true)
 }
 
 /// Raise a desktop alert for pressing mail.

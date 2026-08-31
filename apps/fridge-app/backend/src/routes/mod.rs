@@ -207,6 +207,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hunt/inbox/status", get(inbox::status))
         .route("/hunt/inbox/sync", post(inbox::sync_now))
         .route("/hunt/inbox/disconnect", post(inbox::disconnect))
+        .route("/hunt/proposals", get(inbox::proposals))
+        .route("/hunt/proposals/{id}/accept", post(inbox::accept_proposal))
+        .route("/hunt/proposals/{id}/reject", post(inbox::reject_proposal))
         .route(
             "/hunt/answers",
             get(hunt::list_answers).post(hunt::create_answer),

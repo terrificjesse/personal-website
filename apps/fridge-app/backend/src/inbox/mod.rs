@@ -16,7 +16,8 @@
 //! - [`oauth`] — connecting the account, and keeping the access token fresh.
 //! - [`gmail`] — the Gmail API surface actually used. Read-only in this phase, by construction.
 //! - [`sync`] — the pass: fetch, record, count. Owns `inbox_runs`.
-//! - [`classify`] — a stub until 8b.
+//! - [`classify`] — the rules layer.
+//! - [`advance`] — matching, and what an email may do to a status. Rules 2 and 3, pure.
 //!
 //! # Email is untrusted content — rule 1
 //!
@@ -26,6 +27,7 @@
 //! When the classifier arrives in 8b it is a pure function — email in, a constrained enum out,
 //! no tools — and every write happens in Rust outside the model call.
 
+pub mod advance;
 pub mod classify;
 pub mod gmail;
 pub mod oauth;

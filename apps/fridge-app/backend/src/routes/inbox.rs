@@ -9,7 +9,7 @@
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Redirect,
 };
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::GoogleOAuthConfig;
 use crate::inbox::{oauth, sync};
+use crate::internships::models::ApplicationStatus;
 use crate::routes::auth::CurrentUser;
 
 /// Guards the callback against a request the user did not start. Its own cookie, separate from
@@ -252,4 +253,152 @@ mod tests {
         assert_ne!(GMAIL_STATE_COOKIE, "fridge_session");
         assert_ne!(GMAIL_STATE_COOKIE, "oauth_state");
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// Status proposals (Phase 8c, the reversible half)
+// ------------------------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Proposal {
+    pub id: String,
+    pub application_id: String,
+    pub company_name: String,
+    pub title: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub applied_automatically: bool,
+    /// The email that caused it. **This link is what makes a bad call reversible** — rule 2.
+    pub subject: Option<String>,
+    pub evidence: Option<String>,
+    pub confidence: Option<f64>,
+    pub created_at: String,
+}
+
+/// Proposals still awaiting a decision, newest first.
+pub async fn proposals(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<Vec<Proposal>>, StatusCode> {
+    sqlx::query_as::<_, Proposal>(
+        "SELECT p.id, p.application_id, a.company_name, a.title,
+                p.from_status, p.to_status, p.applied_automatically,
+                m.subject, v.evidence, v.confidence, p.created_at
+           FROM status_proposals p
+           JOIN internship_applications a ON a.id = p.application_id
+           JOIN email_verdicts v ON v.id = p.verdict_id
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE a.user_id = ? AND p.reviewed_at IS NULL
+          ORDER BY p.created_at DESC",
+    )
+    .bind(&user.id)
+    .fetch_all(&pool)
+    .await
+    .map(Json)
+    .map_err(|err| {
+        eprintln!("inbox: listing proposals failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Accept a proposal: apply the status change and mark it reviewed.
+pub async fn accept_proposal(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide(&pool, &user.id, &id, true).await
+}
+
+/// Reject a proposal: mark it reviewed and change nothing.
+pub async fn reject_proposal(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide(&pool, &user.id, &id, false).await
+}
+
+async fn decide(
+    pool: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    accept: bool,
+) -> Result<StatusCode, StatusCode> {
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT p.application_id, p.to_status, p.applied_automatically
+           FROM status_proposals p
+           JOIN internship_applications a ON a.id = p.application_id
+          WHERE p.id = ? AND a.user_id = ? AND p.reviewed_at IS NULL",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| {
+        eprintln!("inbox: reading a proposal failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let Some((application_id, to_status, was_auto)) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let now = Utc::now();
+
+    if accept {
+        // Applying an already-auto-applied proposal again is a no-op on the status, which is
+        // why this is safe to press twice.
+        if ApplicationStatus::parse(&to_status).is_none() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let _ = sqlx::query(
+            "UPDATE internship_applications
+                SET status = ?1, status_changed_at = ?2, updated_at = ?2
+              WHERE id = ?3 AND user_id = ?4",
+        )
+        .bind(&to_status)
+        .bind(now.to_rfc3339())
+        .bind(&application_id)
+        .bind(user_id)
+        .execute(pool)
+        .await;
+    } else if was_auto == 1 {
+        // Rejecting a proposal that was already applied has to UNDO it. Without this, "reject"
+        // would only mean "stop showing me this", and the tracker would keep the change the
+        // user just said was wrong — which is the whole failure rule 2 exists to prevent.
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT from_status FROM status_proposals WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some(previous) = previous {
+            let _ = sqlx::query(
+                "UPDATE internship_applications
+                    SET status = ?1, status_changed_at = ?2, updated_at = ?2
+                  WHERE id = ?3 AND user_id = ?4",
+            )
+            .bind(previous)
+            .bind(now.to_rfc3339())
+            .bind(&application_id)
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        }
+    }
+
+    sqlx::query("UPDATE status_proposals SET reviewed_at = ?1, accepted = ?2 WHERE id = ?3")
+        .bind(now.to_rfc3339())
+        .bind(i64::from(accept))
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|err| {
+            eprintln!("inbox: recording a review failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
