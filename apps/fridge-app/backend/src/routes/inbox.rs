@@ -76,6 +76,12 @@ pub async fn callback(
     Query(params): Query<CallbackQuery>,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
     let config = config.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // READ THE STATE BEFORE CLEARING IT. `remove` returns a jar without that cookie, so a
+    // `get` afterwards yields None, `expected` is always None, and every callback 400s — the
+    // flow could not have worked once. Written the other way round first, and it was invisible
+    // to the whole suite because nothing exercises this path without Google on the other end:
+    // the Phase 5 lesson in apps/fridge-app/CLAUDE.md, in the same function it was learned in.
+    let expected = jar.get(GMAIL_STATE_COOKIE).map(|c| c.value().to_string());
     let jar = jar.remove(Cookie::from(GMAIL_STATE_COOKIE));
 
     // A user who declined is not an error to investigate.
@@ -83,7 +89,6 @@ pub async fn callback(
         return Ok((jar, Redirect::to(&front_end("gmail=declined"))));
     }
 
-    let expected = jar.get(GMAIL_STATE_COOKIE).map(|c| c.value().to_string());
     let (Some(code), Some(state), Some(expected)) = (params.code, params.state, expected) else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -211,4 +216,40 @@ pub async fn disconnect(
         .await
         .map_err(internal("disconnecting Gmail"))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this file shipped with, pinned as behaviour rather than as a comment.
+    ///
+    /// `CookieJar::remove` returns a jar with the cookie gone, so anything that reads after
+    /// removing reads nothing. The callback did exactly that and rejected every consent it was
+    /// given. No test in the suite could have caught it, because the path needs Google at the
+    /// other end — which is precisely why the ordering is worth asserting directly.
+    #[test]
+    fn a_jar_read_after_removal_yields_nothing() {
+        let jar = CookieJar::new().add(Cookie::new(GMAIL_STATE_COOKIE, "abc123"));
+        assert_eq!(
+            jar.get(GMAIL_STATE_COOKIE).map(|c| c.value().to_string()),
+            Some("abc123".to_string()),
+            "reading first works"
+        );
+
+        let emptied = jar.remove(Cookie::from(GMAIL_STATE_COOKIE));
+        assert_eq!(
+            emptied.get(GMAIL_STATE_COOKIE).map(|c| c.value().to_string()),
+            None,
+            "reading after removing does not — capture the value before clearing it"
+        );
+    }
+
+    #[test]
+    fn the_state_cookie_is_not_the_session_cookie() {
+        // Its own name on purpose: connecting Gmail must not consume or invalidate a sign-in
+        // in flight, and sharing a cookie name is how that happens by accident.
+        assert_ne!(GMAIL_STATE_COOKIE, "fridge_session");
+        assert_ne!(GMAIL_STATE_COOKIE, "oauth_state");
+    }
 }
