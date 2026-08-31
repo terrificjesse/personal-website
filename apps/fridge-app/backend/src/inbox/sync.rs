@@ -104,6 +104,18 @@ pub async fn run(
         }
     };
 
+    // The classifier is pure (rule 1), so what it may know about the world is passed in.
+    // Loaded once per pass rather than per message: it is one query and a run is a hundred
+    // messages.
+    let known_companies: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT lower(company_name) FROM internship_postings
+          UNION SELECT DISTINCT lower(company_name) FROM internship_applications",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let context = classify::Context { known_companies: &known_companies };
+
     let client = reqwest::Client::new();
     let ids = match gmail::list_message_ids(&client, &token, max_messages).await {
         Ok(ids) => ids,
@@ -136,14 +148,32 @@ pub async fn run(
             message.from.as_deref(),
             message.subject.as_deref(),
             message.snippet.as_deref(),
+            &context,
         );
         report.classified += 1;
+
+        // RULE 7: written for EVERY message, including the disregarded ones. A dropped email
+        // that leaves no trace makes "correctly ignored 400 newsletters" and "broken and ate
+        // an OA" produce identical output — a quiet inbox.
+        //
+        // `matched_application_id` stays NULL here: 8b classifies, and matching is 8c's. Rule
+        // 8 makes that safe — NULL is legal on a pressing category, and the category was
+        // decided from the email alone regardless.
+        if let Err(err) = store_verdict(pool, &message.id, &verdict, now).await {
+            eprintln!("inbox: could not record a verdict for {}: {err:?}", message.id);
+        }
+
+        // Rejection folds into the confirmation counter rather than getting its own: rule 7
+        // names four buckets, and a rejection is a handled outcome rather than something
+        // needing your attention. `is_pressing` is the line that matters, and it excludes it.
+        // Exhaustive and spelled out rather than using a guard, so adding a category is a
+        // compile error here — a new category silently falling into no bucket would break
+        // rule 7's invariant without anything failing.
         match verdict.category {
-            c if c.is_pressing() => report.pressing += 1,
+            Category::Oa | Category::Interview | Category::Offer => report.pressing += 1,
             Category::Confirmation | Category::Rejection => report.confirmation += 1,
             Category::Outreach => report.outreach += 1,
             Category::Disregarded => report.disregarded += 1,
-            _ => report.disregarded += 1,
         }
     }
 
@@ -227,6 +257,40 @@ async fn store_message(
     .rows_affected();
 
     Ok(inserted > 0)
+}
+
+/// Record what the classifier decided, for every message.
+async fn store_verdict(
+    pool: &SqlitePool,
+    gmail_message_id: &str,
+    verdict: &classify::EmailVerdict,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let message_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM email_messages WHERE gmail_message_id = ?")
+            .bind(gmail_message_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(message_id) = message_id else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        "INSERT INTO email_verdicts
+             (id, message_id, category, confidence, matched_application_id, classifier,
+              evidence, created_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, 'rules', ?5, ?6)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&message_id)
+    .bind(verdict.category.as_str())
+    .bind(verdict.confidence)
+    .bind(&verdict.evidence)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// The most recent run for a user, for the status endpoint and the popup.

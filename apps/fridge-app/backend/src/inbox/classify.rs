@@ -74,30 +74,486 @@ pub struct EmailVerdict {
     pub evidence: String,
 }
 
-/// The 8a stub: everything is disregarded, and says so.
+/// What the classifier is allowed to know, beyond the email itself.
 ///
-/// Deliberately not a guess. A half-built rules layer shipped early would produce numbers that
-/// look like classification and measure nothing, and 8b's checkpoint depends on measuring
-/// against real mail — a stub that is obviously a stub cannot be mistaken for a baseline.
-pub fn classify(_from: Option<&str>, _subject: Option<&str>, _snippet: Option<&str>) -> EmailVerdict {
-    EmailVerdict {
-        category: Category::Disregarded,
-        confidence: 0.0,
-        company_guess: None,
-        evidence: "8a stub: no classification has been attempted".to_string(),
+/// Passed in rather than looked up, because [`classify`] is a **pure function** — rule 1. It
+/// gets no database handle and no tools, so anything it needs about the world arrives here
+/// and the caller decides what that is.
+#[derive(Debug, Clone, Default)]
+pub struct Context<'a> {
+    /// Companies we have collected postings from, lowercased. Used only to decide whether an
+    /// email names a *specific* employer, which is the line between outreach and junk.
+    pub known_companies: &'a [String],
+}
+
+/// Terminal verdicts, checked before anything else and in this order.
+///
+/// **Rejection comes first on purpose.** "Thank you for interviewing with us — unfortunately
+/// we will not be moving forward" contains an interview marker and is not an interview. Every
+/// other order lets a rejection read as the stage it is rejecting you from, which is rule 3's
+/// trap arriving through the classifier instead of through timestamps.
+const REJECTION: &[&str] = &[
+    "unfortunately",
+    "we regret",
+    "not be moving forward",
+    "not moving forward",
+    "will not be progressing",
+    "decided to move forward with other",
+    "no longer under consideration",
+    "were not selected",
+    "not selected for",
+    "pursue other candidates",
+];
+
+const OFFER: &[&str] = &[
+    "offer of employment",
+    "pleased to offer",
+    "extend an offer",
+    "your offer",
+    "offer letter",
+];
+
+const INTERVIEW: &[&str] = &[
+    "interview",
+    "phone screen",
+    "schedule a call",
+    "schedule some time",
+    "schedule time",
+    "meet with the team",
+    "speak with you",
+    "next round",
+];
+
+/// An assessment you are being **asked to do** — not one merely mentioned.
+///
+/// Bare "assessment" was here first and it was wrong on real mail: a recruiter wrote "you are
+/// currently at the application/assessment stage with Roblox", which is context, and it
+/// classified as an OA. That inflates `pressing`, which is the count that decides whether you
+/// get interrupted — so the marker has to carry the *ask*, not the topic.
+///
+/// The named platforms stay bare because you are never sent a HackerRank link for reference.
+const ASSESSMENT: &[&str] = &[
+    "online assessment",
+    "assessment invitation",
+    "assessments invitation",
+    "complete the assessment",
+    "complete your assessment",
+    "coding challenge",
+    "code challenge",
+    "take home",
+    "take-home",
+    "technical screen",
+    "hackerrank",
+    "codesignal",
+    "codility",
+    "karat",
+];
+
+/// An invitation *to* an assessment, where the two words are separated by template prose.
+/// "We're thrilled to invite you to the next step of the recruiting process — the assessments!"
+const ASSESSMENT_PAIRS: &[(&str, &str)] = &[
+    ("invite you", "assessment"),
+    ("invitation", "assessment"),
+    ("next step", "assessment"),
+];
+
+const CONFIRMATION: &[&str] = &[
+    "thank you for applying",
+    "thanks for applying",
+    "we have received your application",
+    "we've received your application",
+    "application received",
+    "received your application",
+    "your application to",
+    "thank you for your interest in",
+    "application was submitted",
+    // Real mail: "Thank you for submitting your application for a position at Roblox!" —
+    // the "applying"/"received" families both miss it.
+    "submitting your application",
+    "submitted your application",
+    "for submitting your",
+];
+
+/// Bulk mail that is *literally* job-related and still junk.
+///
+/// This is the relevance gate, and the line is **specificity, not topic**. A burner inbox used
+/// for applications fills with Indeed digests, staffing blasts and bootcamp marketing — all
+/// about jobs, none about *your* application. Key the rules on the word "job" and
+/// `Hunt/Outreach` becomes the same undifferentiated pile the inbox already is.
+const BULK: &[&str] = &[
+    "jobs for you",
+    "new jobs",
+    "job alert",
+    "jobs you may be interested",
+    "recommended for you",
+    "top picks for you",
+    "hiring now",
+    "apply now to",
+    "we found jobs",
+    "your job search",
+    "unsubscribe from job",
+    "webinar",
+    "master's program",
+    "masters program",
+    "bootcamp",
+];
+
+/// Senders that are machines. Not junk by itself — most ATS mail is a no-reply — but it is the
+/// difference between a person writing to you and a system announcing something.
+fn is_machine_sender(from: &str) -> bool {
+    let from = from.to_lowercase();
+    ["no-reply", "noreply", "donotreply", "do-not-reply", "notifications@", "mailer@"]
+        .iter()
+        .any(|marker| from.contains(marker))
+}
+
+/// Domains that only ever carry application mail.
+const ATS_DOMAINS: &[&str] = &[
+    "greenhouse.io",
+    "lever.co",
+    "ashbyhq.com",
+    "myworkday.com",
+    "workday.com",
+    "smartrecruiters.com",
+    "icims.com",
+    "workable.com",
+    "rippling.com",
+];
+
+/// Lowercase, and flatten the punctuation real subject lines actually use.
+///
+/// Mail clients and ATS templates emit typographic quotes and dashes constantly — Tesla's
+/// confirmation is "Thank you – we've received your Tesla application", with an en-dash and a
+/// curly apostrophe. A marker written with an ASCII apostrophe silently never matches it, and
+/// silently-never-matching is the failure mode this whole classifier is judged on.
+fn haystack(subject: Option<&str>, snippet: Option<&str>) -> String {
+    format!("{} {}", subject.unwrap_or(""), snippet.unwrap_or(""))
+        .to_lowercase()
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201c}', '\u{201d}'], "\"")
+        .replace(['\u{2013}', '\u{2014}'], "-")
+}
+
+fn hit<'a>(text: &str, markers: &[&'a str]) -> Option<&'a str> {
+    markers.iter().copied().find(|marker| text.contains(marker))
+}
+
+/// Markers that only work as a pair, because something sits between them.
+///
+/// "We've received your **Tesla** application" is the case that forced this: the company name
+/// is inside the phrase, so no single substring matches. Both halves must be present, and
+/// order is not required — templates vary.
+const CONFIRMATION_PAIRS: &[(&str, &str)] = &[
+    ("received your", "application"),
+    ("application", "has been received"),
+    ("application", "was submitted"),
+];
+
+fn hit_pair<'a>(text: &str, pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
+    pairs
+        .iter()
+        .copied()
+        .find(|(a, b)| text.contains(a) && text.contains(b))
+}
+
+/// Classify one email from its metadata alone.
+///
+/// **Rule 8: the category is decided here, from the email, before any match against an
+/// application is attempted.** The matcher is fuzzy and will miss — a company styled
+/// differently in mail than on its posting, a subsidiary, an ATS sending as
+/// `no-reply@greenhouse.io` — and if "unmatched" routed to disregard, one miss would silently
+/// eat an interview invite.
+pub fn classify(
+    from: Option<&str>,
+    subject: Option<&str>,
+    snippet: Option<&str>,
+    context: &Context<'_>,
+) -> EmailVerdict {
+    let text = haystack(subject, snippet);
+    let sender = from.unwrap_or("").to_lowercase();
+
+    let verdict = |category: Category, confidence: f64, evidence: String| EmailVerdict {
+        category,
+        confidence,
+        company_guess: guess_company(&sender, &text, context),
+        evidence,
+    };
+
+    // Terminal outcomes first. See REJECTION's note on why it leads.
+    if let Some(marker) = hit(&text, REJECTION) {
+        return verdict(Category::Rejection, 0.9, format!("rejection marker: {marker:?}"));
     }
+    if let Some(marker) = hit(&text, OFFER) {
+        return verdict(Category::Offer, 0.85, format!("offer marker: {marker:?}"));
+    }
+
+    // Then the two that need a response from you. Interview before assessment: "interview" is
+    // the more specific claim, and an email that mentions both is usually inviting you to one.
+    if let Some(marker) = hit(&text, INTERVIEW) {
+        return verdict(Category::Interview, 0.8, format!("interview marker: {marker:?}"));
+    }
+    if let Some(marker) = hit(&text, ASSESSMENT) {
+        return verdict(Category::Oa, 0.8, format!("assessment marker: {marker:?}"));
+    }
+    if let Some((a, b)) = hit_pair(&text, ASSESSMENT_PAIRS) {
+        return verdict(Category::Oa, 0.7, format!("assessment pair: {a:?} + {b:?}"));
+    }
+
+    if let Some(marker) = hit(&text, CONFIRMATION) {
+        return verdict(Category::Confirmation, 0.85, format!("confirmation marker: {marker:?}"));
+    }
+    if let Some((a, b)) = hit_pair(&text, CONFIRMATION_PAIRS) {
+        return verdict(Category::Confirmation, 0.8, format!("confirmation pair: {a:?} + {b:?}"));
+    }
+
+    // The relevance gate. Checked AFTER the pressing categories, never before: a digest
+    // subject line must not be able to swallow a real interview invite that happens to
+    // contain the word "jobs".
+    if let Some(marker) = hit(&text, BULK) {
+        return verdict(Category::Disregarded, 0.7, format!("bulk mail marker: {marker:?}"));
+    }
+
+    // Job-specific and addressed to you, but about no application you made.
+    let from_ats = ATS_DOMAINS.iter().any(|domain| sender.contains(domain));
+    let named_company = guess_company(&sender, &text, context);
+    let from_a_person = !sender.is_empty() && !is_machine_sender(&sender);
+
+    if from_ats || (named_company.is_some() && from_a_person) {
+        return verdict(
+            Category::Outreach,
+            0.5,
+            match &named_company {
+                Some(company) => format!("names {company}, and a person sent it"),
+                None => "from an ATS domain, but matches no application".to_string(),
+            },
+        );
+    }
+
+    // Everything else. The highest-volume path, and still recorded — rule 7.
+    verdict(
+        Category::Disregarded,
+        0.6,
+        "no application, employer or job-specific signal".to_string(),
+    )
+}
+
+/// A company named in the sender's domain or the text, if we know of one.
+///
+/// A hint for the matcher, never a gate. Longest match wins so "jump trading" beats "jump".
+fn guess_company(sender: &str, text: &str, context: &Context<'_>) -> Option<String> {
+    let mut best: Option<&String> = None;
+    for company in context.known_companies {
+        if company.len() < 3 {
+            continue;
+        }
+        let squashed = company.replace(' ', "");
+        let mentioned = text.contains(company.as_str()) || sender.contains(squashed.as_str());
+        if mentioned && best.is_none_or(|current| company.len() > current.len()) {
+            best = Some(company);
+        }
+    }
+    best.cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn companies() -> Vec<String> {
+        ["roblox", "tesla", "jump trading", "stripe", "datadog"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect()
+    }
+
+    fn classify_with(from: &str, subject: &str, snippet: &str) -> EmailVerdict {
+        let known = companies();
+        classify(
+            Some(from),
+            Some(subject),
+            Some(snippet),
+            &Context { known_companies: &known },
+        )
+    }
+
+    // --- Every one of these is a real message from the burner inbox, verbatim. ------------
+
     #[test]
-    fn the_stub_classifies_nothing_and_admits_it() {
-        let verdict = classify(Some("a@b.com"), Some("Interview invitation"), Some("..."));
+    fn the_real_confirmations_are_confirmations() {
+        for (from, subject) in [
+            ("Tesla <noreply@tesla.com>", "Thank you – we've received your Tesla application"),
+            ("no-reply@roblox.com", "Thank you for applying to Roblox!"),
+            ("no-reply@jumptrading.com", "Thank you for applying to Jump Trading!"),
+        ] {
+            let verdict = classify_with(from, subject, "");
+            assert_eq!(verdict.category, Category::Confirmation, "{subject} -> {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn the_real_assessment_emails_are_pressing() {
+        // The two that actually needed something from the user. Getting these wrong is the
+        // expensive direction — a missed OA is a lost application.
+        for subject in [
+            "[Action Required] Your Roblox Application - Online Assessment",
+            "[Action Required] Your Roblox Assessments Invitation",
+        ] {
+            let verdict = classify_with("Roblox Assessment <assessment@email.roblox.com>", subject, "");
+            assert_eq!(verdict.category, Category::Oa, "{subject} -> {verdict:?}");
+            assert!(verdict.category.is_pressing());
+        }
+    }
+
+    #[test]
+    fn a_security_alert_is_not_employment() {
+        let verdict = classify_with(
+            "Google <no-reply@accounts.google.com>",
+            "Security alert",
+            "A new sign-in on Windows",
+        );
         assert_eq!(verdict.category, Category::Disregarded);
-        assert_eq!(verdict.confidence, 0.0);
-        assert!(verdict.evidence.contains("stub"));
+    }
+
+    #[test]
+    fn a_named_person_at_a_known_company_is_outreach() {
+        // Borderline, and decided deliberately: a human at an employer we know of, about
+        // something job-related, is the "addressed to you" side of the line. If this proves
+        // too generous the boundary moves HERE, in one place, rather than by loosening rules
+        // elsewhere.
+        let verdict = classify_with(
+            "Sophia Pressman <spressman@roblox.com>",
+            "Roblox Week @ CMU - 9/8-9/10",
+            "Come meet the team",
+        );
+        assert_eq!(verdict.category, Category::Outreach);
+        assert_eq!(verdict.company_guess.as_deref(), Some("roblox"));
+    }
+
+    #[test]
+    fn an_event_rsvp_is_not_an_application_confirmation() {
+        // "Thanks for RSVPing" must not trip the "thanks for applying" family.
+        let verdict = classify_with(
+            "On Campus 2026 <oncampus2026@example.com>",
+            "Thanks for RSVPing to On Campus 2026 CMU Kaiju Cats x Cookies",
+            "",
+        );
+        assert_ne!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
+    // --- Ordering, which is where this gets subtly wrong ---------------------------------
+
+    #[test]
+    fn a_rejection_that_mentions_an_interview_is_a_rejection() {
+        // THE ordering trap. Every other order lets a rejection read as the stage it is
+        // rejecting you from — rule 3 arriving through the classifier instead of timestamps.
+        let verdict = classify_with(
+            "no-reply@greenhouse.io",
+            "Your application to Datadog",
+            "Thank you for interviewing with us. Unfortunately we will not be moving forward.",
+        );
+        assert_eq!(verdict.category, Category::Rejection, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_rejection_after_an_assessment_is_still_a_rejection() {
+        let verdict = classify_with(
+            "no-reply@lever.co",
+            "Update on your application",
+            "Thanks for completing the online assessment. We regret to say we are moving on.",
+        );
+        assert_eq!(verdict.category, Category::Rejection, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_digest_cannot_swallow_a_real_interview_invite() {
+        // The relevance gate is checked AFTER the pressing categories for exactly this: a
+        // subject containing "new jobs" must not be able to disregard an interview.
+        let verdict = classify_with(
+            "recruiter@stripe.com",
+            "Interview invitation — and some new jobs you may like",
+            "",
+        );
+        assert_eq!(verdict.category, Category::Interview, "{verdict:?}");
+    }
+
+    // --- The relevance gate ---------------------------------------------------------------
+
+    #[test]
+    fn job_related_bulk_mail_is_disregarded() {
+        // Literally about jobs, and still junk. Key the rules on the word "job" and the
+        // outreach folder becomes the pile the inbox already is.
+        for subject in [
+            "10 new jobs for you this week",
+            "Your job alert: software intern",
+            "Jobs you may be interested in",
+            "Free webinar: break into tech",
+            "Apply now to our data science bootcamp",
+        ] {
+            let verdict = classify_with("noreply@jobboard.example.com", subject, "");
+            assert_eq!(verdict.category, Category::Disregarded, "{subject} -> {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn a_machine_at_an_unknown_domain_saying_nothing_specific_is_disregarded() {
+        let verdict = classify_with("noreply@shop.example.com", "Your receipt", "Order #123");
+        assert_eq!(verdict.category, Category::Disregarded);
+    }
+
+    #[test]
+    fn ats_mail_that_matches_nothing_is_still_kept_as_outreach() {
+        // Rule 8's spirit: an ATS wrote to you about something. It is not junk just because
+        // no application of ours matches it.
+        let verdict = classify_with(
+            "no-reply@ashbyhq.com",
+            "An update from the hiring team",
+            "",
+        );
+        assert_eq!(verdict.category, Category::Outreach);
+    }
+
+    // --- Shape --------------------------------------------------------------------------
+
+
+    // --- Real snippets that the first version of these rules got wrong -------------------
+
+    #[test]
+    fn an_assessment_merely_mentioned_is_not_an_assessment_invitation() {
+        // Verbatim from a recruiter's email. Bare "assessment" matched this and called it an
+        // OA, inflating the count that decides whether you get interrupted.
+        let verdict = classify_with(
+            "Sophia Pressman <spressman@roblox.com>",
+            "Roblox Week @ CMU - 9/8-9/10",
+            "Hi Jesse, Hope you're having a great weekend! I wanted to reach out since you \
+             are currently at the application/assessment stage with Roblox.",
+        );
+        assert_ne!(verdict.category, Category::Oa, "{verdict:?}");
+        assert_eq!(verdict.category, Category::Outreach);
+    }
+
+    #[test]
+    fn an_actual_assessment_invitation_still_registers() {
+        // The other half: the ask, separated from the noun by template prose.
+        let verdict = classify_with(
+            "Roblox Assessment <noreply@email.roblox.com>",
+            "[Action Required] Your Roblox Assessments Invitation",
+            "Hi Jesse, We're thrilled to invite you to the next step of the recruiting \
+             process — the assessments!",
+        );
+        assert_eq!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_verify_your_email_application_receipt_is_a_confirmation() {
+        // Subject says "[Action Required] Your Roblox Application", which reads pressing and
+        // is not: the body is an email verification for an application just submitted.
+        let verdict = classify_with(
+            "no-reply@roblox.com",
+            "[Action Required] Your Roblox Application",
+            "Email Verification Hi Jesse, Thank you for submitting your application for a \
+             position at Roblox! Please click here to verify your email address",
+        );
+        assert_eq!(verdict.category, Category::Confirmation, "{verdict:?}");
     }
 
     #[test]
@@ -128,5 +584,26 @@ mod tests {
         ] {
             assert!(allowed.contains(&category.as_str()), "{category:?}");
         }
+    }
+
+    #[test]
+    fn every_verdict_carries_its_reason() {
+        // A verdict with no evidence is a number nobody can argue with. `posting_rejects`
+        // one subsystem over exists for the same reason.
+        let verdict = classify_with("no-reply@roblox.com", "Thank you for applying to Roblox!", "");
+        assert!(!verdict.evidence.is_empty());
+        assert!(verdict.evidence.contains("thank you for applying"), "{verdict:?}");
+    }
+
+    #[test]
+    fn the_longest_known_company_wins_the_guess() {
+        let known = vec!["jump".to_string(), "jump trading".to_string()];
+        let verdict = classify(
+            Some("no-reply@jumptrading.com"),
+            Some("Thank you for applying to Jump Trading!"),
+            Some(""),
+            &Context { known_companies: &known },
+        );
+        assert_eq!(verdict.company_guess.as_deref(), Some("jump trading"));
     }
 }
