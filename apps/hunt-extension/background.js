@@ -11,16 +11,30 @@
  *   - no state survives between wakes. Anything remembered in a module variable is gone.
  *
  * That second point is the whole reason `hunt_events.acked_at` lives on the server. A dedup
- * set held here would be empty on the next wake and every alert would fire again. Everything
- * this file writes to `browser.storage.local` is a cache for the popup — losing it costs a
- * nicer UI, never a duplicate or a dropped alert.
+ * set held in a module variable would be empty on the next wake and every alert would fire
+ * again. `browser.storage.local` is the exception that survives, and everything this file
+ * writes there is a cache — losing it costs a nicer UI or one repeat alert, never a dropped
+ * one.
  *
  * # Notify, then ack — in that order
  *
- * At-least-once, deliberately. If the ack fails the event stays unacked and re-notifies on
- * the next poll; because the notification id IS the event id, Firefox replaces the existing
- * notification rather than stacking a second one. Acking first would invert the failure into
- * an alert that is silently lost, which is the expensive direction.
+ * At-least-once for *delivery*, deliberately. If the ack fails the event stays unacked and is
+ * offered again next poll. Acking first would invert the failure into an alert that is
+ * silently lost, which is the expensive direction.
+ *
+ * # But notify only for what is new — not for everything unacked
+ *
+ * "Unacked" is not "new". A poll runs on an alarm, on browser startup, on Settings being
+ * saved, and on the popup's Check now button, and every one of those used to re-raise the
+ * whole unacked backlog: pressing Check now notified you about the alerts you had the popup
+ * open to read. Anything that stopped acks from landing — the backend down, the token
+ * expired, Firefox closed for a day — turned into a pile of desktop notifications on the
+ * next successful poll, for events that were hours old.
+ *
+ * So `notifiedEventIds` in `storage.local` records what has actually been shown, and an event
+ * is notified once. It is still a cache and is still allowed to be lost: losing it costs one
+ * repeat notification, which is the same at-least-once bargain as above. The server's
+ * `acked_at` remains the record of what was delivered.
  */
 
 const ALARM_NAME = "hunt-poll";
@@ -28,6 +42,12 @@ const SETTINGS_KEY = "settings";
 const STATUS_KEY = "status";
 const CACHE_KEY = "recentEvents";
 const UNSEEN_KEY = "unseenCount";
+const NOTIFIED_KEY = "notifiedEventIds";
+
+// How many event ids to remember having shown. Comfortably more than a long backlog, and
+// bounded because this is a cache in `storage.local`, not a log. Trimming an id can only cost
+// a repeat notification for an event that is somehow still unacked that far back.
+const NOTIFIED_MEMORY = 300;
 
 const DEFAULT_SETTINGS = {
   backendUrl: "http://localhost:8080",
@@ -141,22 +161,36 @@ async function poll() {
     return setStatus({ state: "error", detail: `unreadable response: ${err}` });
   }
 
-  const events = (payload.events || []).filter((event) => settings.kinds[event.kind] !== false);
-  await raise(events, settings);
+  // Everything, not just the notifiable kinds. An event of a kind you have switched off has
+  // still been delivered — it is in the popup list — and dropping it here left it unacked
+  // for ever, offered again on every poll and counted in "waiting to be shown" by a popup
+  // that was never going to show it. `raise` decides what is worth a notification.
+  const events = payload.events || [];
+  const notified = await raise(events, settings);
 
   // `delivered`, not "how many are waiting": by the time this is written the batch has been
   // acked, so `payload.unacked_total` — read before the acks — would be a stale number
   // claiming work is outstanding that has just been done. The popup fetches the live count
   // itself; this only has to say what this poll did.
-  return setStatus({ state: "ok", delivered: events.length });
+  return setStatus({ state: "ok", delivered: events.length, notified });
 }
 
-/** Notify for these events, then ack them. Newest ends up on top of the stack. */
+/**
+ * Notify for the events that are actually new, cache and ack all of them.
+ *
+ * Returns how many notifications were raised, which is 0 on the common poll where nothing has
+ * happened since the last one.
+ */
 async function raise(events, settings) {
-  if (events.length === 0) return;
+  if (events.length === 0) return 0;
 
-  const individually = events.slice(0, Math.max(1, settings.maxNotificationsPerPoll));
-  const summarized = events.length - individually.length;
+  const alreadyNotified = await loadNotified();
+  const fresh = events.filter(
+    (event) => settings.kinds[event.kind] !== false && !alreadyNotified.has(event.id)
+  );
+
+  const individually = fresh.slice(0, Math.max(1, settings.maxNotificationsPerPoll));
+  const summarized = fresh.length - individually.length;
 
   // The server returns newest first; show oldest of the batch first so the newest lands last
   // and is therefore the one on top.
@@ -166,17 +200,37 @@ async function raise(events, settings) {
   if (summarized > 0) {
     await browser.notifications.create(`hunt-summary-${Date.now()}`, {
       type: "basic",
-      title: `+${summarized} more posting${summarized === 1 ? "" : "s"}`,
+      title: `+${summarized} more alert${summarized === 1 ? "" : "s"}`,
       message: "Open the popup to see the rest.",
     });
   }
 
-  await cacheForPopup(events);
-  await bumpUnseen(events.length);
+  // Recorded before the ack, not after. If the ack fails the event comes back on the next
+  // poll — that is the at-least-once delivery bargain — but it has genuinely been shown once
+  // already, and showing it again is the thing this is here to stop.
+  await rememberNotified(fresh.map((event) => event.id));
 
-  // Ack everything that was shown, including the summarized ones — they are listed in the
-  // popup, so they have been delivered.
+  await cacheForPopup(events);
+  await bumpUnseen(fresh.length);
+
+  // Ack everything received, including what was summarized or filtered out by kind: all of it
+  // is in the popup list, so all of it has been delivered.
   await Promise.all(events.map((event) => ack(event.id, settings)));
+  return fresh.length;
+}
+
+/** The ids already shown as desktop notifications. */
+async function loadNotified() {
+  const stored = await browser.storage.local.get(NOTIFIED_KEY);
+  return new Set(stored[NOTIFIED_KEY] || []);
+}
+
+async function rememberNotified(ids) {
+  if (ids.length === 0) return;
+  const stored = await browser.storage.local.get(NOTIFIED_KEY);
+  // Newest first, deduped, capped. A `Set` keeps insertion order, so this is the trim.
+  const merged = [...new Set([...ids, ...(stored[NOTIFIED_KEY] || [])])];
+  await browser.storage.local.set({ [NOTIFIED_KEY]: merged.slice(0, NOTIFIED_MEMORY) });
 }
 
 async function notify(event) {

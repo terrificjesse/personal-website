@@ -172,8 +172,9 @@ Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
 
 | Function | What it does |
 |---|---|
-| `poll` | Fetches, filters by enabled kinds, raises, records status. **Never throws** — the callers are an alarm and a button |
-| `raise` | Notifies up to `maxNotificationsPerPoll` (default 3) individually, one summary for the rest, then acks everything shown |
+| `poll` | Fetches, raises, records status. **Never throws** — the callers are an alarm and a button. Hands `raise` *every* event, including kinds the user switched off: those are still delivered and must still be acked |
+| `raise` | Notifies only events **not already notified** and of an enabled kind — up to `maxNotificationsPerPoll` (default 3) individually, one summary for the rest — then caches and acks *everything received*. Returns how many notifications it raised |
+| `loadNotified` / `rememberNotified` | `notifiedEventIds` in `storage.local`, newest-first and capped at 300. Recorded **before** the ack: a failed ack still re-offers the event, but it has been shown once and must not be shown again |
 | `notify` | The **notification id is the event id**, so a re-notify after a failed ack replaces rather than stacks |
 | `ack` | Failure leaves the event unacked on purpose: it is offered again next poll |
 | `setStatus` | Records one of `ok` / `unreachable` / `unauthenticated` / `error` |
@@ -184,8 +185,16 @@ Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
 Every listener is registered synchronously at the top level, or the event meant to wake the
 page arrives before anything is listening.
 
-**Notify, then ack — in that order.** At-least-once, deliberately. A failed ack costs a
-duplicate notification; acking first would cost a silently dropped alert.
+**Notify, then ack — in that order.** At-least-once for *delivery*, deliberately: acking first
+would turn a failure into a silently dropped alert.
+
+**"Unacked" is not "new", and only new is worth a notification.** A poll runs on the alarm, on
+browser startup, on Settings being saved and on the popup's *Check now* button, and each one
+used to re-raise the whole unacked backlog — pressing *Check now* notified you about the alerts
+you had the popup open to read, and any spell where acks could not land (backend down, token
+expired, Firefox closed for a day) arrived as a pile of notifications for hours-old events.
+`notifiedEventIds` makes a notification once-per-event; losing that cache costs one repeat,
+which is the same bargain delivery already makes.
 
 ## Auth: a bearer token, because the cookie cannot get there
 

@@ -230,6 +230,15 @@ MV3 background pages get killed and restarted, so anything remembered in memory 
 get the same alert twice. `hunt_events` carries read/ack state server-side; the extension acks
 what it showed. `browser.storage.local` is a convenience cache, never the record.
 
+**Delivery and notification are separate questions, and only the first belongs to the server.**
+Unacked means undelivered; it does not mean new. The extension keeps `notifiedEventIds` in
+`storage.local` so an event raises a desktop notification once, however many times it is polled
+— without it, every startup, every Settings save and every *Check now* re-alerts the whole
+backlog. That set is still a cache and is still allowed to be lost: the cost is one repeat
+notification, never a dropped one, because `acked_at` remains the record. Do not delete it as a
+rule-6 violation; it is not the record of anything, and **an event the extension chooses not to
+notify about must still be acked**, or it sits in the backlog for ever.
+
 ### 7. "Disregarded" means unlabelled, not unrecorded
 
 The disregard branch is about to become the highest-volume path in the system. If a dropped
