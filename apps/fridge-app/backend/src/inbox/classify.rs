@@ -166,6 +166,10 @@ const CONFIRMATION: &[&str] = &[
     "received your application",
     "your application to",
     "thank you for your interest in",
+    // Paycom's wording, from a real application confirmation that was disregarded because
+    // only the "your interest" phrasing was listed.
+    "expressing interest in",
+    "expressed interest in",
     "application was submitted",
     // Real mail: "Thank you for submitting your application for a position at Roblox!" —
     // the "applying"/"received" families both miss it.
@@ -196,6 +200,15 @@ const BULK: &[&str] = &[
     "master's program",
     "masters program",
     "bootcamp",
+    // Event RSVPs and registrations. A recruiting event you replied to is not an application
+    // and not a role — and this one reached Hunt/Outreach only because the sender's domain
+    // was connect.roblox.com and the address did not happen to contain "noreply", which is a
+    // thin basis for deciding a human wrote to you.
+    "rsvp",
+    "thanks for your response to",
+    "thank you for your response to",
+    "you are registered",
+    "thanks for registering",
 ];
 
 /// Senders that are machines. Not junk by itself — most ATS mail is a no-reply — but it is the
@@ -218,6 +231,13 @@ const ATS_DOMAINS: &[&str] = &[
     "icims.com",
     "workable.com",
     "rippling.com",
+    // Found in real mail: an application confirmation arrived from msg.paycomonline.com and
+    // matched nothing. The same shape as Phase 7's ATS-coverage gap, one subsystem over.
+    "paycomonline.com",
+    "myworkdayjobs.com",
+    "taleo.net",
+    "brassring.com",
+    "jobvite.com",
 ];
 
 /// Lowercase, and flatten the punctuation real subject lines actually use.
@@ -554,6 +574,46 @@ mod tests {
              position at Roblox! Please click here to verify your email address",
         );
         assert_eq!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
+
+    // --- The held-out set: real mail that arrived AFTER the rules were written -----------
+
+    #[test]
+    fn an_event_rsvp_confirmation_is_disregarded_not_outreach() {
+        // Verbatim. It reached Hunt/Outreach because the sender's domain contains "roblox"
+        // and the address lacks "noreply" — a thin basis for deciding a human wrote to you.
+        let verdict = classify_with(
+            "On Campus 2026 CMU Kaiju Cats x Cookies <oncampus2026kaijucatsxcookies@connect.roblox.com>",
+            "Thanks for RSVPing to On Campus 2026 CMU Kaiju Cats x Cookies",
+            "Thanks for your response to On Campus 2026 CMU Kaiju Cats x Cookies Name: Jesse Li",
+        );
+        assert_eq!(verdict.category, Category::Disregarded, "{verdict:?}");
+    }
+
+    #[test]
+    fn an_application_account_setup_is_a_confirmation() {
+        // Verbatim, and the expensive direction: real application mail was being dropped.
+        // "Thank you for expressing interest in" is Paycom's wording, and only the
+        // "your interest in" phrasing was listed.
+        let verdict = classify_with(
+            "Oklahoma City Thunder <donotreply@msg.paycomonline.com>",
+            "Oklahoma City Thunder Password setup",
+            "You have received a new message from Oklahoma City Thunder. Hi Jesse Li! Thank \
+             you for expressing interest in the Software Engineer Intern position",
+        );
+        assert_eq!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_real_recruiter_email_is_still_outreach() {
+        // The RSVP rule must not swallow the case Hunt/Outreach exists for.
+        let verdict = classify_with(
+            "Sophia Pressman <spressman@roblox.com>",
+            "Roblox Week @ CMU - 9/8-9/10",
+            "Hi Jesse, I wanted to reach out about the team.",
+        );
+        assert_eq!(verdict.category, Category::Outreach, "{verdict:?}");
     }
 
     #[test]

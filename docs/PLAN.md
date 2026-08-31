@@ -671,7 +671,7 @@ reading `applied` for a job you already interviewed at.
   was learned in. And a stale `cargo run` debug binary held port 8080, so a freshly built
   release binary failed to bind and the *old* build kept answering, which read as a missing
   route.
-- [gen] **8b — Classify + match, still no writes.** Rules first, Claude API on ambiguity.
+- [gen] **8b — Classify + match. Rules layer built; checkpoint NOT met — see below.** Rules first, Claude API on ambiguity.
   Verdicts stored. *Checkpoint:* against a hand-labelled set of **real burner-inbox mail across
   a whole two-week window**, not 50 curated job emails — a curated set contains no newsletters,
   so it cannot measure the relevance gate, which is the highest-volume decision in the system.
@@ -802,6 +802,46 @@ load, which is rule 10's core promise; and no EEO field is touched — refused b
 pinned by tests, and visibly untouched on Lever's gender, race and veteran selects.
 
 Nothing was submitted on any of the three.
+
+### 8b — measured 2026-08-31, and the checkpoint is not met
+
+Run honestly, and the honest result is that **the checkpoint cannot be met yet and this is not
+it.** Recorded because a partial measurement stated as partial is worth more than an unmeasured
+classifier, and far more than a number that looks like a pass.
+
+**Why it is not the checkpoint.** It asks for a hand-labelled set of every message across ~2
+weeks. The burner holds **14 messages over 2 days, with zero digests, newsletters or staffing
+blasts** — so the relevance gate, which the checkpoint singles out as the highest-volume
+decision in the system, has nothing to measure against at all.
+
+**And most of the corpus was already spent.** 8 of the 14 were the mail the rules were written
+by reading, with three defects fixed against them. Grading on those measures the tuning, not the
+classifier, and would have returned ~100%.
+
+**What was measurable:** 6 messages arrived after the rules were committed. On that held-out
+set, hand-labelled by the user rather than by the author of the rules:
+
+| | |
+|---|---|
+| Correct | **4 of 6** |
+| Junk leaked into `Hunt/Outreach` | **1** — an event RSVP confirmation |
+| Real application mail disregarded | **1** — an ATS account-setup email |
+
+Both failure modes the checkpoint names, one instance each, on six messages. Both diagnosed and
+fixed:
+
+- The RSVP reached outreach because its sender was `…@connect.roblox.com` — the domain matched
+  a known company and the address did not contain "noreply", which is a thin basis for deciding
+  a human wrote to you. Event RSVPs and registrations now fall to the relevance gate.
+- The account-setup mail said "Thank you for **expressing** interest in", and only the "your
+  interest in" phrasing was listed. It also came from `msg.paycomonline.com` — Paycom, an ATS
+  nothing recognised, the same shape as Phase 7's ATS-coverage gap one subsystem over.
+
+All 14 now agree with the user's labels, and both real strings are pinned as tests.
+
+**The held-out set is now spent.** Fixing against it made those six in-sample too; a set can
+only be measured once. The next honest measurement needs mail that arrives from here, and the
+relevance gate stays unmeasured until digests and staffing blasts actually turn up.
 
 ### Open questions
 
