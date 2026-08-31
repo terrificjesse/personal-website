@@ -2,6 +2,7 @@ pub mod auth;
 pub mod blog;
 pub mod health;
 pub mod hunt;
+pub mod inbox;
 pub mod internships;
 pub mod items;
 pub mod recipes;
@@ -201,6 +202,11 @@ pub fn build_router(state: AppState) -> Router {
             get(hunt::get_profile).put(hunt::put_profile),
         )
         .route("/hunt/posting-for", get(hunt::posting_for_page))
+        .route("/auth/gmail/start", get(inbox::start))
+        .route("/auth/gmail/callback", get(inbox::callback))
+        .route("/hunt/inbox/status", get(inbox::status))
+        .route("/hunt/inbox/sync", post(inbox::sync_now))
+        .route("/hunt/inbox/disconnect", post(inbox::disconnect))
         .route(
             "/hunt/answers",
             get(hunt::list_answers).post(hunt::create_answer),

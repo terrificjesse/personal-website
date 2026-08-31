@@ -4,6 +4,7 @@ mod db;
 mod expiration;
 mod foodkeeper;
 mod hunt;
+mod inbox;
 mod internships;
 mod models;
 mod nlp;
