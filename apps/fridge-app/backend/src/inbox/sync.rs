@@ -23,6 +23,8 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use crate::hunt::events::{self, EventKind, NewHuntEvent};
+
 use super::classify::{self, Category};
 use super::{gmail, oauth};
 
@@ -163,6 +165,21 @@ pub async fn run(
             eprintln!("inbox: could not record a verdict for {}: {err:?}", message.id);
         }
 
+        // 8d: the second producer for `hunt_events`. Pressing mail — an OA, an interview, an
+        // offer — becomes a desktop notification through the channel 8e built, with no second
+        // pipeline and no changes to the poll or the extension.
+        //
+        // Rule 8 is why this does not wait for a match: an unmatched interview invite is the
+        // single most costly thing this tool could drop, and the category was decided from the
+        // email alone precisely so the alert does not depend on the matcher succeeding.
+        if verdict.category.is_pressing() {
+            if let Err(err) = raise_alert(pool, user_id, &message, &verdict, now).await {
+                // An undelivered notification is a worse day, not lost data — the message and
+                // its verdict are already stored. Same posture as the posting producer.
+                eprintln!("inbox: could not raise an alert for {}: {err:?}", message.id);
+            }
+        }
+
         // Rejection folds into the confirmation counter rather than getting its own: rule 7
         // names four buckets, and a rejection is a handled outcome rather than something
         // needing your attention. `is_pressing` is the line that matters, and it excludes it.
@@ -257,6 +274,66 @@ async fn store_message(
     .rows_affected();
 
     Ok(inserted > 0)
+}
+
+/// Raise a desktop alert for pressing mail.
+///
+/// Writes to the same `hunt_events` table the posting producer uses. Two producers, one table,
+/// one poll, one notification path — the shape 8e was built to accommodate, so this adds a
+/// producer rather than a pipeline.
+async fn raise_alert(
+    pool: &SqlitePool,
+    user_id: &str,
+    message: &gmail::Message,
+    verdict: &classify::EmailVerdict,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let what = match verdict.category {
+        Category::Oa => "Assessment",
+        Category::Interview => "Interview",
+        Category::Offer => "Offer",
+        // Only the pressing three reach here; anything else is a caller bug rather than a
+        // category to invent a label for.
+        other => return Err(anyhow::anyhow!("{other:?} is not pressing")),
+    };
+
+    let who = verdict
+        .company_guess
+        .clone()
+        .or_else(|| sender_name(message.from.as_deref()))
+        .unwrap_or_else(|| "your inbox".to_string());
+
+    let event = NewHuntEvent {
+        kind: EventKind::Email,
+        // NOT NULL, always. Migration 0014's rule: a NULL user_id means "from the shared
+        // posting corpus and private to nobody", and this is somebody's mail. Setting it is
+        // what makes the read path's `user_id IS NULL OR user_id = :me` safe by construction.
+        user_id: Some(user_id.to_string()),
+        // The Gmail message id, so re-classifying the same email cannot alert twice — the
+        // UNIQUE (kind, subject_id) that made the posting producer idempotent, reused.
+        subject_id: message.id.clone(),
+        title: format!("{what} — {who}"),
+        body: message.subject.clone().unwrap_or_else(|| "(no subject)".to_string()),
+        url: Some(format!("https://mail.google.com/mail/u/0/#all/{}", message.id)),
+        payload: serde_json::json!({
+            "category": verdict.category.as_str(),
+            "confidence": verdict.confidence,
+            "company_guess": verdict.company_guess,
+            "evidence": verdict.evidence,
+            "gmail_message_id": message.id,
+            "from": message.from,
+            "subject": message.subject,
+        }),
+    };
+
+    events::emit(pool, &event, now).await
+}
+
+/// The display name from a `From` header, if it has one.
+fn sender_name(from: Option<&str>) -> Option<String> {
+    let from = from?.trim();
+    let name = from.split('<').next()?.trim().trim_matches('"');
+    (!name.is_empty() && name != from).then(|| name.to_string())
 }
 
 /// Record what the classifier decided, for every message.
@@ -407,6 +484,120 @@ mod tests {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM email_messages")
             .fetch_one(&pool).await.expect("count");
         assert_eq!(count, 1);
+    }
+
+
+    /// 8d: pressing mail becomes an alert, and does so **without** a matched application.
+    ///
+    /// Rule 8's whole point. An unmatched interview invite is the costliest thing this tool
+    /// could drop, so the alert must not depend on the matcher — which does not even exist yet.
+    #[tokio::test]
+    async fn pressing_mail_raises_an_alert_even_with_nothing_to_match_it_to() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let now = Utc::now();
+        let message = gmail::Message {
+            id: "gmail-oa-1".into(),
+            thread_id: None,
+            from: Some("Roblox Assessment <noreply@email.roblox.com>".into()),
+            subject: Some("[Action Required] Your Roblox Assessments Invitation".into()),
+            received_at: Some(now.to_rfc3339()),
+            snippet: Some("We're thrilled to invite you to the assessments".into()),
+        };
+        let verdict = classify::EmailVerdict {
+            category: Category::Oa,
+            confidence: 0.8,
+            company_guess: Some("roblox".into()),
+            evidence: "assessment invitation".into(),
+        };
+
+        assert!(raise_alert(&pool, "u1", &message, &verdict, now).await.expect("alert"));
+
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT kind, title, user_id FROM hunt_events")
+            .fetch_one(&pool).await.expect("event");
+        assert_eq!(row.0, "email");
+        assert!(row.1.contains("Assessment"), "{}", row.1);
+        assert_eq!(row.2.as_deref(), Some("u1"), "an email alert is private to its owner");
+    }
+
+    /// The same message classified twice must not alert twice — the UNIQUE (kind, subject_id)
+    /// that made the posting producer idempotent, doing the same job here.
+    #[tokio::test]
+    async fn the_same_email_never_alerts_twice() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let now = Utc::now();
+        let message = gmail::Message {
+            id: "gmail-oa-1".into(), thread_id: None,
+            from: Some("a@b.com".into()), subject: Some("Interview".into()),
+            received_at: None, snippet: None,
+        };
+        let verdict = classify::EmailVerdict {
+            category: Category::Interview, confidence: 0.8,
+            company_guess: None, evidence: "x".into(),
+        };
+
+        assert!(raise_alert(&pool, "u1", &message, &verdict, now).await.expect("first"));
+        assert!(!raise_alert(&pool, "u1", &message, &verdict, now).await.expect("second"));
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM hunt_events")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(count, 1);
+    }
+
+    /// A posting alert and an email alert can share a subject id without colliding — the
+    /// reason the key is (kind, subject_id) rather than subject_id alone.
+    #[tokio::test]
+    async fn an_email_alert_does_not_collide_with_a_posting_alert() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let now = Utc::now();
+
+        crate::hunt::events::emit(&pool, &crate::hunt::events::NewHuntEvent {
+            kind: crate::hunt::events::EventKind::Posting,
+            user_id: None,
+            subject_id: "shared-id".into(),
+            title: "New at Roblox".into(), body: "b".into(), url: None,
+            payload: serde_json::Value::Null,
+        }, now).await.expect("posting");
+
+        let message = gmail::Message {
+            id: "shared-id".into(), thread_id: None, from: None,
+            subject: Some("Offer".into()), received_at: None, snippet: None,
+        };
+        let verdict = classify::EmailVerdict {
+            category: Category::Offer, confidence: 0.9, company_guess: None,
+            evidence: "x".into(),
+        };
+        assert!(raise_alert(&pool, "u1", &message, &verdict, now).await.expect("email"));
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM hunt_events")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn non_pressing_mail_raises_nothing() {
+        // A confirmation is filed, not announced. The open question about whether outreach
+        // should interrupt is answered "no" here, and it is one predicate to change.
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let message = gmail::Message {
+            id: "gmail-1".into(), thread_id: None, from: None,
+            subject: Some("Thank you for applying".into()), received_at: None, snippet: None,
+        };
+        for category in [Category::Confirmation, Category::Outreach, Category::Disregarded,
+                         Category::Rejection] {
+            let verdict = classify::EmailVerdict {
+                category, confidence: 0.8, company_guess: None, evidence: "x".into(),
+            };
+            assert!(raise_alert(&pool, "u1", &message, &verdict, Utc::now()).await.is_err(),
+                    "{category:?} must not reach the alert path");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM hunt_events")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(count, 0);
     }
 
     /// RULE 7's invariant. Summed into one number, a miscount is invisible.
