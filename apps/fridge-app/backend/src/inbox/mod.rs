@@ -20,6 +20,8 @@
 //! - [`sync`] — the pass: fetch, record, count. Owns `inbox_runs`.
 //! - [`classify`] — the rules layer.
 //! - [`advance`] — matching, and what an email may do to a status. Rules 2 and 3, pure.
+//! - [`labelset`] — 8b's measurement harness. Tooling, not pipeline: it never runs during a
+//!   sync and never writes to a mailbox or to our own tables.
 //!
 //! # Email is untrusted content — rule 1
 //!
@@ -33,5 +35,6 @@ pub mod advance;
 pub mod classify;
 pub mod gmail;
 pub mod labels;
+pub mod labelset;
 pub mod oauth;
 pub mod sync;

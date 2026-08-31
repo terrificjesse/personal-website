@@ -843,6 +843,25 @@ All 14 now agree with the user's labels, and both real strings are pinned as tes
 only be measured once. The next honest measurement needs mail that arrives from here, and the
 relevance gate stays unmeasured until digests and staffing blasts actually turn up.
 
+**The harness for the next attempt is built** — `src/inbox/labelset.rs`, reached as
+`cargo run --release -- labelset export|score`. It exports *every* stored message to a CSV with
+an empty label column (no verdict shown, so the labels are not anchored), re-runs the rules over
+the filled-in sheet, and reports the two failure modes against separate denominators, with no
+single accuracy figure to quote instead of them. It keeps a ledger beside the labels file
+recording the fingerprint of the rules each grading ran under, so a set that was graded and then
+tuned against reports itself as in-sample rather than silently passing as fresh.
+
+Two things it surfaced immediately, neither yet fixed:
+
+- `guess_company` matches a known company as a bare substring of the sender, with a 3-character
+  floor. On the live inbox that makes `systemmessage@paycomonline.com` name **Sage** (from
+  "mes*sage*") and `donotreply@msg.paycomonline.com` name **KLA** (from "O*kla*homa City
+  Thunder"). Neither flips a category today — both senders are on an ATS domain and reach
+  outreach anyway — but `company_guess` is the matcher's hint, so a wrong one is a rule 2 risk:
+  an email matched to the wrong application. `jobs@ziprecruiter.com` naming **Zip** is the same
+  bug pointed at the relevance gate, caught today only when a BULK marker happens to fire first.
+- `is_machine_sender` does not know `systemmessage@`, so that sender reads as a person.
+
 ### Open questions
 
 - Should `Hunt/Outreach` raise a notification? **Currently no.** Cold outreach is high-volume

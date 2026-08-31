@@ -29,6 +29,14 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init_pool(&database_url).await?;
 
+    // Dev tooling, dispatched before any of the server's background work starts: a harness
+    // that exports and grades a labelling sheet has no business spawning a blog watcher or a
+    // collector run. See `inbox::labelset` — it is 8b's measurement, not part of the pipeline.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("labelset") {
+        return inbox::labelset::main(&pool, &args[1..]).await;
+    }
+
     // Checks for expired sessions in the session table and purges them
     match auth::purge_expired_sessions(&pool).await {
         Ok(0) => {}

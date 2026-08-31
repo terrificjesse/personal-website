@@ -133,6 +133,28 @@ for the popup.
 Also changed: `src/main.rs` (`mod hunt`), `src/routes/mod.rs` (two routes),
 `src/routes/internships.rs` (`CollectionSummary.alerts_created`).
 
+### `src/inbox/labelset.rs` *(new — `[gen]`)*
+
+8b's measurement harness. **Tooling, not pipeline** — it never runs during a sync, writes to no
+table and no mailbox, and reads only. Reached as a subcommand of the server binary, dispatched
+in `main.rs` before any background work starts:
+
+```
+cargo run --release -- labelset export --out labelsets/aug.csv [--since ISO] [--until ISO]
+cargo run --release -- labelset score  --labels labelsets/aug.csv
+```
+
+| Item | What it does |
+|---|---|
+| `export` | Every stored message in the window to a CSV with an empty `label` column. "Every" is load-bearing: filtering to job-looking mail yields a set that cannot measure the relevance gate |
+| `Row` | Exactly the fields `classify` gets — sender, subject, snippet — **and no verdict column**. Pre-filling the machine's answer measures how agreeable the reviewer is |
+| `score` | Re-runs `classify::classify` over the labelled rows. Deliberately not `email_verdicts`, which holds whatever rules ran the day the sync did |
+| `Summary` | The two failure modes with **separate denominators**, and no `accuracy` field to quote instead. Also `pressing_missed` — rule 8's failure is broader than the disregard branch |
+| `rules_fingerprint` | SHA-256 of `classify.rs`, compiled in via `include_str!`, so it describes the binary doing the grading |
+| `Ledger` | `<labels>.graded.json`. A message is **spent** when it was graded under a *different* fingerprint — grading does not spend a set, changing the rules after seeing the result does. Re-scoring under unchanged rules is free |
+
+`labelsets/` is gitignored: the sheets hold real subject lines and snippets.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
@@ -385,3 +407,6 @@ Chrome resolves from the root, which is why every example omits the leading slas
   `hunt_events` took `0014` because 8e needed it first.
 - **The extension shows no internship list**, only alerts and a link out. Whether it should is
   an open question in `apps/hunt-extension/CLAUDE.md`.
+- **8b's checkpoint is waiting on mail, not on code.** `src/inbox/labelset.rs` is the harness
+  for it; the burner held 14 messages over 2 days with zero digests when it was written, so the
+  relevance gate still has nothing to measure against.

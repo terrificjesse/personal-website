@@ -336,7 +336,9 @@ Deliberately: **classification earns write access, it does not start with it.**
 | 8g answer library | ✅ built; loop never closed by hand |
 | 9 usable daily | ✅ worker, proposals panel, inbox status |
 
-**8b's checkpoint is the outstanding one, and it needs mail rather than work.** It asks for a
+**8b's checkpoint is the outstanding one, and it needs mail rather than work.** The harness to
+run it is built — `src/inbox/labelset.rs`, `labelset export` then `labelset score`; see
+`docs/HUNT.md`. What is missing is the mail, not the tooling. It asks for a
 hand-labelled set of *every message across ~2 weeks* — not curated job emails, because a curated
 set contains no newsletters and therefore cannot measure the relevance gate, which is the
 highest-volume decision in the system. Measure two numbers separately: how much junk leaked into
