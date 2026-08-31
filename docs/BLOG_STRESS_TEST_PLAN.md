@@ -16,8 +16,7 @@
 >
 > | | |
 > |---|---|
-> | **Confirmed & fixed** | J1 (concurrent creates returned 500), J17 (paging could repeat a post) |
-> | **Confirmed, not fixed** | J2 (duplicate frontmatter keys), J12 (misleading skip reason) |
+> | **Confirmed & fixed** | J1, J17, J2, J12 — all four |
 > | **Refuted** | J19 auth revocation, J16 pagination edges, J21 volume, J3/J4 bad input, J14 sync × API |
 
 **Goal: find what's broken.** Not to re-confirm the Phase 6 checkpoint, which passed and
@@ -292,17 +291,29 @@ Verified: publishing between page 1 and page 2 now yields **no overlap**, and a 
 4-row pages while publishing every third page covered all 30 originals with **zero duplicates**
 in both sort directions. Malformed cursors are 400, not an empty first page.
 
-### J2 — duplicate frontmatter keys silently take the last 🟡
+### J2 — duplicate frontmatter keys silently take the last 🟡 — FIXED
 
 `title: First` … `title: Second` stores "Second" with no warning. This contradicts the parser's
 own governing rule: an **unknown** key is a hard error precisely to catch typos, but a
 **duplicated** key — equally likely a mistake — passes silently.
 
-### J12 — misleading skip reason 🟡
+**Fix:** a repeated key fails the file and names itself. The worst version of the old
+behaviour is a file that plainly reads `published: false` on one line while the post is live,
+which is unfalsifiable by reading the file. `published` became an `Option<bool>` internally
+purely so a repeat can be distinguished from the default; a test pins that absent still means
+false.
+
+### J12 — misleading skip reason 🟡 — FIXED
 
 A frontmatter `slug: "!!!"` that slugifies to nothing is skipped with *"filename produces an
 empty slug"*. The filename was fine; the frontmatter was not. The reader renames the wrong
 thing.
+
+**Fix:** `slug_for` decides the slug and returns *why* there isn't one, so the message names
+the source that actually caused it. Split into a pure function so the reason is testable
+rather than only observable in a log line. Verified live: a bad `slug:` now reports
+"its frontmatter `slug:` has no alphanumeric characters", while a genuinely bad filename still
+reports the filename.
 
 ## Refuted
 

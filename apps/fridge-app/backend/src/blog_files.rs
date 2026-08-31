@@ -132,7 +132,9 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
 
     let mut title: Option<String> = None;
     let mut date: Option<DateTime<Utc>> = None;
-    let mut published = false;
+    // `Option`, not `bool`, only so a repeat can be told from the default. Unwrapped to
+    // `false` at the end.
+    let mut published: Option<bool> = None;
     let mut slug: Option<String> = None;
     let mut closed = false;
     let mut body_offset = rest.len();
@@ -160,18 +162,37 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
         let key = key.trim();
         let value = unquote(value.trim());
 
+        // A key given twice is an error, not last-one-wins.
+        //
+        // The rule below — an *unknown* key fails the file — exists to catch typos. A
+        // *repeated* key is the same kind of mistake (a half-finished edit, a bad merge, a
+        // copied block) and silently keeping the last one hides it just as thoroughly: the
+        // file plainly says `published: false` on one line and the post is live anyway.
+        macro_rules! set_once {
+            ($slot:expr, $name:literal, $value:expr) => {{
+                if $slot.is_some() {
+                    return Err(format!(
+                        "frontmatter key `{}` appears more than once",
+                        $name
+                    ));
+                }
+                $slot = Some($value);
+            }};
+        }
+
         match key {
-            "title" => title = Some(value.to_string()),
-            "slug" => slug = Some(value.to_string()),
-            "date" => date = Some(parse_date(value)?),
+            "title" => set_once!(title, "title", value.to_string()),
+            "slug" => set_once!(slug, "slug", value.to_string()),
+            "date" => set_once!(date, "date", parse_date(value)?),
             "published" => {
-                published = match value {
+                let parsed = match value {
                     "true" | "yes" => true,
                     "false" | "no" => false,
                     other => {
                         return Err(format!("`published` must be true or false, got {other:?}"));
                     }
-                }
+                };
+                set_once!(published, "published", parsed);
             }
             other => {
                 return Err(format!(
@@ -201,7 +222,7 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
         FrontMatter {
             title: title.trim().to_string(),
             date,
-            published,
+            published: published.unwrap_or(false),
             slug: slug.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         },
         body,
@@ -432,6 +453,25 @@ struct DirScan {
     present: HashSet<String>,
 }
 
+/// The slug a file will publish at, or why it has none.
+///
+/// Split out so the *reason* is testable rather than only observable in a log line. It used to
+/// report "filename produces an empty slug" whichever source was at fault, so a bad
+/// frontmatter `slug:` sent the reader off to rename a filename that was perfectly fine.
+fn slug_for(front_matter: &FrontMatter, file_stem: &str) -> Result<String, String> {
+    let (candidate, origin) = match &front_matter.slug {
+        Some(explicit) => (slugify(explicit), "frontmatter `slug:`"),
+        None => (slugify(file_stem), "filename"),
+    };
+
+    if candidate.is_empty() {
+        return Err(format!(
+            "its {origin} has no alphanumeric characters, so the slug would be empty"
+        ));
+    }
+    Ok(candidate)
+}
+
 /// One post read off disk, ready to be written to the database.
 struct FilePost {
     /// The file this came from, relative to the content directory. Recorded on the row so the
@@ -501,15 +541,14 @@ fn read_dir_posts(dir: &Path) -> std::io::Result<DirScan> {
             }
         };
 
-        let slug = match &front_matter.slug {
-            Some(explicit) => slugify(explicit),
-            None => slugify(stem),
+        let slug = match slug_for(&front_matter, stem) {
+            Ok(slug) => slug,
+            Err(reason) => {
+                eprintln!("blog sync: skipping {display} — {reason}");
+                skipped += 1;
+                continue;
+            }
         };
-        if slug.is_empty() {
-            eprintln!("blog sync: skipping {display} — filename produces an empty slug");
-            skipped += 1;
-            continue;
-        }
 
         // The same limits `create_post` enforces on the API. A file bypasses that handler, so
         // without this a 200k-character post would reach a column the rest of the app assumes
@@ -837,6 +876,90 @@ mod tests {
 
         let empty = "---\ntitle: T\ndate: 2026-08-19\nslug:\n---\nBody\n";
         assert_eq!(parse_front_matter(empty).unwrap().0.slug, None);
+    }
+
+    /// **J2.** A key given twice is a mistake, and must fail the file rather than quietly
+    /// keeping the last one.
+    ///
+    /// The parser already errors on an *unknown* key to catch typos. A repeated key is the
+    /// same class of mistake — a half-finished edit, a bad merge, a copied block — and
+    /// last-one-wins hides it completely: the file says `published: false` on one line and the
+    /// post is live anyway.
+    #[test]
+    fn a_repeated_frontmatter_key_is_an_error() {
+        let cases = [
+            (
+                "title",
+                "---\ntitle: A\ndate: 2026-08-19\ntitle: B\n---\nBody\n",
+            ),
+            (
+                "date",
+                "---\ntitle: A\ndate: 2026-08-19\ndate: 2026-08-20\n---\nBody\n",
+            ),
+            (
+                "published",
+                "---\ntitle: A\ndate: 2026-08-19\npublished: false\npublished: true\n---\nBody\n",
+            ),
+            (
+                "slug",
+                "---\ntitle: A\ndate: 2026-08-19\nslug: one\nslug: two\n---\nBody\n",
+            ),
+        ];
+
+        for (key, text) in cases {
+            let err =
+                parse_front_matter(text).expect_err(&format!("a repeated `{key}` must not parse"));
+            assert!(
+                err.contains(key) && err.contains("more than once"),
+                "the error should name the repeated key: {err}"
+            );
+        }
+    }
+
+    /// The `Option<bool>` that makes the check above possible must not change what an absent
+    /// `published` means.
+    #[test]
+    fn published_is_still_false_when_absent_and_honoured_when_present() {
+        let absent = "---\ntitle: A\ndate: 2026-08-19\n---\nBody\n";
+        assert!(!parse_front_matter(absent).unwrap().0.published);
+
+        let present = "---\ntitle: A\ndate: 2026-08-19\npublished: true\n---\nBody\n";
+        assert!(parse_front_matter(present).unwrap().0.published);
+
+        let explicit_false = "---\ntitle: A\ndate: 2026-08-19\npublished: false\n---\nBody\n";
+        assert!(!parse_front_matter(explicit_false).unwrap().0.published);
+    }
+
+    /// **J12.** An empty slug must blame whichever source actually produced it.
+    #[test]
+    fn an_empty_slug_names_the_source_that_caused_it() {
+        let front = |slug: Option<&str>| FrontMatter {
+            title: "T".to_string(),
+            date: parse_date("2026-08-19").unwrap(),
+            published: true,
+            slug: slug.map(str::to_string),
+        };
+
+        assert_eq!(slug_for(&front(None), "good-name").unwrap(), "good-name");
+        assert_eq!(
+            slug_for(&front(Some("Custom URL")), "ignored").unwrap(),
+            "custom-url"
+        );
+
+        let from_filename = slug_for(&front(None), "!!!").expect_err("empty slug must fail");
+        assert!(
+            from_filename.contains("filename") && !from_filename.contains("frontmatter"),
+            "a bad filename must blame the filename: {from_filename}"
+        );
+
+        // The regression: this used to say "filename produces an empty slug", sending the
+        // reader to rename a file that was perfectly fine.
+        let from_frontmatter = slug_for(&front(Some("!!!")), "perfectly-good-filename")
+            .expect_err("empty slug must fail");
+        assert!(
+            from_frontmatter.contains("frontmatter"),
+            "a bad frontmatter slug must blame the frontmatter, not the file: {from_frontmatter}"
+        );
     }
 
     #[test]

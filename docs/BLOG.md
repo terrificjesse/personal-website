@@ -69,7 +69,8 @@ Ingests `content/blog/*.md`. Runs at startup from `main.rs` and on demand from `
 | Function | What it does |
 |---|---|
 | `content_dir` | `BLOG_CONTENT_DIR`, else `content/blog` resolved off `CARGO_MANIFEST_DIR`. **`include_str!` can't be used here** — the pattern `foodkeeper.rs`/`themealdb.rs` use needs a fixed file list at compile time, and the whole point is adding a file without touching code. A runtime read means the working directory matters, hence the manifest-relative default. |
-| `parse_front_matter` | Hand-rolled, no crate: the schema is four flat scalars. Returns `(FrontMatter, body)`. **An unknown key is an error** — a misspelled `pubished: true` would otherwise leave a post a draft forever with no symptom. |
+| `parse_front_matter` | Hand-rolled, no crate: the schema is four flat scalars. Returns `(FrontMatter, body)`. **An unknown key is an error, and so is a repeated one** — a misspelled `pubished: true` would otherwise leave a post a draft forever with no symptom, and a duplicated `published:` would leave the file plainly contradicting the live post. |
+| `slug_for` | The slug, or *why there isn't one*. Names whichever source was at fault — a bad frontmatter `slug:` used to blame the filename. |
 | `read_dir_posts` | Reads and validates every `.md`; skips `README.md`; enforces the same title/body length limits `create_post` does, since a file bypasses that handler. A bad file is skipped and logged, never fatal. |
 | `sync` / `sync_in` | Upserts by slug among `source = 'file'` rows, then **deletes rows whose file is absent from disk**. Mirrors the directory rather than importing from it. Returns a `SyncOutcome`, not a bare report. `sync_in` takes an explicit directory — the seam tests use, since `content_dir()` reads an env var and mutating process env races every other test. |
 | `SyncOutcome` | `Completed(report)` = the directory was reconciled. `Deferred(reason)` = nothing was attempted (no admin yet, or the directory could not be read). **The watcher advances its fingerprint only on `Completed`**; see below. |
@@ -452,8 +453,8 @@ The "areas to probe" table, worked through: **four findings, five refutations**.
 |---|---|---|
 | J1 | `create_post` returned **500 under contention** — `SELECT EXISTS` then `INSERT`, with nothing holding between. Ten concurrent creates of one title gave **six 500s** | **Fixed** — the `UNIQUE` constraint arbitrates; 10× 201 after |
 | J17 | Offset paging repeated a post if something published mid-browse | **Fixed** — keyset `cursor` replaces `offset` |
-| J2 | Duplicate frontmatter keys silently take the last, though an *unknown* key is a hard error | Open |
-| J12 | A bad frontmatter `slug:` reports "**filename** produces an empty slug" | Open |
+| J2 | Duplicate frontmatter keys silently took the last, though an *unknown* key is a hard error | **Fixed** — a repeat fails the file and names itself |
+| J12 | A bad frontmatter `slug:` reported "**filename** produces an empty slug" | **Fixed** — `slug_for` names the source that caused it |
 
 Refuted: auth revocation (immediate, no re-login), pagination edges, hostile input, and sync ×
 API collision. Most usefully, **volume**: 1000 file posts sync in 380ms, re-sync in 127ms, and

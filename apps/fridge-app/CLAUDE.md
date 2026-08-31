@@ -151,7 +151,9 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   `fetch_visible_to` (own + public). **Picking the wrong one leaks a stranger's review into a
   personal view.**
 - `src/blog_files.rs` — `[gen]` markdown-file ingestion for the blog. Hand-rolled frontmatter
-  parser (no crate), `sync`/`sync_in` (mirrors `content/blog/*.md` into `blog_posts`), and
+  parser (no crate — **an unknown key and a repeated key are both errors**, because the whole
+  point is catching a typo the author cannot otherwise see), `sync`/`sync_in` (mirrors
+  `content/blog/*.md` into `blog_posts`), and
   `spawn_watcher` (polls a `(name, mtime, size)` fingerprint every `BLOG_SYNC_INTERVAL_SECS`).
   **Two invariants a 2026-08-30 stress test had to install — don't undo them:** the sweep
   deletes on *file absence* (`source_path`, migration `0016`), never on parse failure; and
@@ -424,10 +426,10 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **Two findings from the second blog stress pass, unfixed** — J2 (duplicate frontmatter keys
-   silently take the last, though an unknown key is a hard error) and J12 (a bad frontmatter
-   `slug:` blames the filename). Both cosmetic. See
-   `docs/BLOG_STRESS_TEST_PLAN.md` § Second pass.
+2. **A third blog stress pass**, if wanted. Both passes are closed with every finding fixed;
+   what is left unexplored is frontmatter fuzzing beyond what was covered (symlinks,
+   megabyte single-line files) and the frontend beyond the first pass.
+   `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
 3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.
