@@ -1,6 +1,6 @@
 # Hunt Extension — CLAUDE.md
 
-**Status: draft, 2026-08-29.** This is the first pass at Phase 8. Expect to edit it.
+**Status: 2026-08-31.** Phase 8 is built and Phase 9 with it; this file is now the *rules*, not the plan. What exists is documented in `docs/HUNT.md` — when that and this disagree, the reference is closer to the code and wins on fact, but the rules below still bind.
 
 ## Scope of this file
 
@@ -53,109 +53,45 @@ tracker still reading `applied` for a job you already interviewed at.
 
 ## Architecture
 
+Two producers, **one** events table, one poll endpoint, one notification path:
+
 ```
-  Gmail (burner account)
-    │  users.messages.list / history.list  (incremental, watermarked by historyId)
-    ▼
-  inbox::sync ───────────────────────────────► inbox_runs   (one row per pass, always)
-    │
-    ▼
-  inbox::classify  →  EmailVerdict { category, company_guess, confidence, evidence }
-    │                 rules first; Claude API only on ambiguity
-    │                 CATEGORY IS DECIDED BEFORE THE MATCH IS ATTEMPTED — rule 8
-    ▼
-  inbox::match     →  Option<application_id>   (fuzzy; ENRICHMENT, not a gate)
-    │
-    ├─ matched ─────────► label  Hunt/Confirmed · Hunt/OA · Hunt/Interview · Hunt/Offer · Hunt/Rejected
-    │                     status_proposals row   (auto-apply only under rules 2 and 3)
-    │                     hunt_events row        (pressing categories only)
-    │
-    ├─ unmatched, but ──► label  Hunt/Outreach
-    │  about a specific   no tracker row, no event by default (rule 9)
-    │  role or company
-    │
-    └─ not job-specific ► NO label, NO event, NO status effect
-                          — but the verdict is still WRITTEN (rule 7)
-
-  internships::collector ────────────────────► hunt_events row  (tier-1/2 company, new posting)
-
-  hunt_events  ──►  GET /hunt/events?since=  ──►  extension background poll
-                                                   └─► browser.notifications
+  internships::collector ── new tier-1/2 posting ──┐
+                                                    ├─► hunt_events ─► GET /hunt/events
+  inbox::classify ───────── OA / interview / offer ─┘                   └─► notifications
 ```
 
-Two producers, **one** events table, **one** poll endpoint, one notification path. Do not build
-a second pipeline for the posting alerts.
+Do not build a second pipeline for either. The full picture — every file and function — is
+`docs/HUNT.md`.
 
-## CV autofill and the answer library — added 2026-08-29
+## Autofill and the answer library — the parts that are not obvious from the code
 
-Two features, one content script, one shared idea: **you have already typed this before.**
+Built; see `docs/HUNT.md`. Four things worth keeping in front of you:
 
-### Autofill
+- **Map fields by label text, not CSS selector.** Selectors rot on every ATS redesign; the
+  visible label survives. Add per-ATS overrides **only** where the generic mapper demonstrably
+  fails, never pre-emptively.
+- **The React gotcha.** Setting `input.value` directly does not register with a React-controlled
+  input — the framework's state never updates and the value is wiped on the next render. Use the
+  prototype's native setter, then dispatch `input` and `change` with `bubbles: true`.
+- **Résumé upload is out of scope.** File inputs cannot be populated both reliably and honestly.
+  Store the path, show it as a reminder, let the user pick the file. Do not synthesise a
+  `DataTransfer` to fake a selection.
+- **Company-specific answers are the answer library's whole risk.** "Why do you want to work at
+  X" reads as the same question everywhere, and pasting one employer's answer into another's
+  form is a uniquely bad way to lose an application. Flag generously; a false positive costs one
+  suggestion, a false negative costs the application.
 
-Profile lives in the backend (`cv_profile`), same as everything else — survives a browser
-reinstall, and it is the same SQLite file that already holds your password hash, so it is not a
-new class of secret. The extension caches it in `browser.storage.local` so filling works offline.
-
-**Map fields by label text, not by CSS selector.** Selectors rot on every ATS redesign; the
-visible label ("Phone number", "LinkedIn URL") is far more stable. Use fuzzy matching over label
-text — `strsim` is already a backend dep, and the same normalize-then-compare shape as
-`internships::dedup`. Add per-ATS overrides **only** where the generic mapper demonstrably fails,
-not pre-emptively.
-
-**Which hosts:** Phase 7 already enumerated them. `internships::dedup::ats_identity` parses
-`boards.greenhouse.io`, `job-boards.greenhouse.io`, `job-boards.eu.greenhouse.io`,
-`jobs.lever.co`, `jobs.ashbyhq.com`, `apply.workable.com`, `ats.rippling.com`. Reuse that list
-rather than inventing a second one — and when a new ATS host is discovered, it should only have
-to be added in one place.
-
-**Workday (`*.myworkdayjobs.com`) is best-effort.** Same posture as LinkedIn/Indeed in Phase 7:
-included knowing it will mostly not work, never on the critical path, and not worth sinking days
-into. It is a dynamic React app with generated ids and it fights autofill by construction.
-
-**Resume upload is out of scope.** File inputs cannot be populated programmatically in any way
-that is both reliable and honest. Store the path, show it as a reminder, let the user pick the
-file. Do not try to synthesize a `DataTransfer` to fake a file selection.
-
-**The React gotcha, which will be your first bug:** setting `input.value = x` directly does not
-register with React-controlled inputs — the framework's state never updates and the value is
-wiped on the next render. Use the native setter
-(`Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set`) and then
-dispatch `input` and `change` events with `bubbles: true`.
-
-### The answer library
-
-`application_answers`: the question as asked, your answer, optional tags, when it was last used.
-When a form has a free-text field, the content script surfaces **your closest past answers** for
-it, ranked by similarity to the question text.
-
-**Retrieval only — never auto-insert, and do not have Claude write the answer.** Two reasons.
-Free-text answers are the part of an application that is actually you, and a model-generated one
-reads like every other model-generated one. And silently pasting a stale answer about a project
-you no longer care about is worse than an empty box, because you will not notice. Surface, let
-the user pick, let them edit.
-
-**Company-specific questions are the trap here.** "Why do you want to work at X" *looks* highly
-similar across applications — same wording, near-identical embedding — and is the single worst
-thing to reuse verbatim. Pasting "I'm excited about Stripe's mission" into a Datadog form is a
-uniquely bad way to lose an application. So: detect a company mention in a stored question,
-**flag that answer as company-specific**, and either exclude it from suggestions or surface it
-with a loud warning. Pin it with a test.
-
-Answers are **editable with the edit retained** — you will improve an answer over time and want
-the current one, not the first draft, but a rewrite you regret should be recoverable.
+**Workday (`*.myworkdayjobs.com`) is best-effort**, the same posture as LinkedIn in Phase 7:
+included knowing it will mostly not work, never on the critical path.
 
 ### Closing the loop with the tracker
 
-When you fill an application on a known ATS page, the extension already knows the company and
-role. It should **offer** — one click, never automatic — to create the `internship_applications`
-row right there. That removes the manual tracker entry that otherwise never happens, and it is
-what makes Track A work later: an email can only be matched to an application that exists.
-
-Note this is the *legitimate* way to create a tracker row, and it does not contradict the rule
-that `Hunt/Outreach` must never create one. Here the user is genuinely applying, so `applied_at`
-means what it says.
-
----
+Filling a form is not applying, and the extension cannot know whether you pressed submit. So
+creating an `internship_applications` row is **offered, one click, never automatic** — and that
+does not contradict the rule that `Hunt/Outreach` never creates one, because there nobody
+applied. It matters beyond convenience: an email can only be matched to an application that
+exists.
 
 ## What "job-related cold outreach" means — decided 2026-08-29
 
@@ -371,168 +307,55 @@ it can be suggested elsewhere (see above).
 
 ---
 
-## Data model sketch — migration `0019_create_inbox.sql` *(written 2026-08-30)*
+## Where the built thing is
 
-Not final. Argue with it before writing it.
+| | |
+|---|---|
+| Every file and function | `docs/HUNT.md` |
+| Phase status and checkpoints | `docs/PLAN.md` §§ Phase 8, 9 |
+| Schema | migrations `0014` hunt_events, `0015` hunt_tokens, `0017` cv_profile, `0018` answers, `0019` inbox, `0020` label record |
+| Endpoints | `src/routes/hunt.rs`, `src/routes/inbox.rs` |
+| Extension | `apps/hunt-extension/` — `README.md` covers sideloading and the Firefox defaults that bite |
 
-**Numbers, as actually built:** `0014` hunt_events, `0015` hunt_tokens, `0016` blog source
-path, `0017` cv_profile, `0018` the answer library, `0019` these inbox tables.
+**Auth is a bearer token, not the session cookie.** The cookie was tried first as this file
+instructed; Firefox will not send a `SameSite=Lax` cookie from a `moz-extension://` page, so the
+fallback named here is what ships. See `docs/HUNT.md`.
 
-**`hunt_events` is not in this migration — it shipped ahead of it, in `0014_create_hunt_events.sql`.**
-8e needed the table and the inbox did not exist yet, and it belongs on its own regardless: it
-has two producers and only one of them is the inbox. Bundling it into the inbox migration
-would say the alert channel is an inbox feature, which is exactly the coupling the "two
-producers, one table" shape exists to prevent. So the inbox tables below are `0015`, and
-Track B's `cv_profile` moves along with them.
+## Build order — status
 
-- `gmail_accounts` — `user_id`, `email`, `refresh_token`, `history_id` watermark, `connected_at`.
-- `inbox_runs` — mirrors `source_runs`. Outcome enum, counts, error.
-- `email_messages` — `gmail_message_id UNIQUE`, thread id, from, subject, received_at,
-  snippet. **Store the minimum**; this is a burner, but it is still your mail.
-- `email_verdicts` — message id, category, confidence, `matched_application_id`,
-  `classifier` (`rules` | `llm`), `evidence` TEXT. One row per classification pass, kept even
-  when superseded, so a bad call is diagnosable rather than merely wrong. (Same instinct as
-  `posting_rejects`.) Category enum: `confirmation`, `oa`, `interview`, `offer`, `rejection`,
-  `outreach`, `disregarded`. **Written for every message, including disregarded ones** — rule 7.
-  `matched_application_id` is nullable and NULL is legal on a pressing category — rule 8.
-- `status_proposals` — application id, from/to status, verdict id, `applied_automatically`,
-  `reviewed_at`. Rule 2 lives here.
-- `hunt_events` — **already built**, in `0014_create_hunt_events.sql`. `kind`
-  (`posting` | `email`), `user_id` (NULL = from the shared posting corpus, NOT NULL = private
-  to that user — the email producer must always set it), `subject_id` with
-  `UNIQUE (kind, subject_id)`, the rendered `title`/`body`/`url`, `payload_json`,
-  `created_at`, `acked_at`. Rule 6 lives here. 8d writes to it rather than altering it.
+Deliberately: **classification earns write access, it does not start with it.**
 
-Track B landed first, as expected — `cv_profile` in `0017` and the answer library in `0018`,
-each in its own migration rather than bundled with the inbox tables:
+| | |
+|---|---|
+| 8a read-only sync | ✅ complete |
+| 8b classify + match | ⚠️ rules layer built; **checkpoint not met** — see below |
+| 8c writes | ✅ proposals and Gmail labels |
+| 8d email → alerts | ✅ complete |
+| 8e extension shell | ✅ complete |
+| 8f autofill | ✅ complete |
+| 8g answer library | ✅ built; loop never closed by hand |
+| 9 usable daily | ✅ worker, proposals panel, inbox status |
 
-- `cv_profile` — `user_id`, and the flat fields an ATS asks for: name, email, phone, location,
-  school, grad date, links (GitHub/LinkedIn/portfolio), work authorization. One row per user.
-- `application_answers` — `user_id`, `question_text`, `question_normalized`, `answer_text`,
-  `is_company_specific`, `tags`, `use_count`, `last_used_at`, `created_at`, `updated_at`.
-- `answer_revisions` — previous `answer_text` plus timestamp. Cheap, and it means an edit you
-  regret is recoverable.
+**8b's checkpoint is the outstanding one, and it needs mail rather than work.** It asks for a
+hand-labelled set of *every message across ~2 weeks* — not curated job emails, because a curated
+set contains no newsletters and therefore cannot measure the relevance gate, which is the
+highest-volume decision in the system. Measure two numbers separately: how much junk leaked into
+`Hunt/Outreach`, and **how much real mail got disregarded** — the second is the one that costs
+you an interview. A held-out set can only be measured once; fixing against it spends it.
 
-## Endpoints sketch
-
-```
-GET    /hunt/events?since=&include_acked=&limit=
-                                      undelivered events, newest first; the popup passes
-                                      include_acked=true for its recent-alerts list
-POST   /hunt/events/{id}/ack
-GET    /hunt/inbox/status             last run, outcome, whether Gmail is connected
-GET    /hunt/proposals                pending status proposals awaiting review
-POST   /hunt/proposals/{id}/accept
-POST   /hunt/proposals/{id}/reject
-GET    /auth/gmail/start              OAuth, offline access
-GET    /auth/gmail/callback
-
-GET    /hunt/profile                  CV fields for autofill
-PUT    /hunt/profile
-GET    /hunt/answers?q=               past answers ranked by similarity to q
-POST   /hunt/answers                  save an answer (from the content script or the popup)
-PATCH  /hunt/answers/{id}             edit; writes an answer_revisions row
-```
-
-All of these are `CurrentUser`-scoped, exactly like `/internships/applications`.
-
-## The extension (Firefox MV3)
-
-```
-apps/hunt-extension/
-  manifest.json      MV3. browser_specific_settings.gecko.id is REQUIRED or storage
-                     doesn't persist across sideloads.
-  background.js      background.scripts (Firefox event page, NOT service_worker).
-                     browser.alarms polls; browser.notifications alerts.
-  popup/             RECENT events (include_acked=true), last sync status, pending
-                     proposals. Not a list of unacked ones: `acked_at` is a delivery
-                     receipt, so the background page acks each event a second after
-                     notifying and an unacked-only popup would be empty every time you
-                     opened it. See rule 6.
-  options/           Backend URL, poll interval, alert kinds, CV profile editor,
-                     answer library browser, EEO-autofill opt-in (default off).
-  content/           Injected on known ATS hosts ONLY. Field mapper, the fill action,
-                     and the answer-suggestion panel. Never runs without a user gesture.
-```
-
-**Auth: reuse the existing session cookie.** With `host_permissions` for the backend origin and
-`fetch(..., { credentials: "include" })`, the extension's requests carry `fridge_session`. If
-you're logged into the site, the extension is authenticated. No second token, no new auth code.
-If that proves awkward in Firefox, the fallback is a dedicated extension token — but try the
-cookie first.
-
-**Alert predicate for postings — reuse what exists.** `prestige::CompanyTiers::tier()` already
-returns `Option<u8>`. Alert on tier 1 and 2. **Do not alert on `None`** — Phase 7's rule is that
-NULL prestige means *unknown*, not *low*, and alerting on unknown would alert on nearly
-everything.
-
----
-
-## Build order
-
-Deliberately: **classification earns write access, it doesn't start with it.**
-
-- **8a — Read-only pipeline.** OAuth, token storage, incremental sync, `inbox_runs`. Classifier
-  stub returns `Other`. *Checkpoint:* messages sync, the run shows in status, no writes anywhere.
-- **8b — Classify + match, still no writes.** Rules layer, then Claude fallback. Verdicts stored.
-  *Checkpoint:* against a hand-labelled set of real burner-inbox mail, not fixtures. Phase 7's
-  lesson: the real run caught two dedup bugs that 510 green tests did not.
-  **Sample a whole time window — every message across ~2 weeks — not 50 curated job emails.**
-  A curated set contains no newsletters, so it cannot measure the relevance gate at all, and
-  the relevance gate is now the highest-volume decision in the system. Measure two numbers
-  separately: how much junk leaked into `Hunt/Outreach`, and **how much real mail got
-  disregarded** — the second is the one that costs you an interview.
-- **8c — Writes.** Gmail labels + status proposals. Rules 2 and 3 land here.
-  *Checkpoint:* a late-arriving autoresponder does not drag an interview back to `applied`.
-- **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the table,
-  which 8e creates.
-- **8e — The extension shell, end to end.** Not just the client: 8e owns `hunt_events`, the
-  poll + ack endpoints, **and the posting producer** — the collector emitting an event when it
-  inserts a tier-1/2 posting. That producer needs no Gmail and no API key, so 8e is a complete
-  vertical slice that ends in a real desktop notification, and it proves the whole alert path
-  before the inbox agent exists. Then: MV3 background poll, notifications, popup, options.
-  *Checkpoint:* a new tier-1/2 posting raises exactly one notification; a tier-3 or untiered one
-  raises none; re-running collection does not raise a second; restart Firefox after acking and
-  it does not come back.
-- **8f — Autofill.** Content script, label-based field mapper, CV profile, the "track this
-  application" offer. *Checkpoint:* fill a real Greenhouse, Lever and Ashby form end to end
-  **without submitting any of them**; confirm React-controlled inputs keep their values after a
-  re-render; confirm nothing fires on page load and no EEO field is touched.
-- **8g — The answer library.** Save answers, similarity retrieval, company-specific flagging.
-  *Checkpoint:* a "why do you want to work here" answer stored against one company is **not**
-  offered for another, and a genuinely reusable one ("a project you're proud of") is.
-
-**8e → 8f → 8g needs nothing from 8a–8d.** If the goal is daily usefulness soonest, that is the
-order to build in.
+Nothing auto-applies a status change until that measurement gives a threshold
+(`INBOX_AUTO_APPLY_CONFIDENCE`).
 
 ## Open questions
 
-- [x] ~~What happens to an email that matches no application?~~ **Settled 2026-08-29:**
-      job-specific → `Hunt/Outreach`, no tracker row; everything else disregarded but recorded.
-      See the section above and rules 7–8.
-- [ ] Should `Hunt/Outreach` raise a notification? **Currently no, and I'd keep it that way** —
+- [ ] Should `Hunt/Outreach` raise a notification? **Currently no, and worth keeping that way** —
       cold outreach is high-volume and low-precision, and a noisy channel gets muted wholesale,
-      taking the OA alerts with it. It's a one-line predicate to flip if the folder turns out
-      to be worth interrupting for; make it an extension option rather than a default.
-- [x] ~~Should Phase 8 be appended to `docs/PLAN.md` as a proper phase, and a `docs/HUNT.md`
-      reference written alongside `BLOG.md` / `INTERNSHIPS.md`?~~ **Done 2026-08-29**, after
-      8e shipped. `docs/PLAN.md` § Phase 8 carries the build order, the traps and the 8e
-      checkpoint; `docs/HUNT.md` is the file-and-function reference. Note that
-      `docs/INTERNSHIPS.md` turns out never to have been written, despite the root
-      `CLAUDE.md` and Phase 7 both pointing at it.
-- [ ] Confidence threshold for auto-apply. Guessing is worse than measuring — set it after 8b
-      gives real numbers on the labelled set.
-- [ ] Does the extension need the internship *list*, or only alerts? Right now: only alerts.
-- [x] ~~Autofill on a company's own careers page.~~ **Settled 2026-08-29: `activeTab` behind a
-      toolbar click.** The script only ever touches a page you explicitly asked it to, and the
-      permission is granted per-invocation rather than standing. Also means no match patterns
-      for the long tail of careers pages, which could never have been enumerated anyway.
-- [ ] How does an answer get *into* the library the first time? Cheapest version: after a fill,
-      the content script offers to save whatever you typed into the free-text boxes. That is
-      also the version most likely to capture answers while they are still good.
-- [ ] Does the answer library want real embeddings, or is `strsim` over normalized question
-      text enough? Start with `strsim` — it is already a dependency and the corpus is tiny.
-      Revisit only if retrieval measurably misses.
+      taking the OA alerts with it. One predicate and an existing checkbox to flip.
+- [ ] Confidence threshold for auto-apply. Set it after 8b measures; guessing invents the
+      measurement it is supposed to come from.
+- [ ] Does the extension need the internship *list*, or only alerts? Currently only alerts.
+- [ ] Does the answer library want embeddings, or is `strsim` over normalized question text
+      enough? Currently `strsim`. Revisit only if retrieval measurably misses.
 
 ## Conventions
 
