@@ -817,6 +817,34 @@ Nothing was submitted on any of the three.
 
 ---
 
+## Phase 9 — Make the hunt tooling usable daily
+
+**Not new capability. The gap between built and used.**
+
+Phase 8 works and is driven entirely by hand: the inbox syncs only when something POSTs to it,
+status proposals are reachable only by `curl`, and nothing anywhere shows whether the agent is
+alive. A tool that needs an operator does not get used during an actual internship hunt — and
+being used is also what produces the corpus 8b's checkpoint needs, so this unblocks that too.
+
+### Scope
+
+- [gen] **An interval worker for the inbox.** Same shape as `BLOG_SYNC_INTERVAL_SECS` and the
+  collector: cadence from an env var, `0` disables, and it **never fetches from a request
+  handler** — the root `CLAUDE.md` cache rule applies to Gmail as much as to a job board.
+- [gen] **A proposals review panel** on the internships tab. Accept or reject a status change,
+  with the email that caused it visible beside it — rule 2's audit trail is worthless if the
+  only way to read it is SQL.
+- [gen] **Inbox status in the extension.** Whether an account is connected, when the last run
+  was, and its outcome. Rule 5 says a broken sync must be visible, and "visible" has so far
+  meant a JSON endpoint nobody opens. The 7-day token expiry makes this the difference between
+  noticing in an hour and noticing in a fortnight.
+
+### What this phase is not
+
+Not the Gmail label writes. Those are 8c's remaining half and stay held until 8b has met a real
+corpus — write access to a mailbox on the strength of a classifier measured against ten
+messages is exactly what the build order exists to prevent.
+
 ## After Phase 5
 
 Not planned in detail yet: additional site tabs beyond the fridge app, deployment

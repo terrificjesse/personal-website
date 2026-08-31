@@ -79,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
         None => println!("Google OAuth not configured — password login only"),
     }
 
+    // The inbox agent's background sync (Phase 9). Same shape as the collector: cadenced by an
+    // env var, disables cleanly, spawned rather than awaited so a slow Gmail cannot delay the
+    // server binding its port. Placed here because it needs the Google config above.
+    inbox::sync::spawn(pool.clone(), google_oauth.clone());
+
     // Sets up the router so the server is ready to handle HTTP requests from the frontend when the listening socket is set up
     let app = routes::build_router(routes::AppState {
         pool,

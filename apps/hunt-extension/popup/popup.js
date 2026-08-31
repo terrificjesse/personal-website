@@ -591,3 +591,54 @@ saveAnswersButton?.addEventListener("click", async () => {
   answerResultEl.textContent = `Saved ${saved} of ${found.length}.`;
   saveAnswersButton.hidden = true;
 });
+
+
+/*
+ * The inbox agent's state, in the place you already look.
+ *
+ * Rule 5 says a broken sync must be visible, and until now "visible" meant a JSON endpoint
+ * nobody opens. This matters on a clock: Google expires refresh tokens after seven days while
+ * the OAuth app is in Testing, so the agent WILL stop — and a stopped agent produces exactly
+ * the same silence as a quiet job market. Noticing in an hour instead of a fortnight is the
+ * whole point of putting it here.
+ */
+
+const inboxEl = document.getElementById("inbox");
+
+void (async () => {
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/hunt/inbox/status`, {
+      credentials: "include",
+      headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
+    });
+    if (!res.ok) return;
+    const status = await res.json();
+
+    if (!status.account) {
+      // Not connected is a real state, not an error, and saying nothing would leave you
+      // wondering why no email alerts ever arrive.
+      inboxEl.textContent = "Inbox: no account connected.";
+      inboxEl.hidden = false;
+      return;
+    }
+
+    const run = status.last_run;
+    if (!run) {
+      inboxEl.textContent = `Inbox: ${status.account}, no sync yet.`;
+    } else if (run.error) {
+      // The failure line. Shown in full rather than summarised — "the stored Gmail token no
+      // longer works, reconnect the account" is actionable, and "sync failed" is not.
+      inboxEl.textContent = `Inbox: ${run.outcome} — ${run.error}`;
+      inboxEl.classList.add("bad");
+    } else {
+      inboxEl.textContent =
+        `Inbox: ${run.outcome}, ${run.classified} classified ${relative(run.started_at)}.`;
+    }
+    inboxEl.hidden = false;
+  } catch {
+    // The backend being unreachable is already reported by the poll status above; repeating
+    // it here would just be two lines saying the same thing.
+  }
+})();

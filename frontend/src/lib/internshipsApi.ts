@@ -644,3 +644,64 @@ export async function answerRevisions(id: string): Promise<AnswerRevision[]> {
   const body = await res.json();
   return body.revisions ?? [];
 }
+
+// ------------------------------------------------------------------------------------------
+// Status proposals (Phase 8c / 9)
+// ------------------------------------------------------------------------------------------
+
+/**
+ * A status change an email implied, awaiting your decision.
+ *
+ * **Nothing here is applied silently.** Rule 2: a misclassification must never rewrite the
+ * tracker, so every email-driven change is a proposal carrying the email that caused it —
+ * and that link is what makes a wrong call reversible. `subject` and `evidence` are shown
+ * beside the change for exactly that reason: an audit trail nobody can read is not one.
+ */
+export type StatusProposal = {
+  id: string;
+  application_id: string;
+  company_name: string;
+  title: string;
+  from_status: string;
+  to_status: string;
+  /** True only if the confidence threshold was configured AND the move was forward and non-terminal. */
+  applied_automatically: boolean;
+  subject: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  created_at: string;
+};
+
+export async function listProposals(): Promise<StatusProposal[]> {
+  const res = await apiFetch("/hunt/proposals");
+  if (!res.ok) throw new Error(`Could not load proposals (${res.status})`);
+  return res.json();
+}
+
+export async function decideProposal(id: string, accept: boolean): Promise<void> {
+  const res = await apiFetch(
+    `/hunt/proposals/${encodeURIComponent(id)}/${accept ? "accept" : "reject"}`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error(`Could not record that decision (${res.status})`);
+}
+
+/** Whether a Gmail account is connected, and what the last sync did. */
+export type InboxStatus = {
+  account: string | null;
+  last_run: {
+    started_at: string;
+    finished_at: string | null;
+    outcome: string;
+    /** Set on a failed or partial run. Without it, "could not authenticate" and "found nothing" are the same empty row. */
+    error: string | null;
+    fetched: number;
+    classified: number;
+  } | null;
+};
+
+export async function getInboxStatus(): Promise<InboxStatus> {
+  const res = await apiFetch("/hunt/inbox/status");
+  if (!res.ok) throw new Error(`Could not load inbox status (${res.status})`);
+  return res.json();
+}

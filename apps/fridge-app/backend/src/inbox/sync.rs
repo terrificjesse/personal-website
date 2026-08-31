@@ -21,6 +21,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::hunt::events::{self, EventKind, NewHuntEvent};
@@ -742,4 +743,87 @@ mod tests {
         let lost_one = SyncReport { disregarded: 3, ..balanced.clone() };
         assert!(!lost_one.counts_balance(), "a dropped email must not balance");
     }
+}
+
+/// How often the inbox syncs when nothing overrides it.
+///
+/// Fifteen minutes, not the collector's six hours: a job board changes on the order of hours,
+/// but an assessment invitation with a deadline does not want to sit unnoticed for one. Gmail's
+/// quota is generous enough that this is not close to rude, and the sync is a capped list plus
+/// metadata reads.
+pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
+
+/// Start the background sync. Call once from `main`.
+///
+/// Spawned rather than awaited — a slow or unreachable Gmail must never delay the server
+/// binding its port, exactly as with the collector.
+pub fn spawn(pool: SqlitePool, config: Option<crate::auth::GoogleOAuthConfig>) {
+    let Some(config) = config else {
+        println!("inbox: Google OAuth not configured — no inbox sync");
+        return;
+    };
+
+    let interval = match std::env::var("INBOX_SYNC_INTERVAL_SECS") {
+        Err(_) => Some(Duration::from_secs(DEFAULT_SYNC_INTERVAL_SECS)),
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                eprintln!(
+                    "inbox: INBOX_SYNC_INTERVAL_SECS={value:?} is not a number — sync disabled; \
+                     use 0 to disable deliberately"
+                );
+                None
+            }
+        },
+    };
+
+    let Some(interval) = interval else {
+        println!("inbox: scheduled sync disabled — POST /hunt/inbox/sync only");
+        return;
+    };
+
+    println!("inbox: syncing every {}s", interval.as_secs());
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+
+            // Every connected account, not just one. There is one today; looping is what makes
+            // that a fact about the data rather than an assumption in the code.
+            let users: Vec<String> = sqlx::query_scalar("SELECT user_id FROM gmail_accounts")
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+
+            for user_id in users {
+                match run(
+                    &pool,
+                    &user_id,
+                    &config.client_id,
+                    &config.client_secret,
+                    DEFAULT_MAX_MESSAGES,
+                    Utc::now(),
+                )
+                .await
+                {
+                    // Quiet on a quiet inbox: a line every fifteen minutes saying "nothing"
+                    // trains you to stop reading the log, which is where the failures are.
+                    Ok(report) if report.classified == 0 => {}
+                    Ok(report) => println!(
+                        "inbox: {} new — {} pressing, {} confirmation, {} outreach, {} disregarded",
+                        report.classified,
+                        report.pressing,
+                        report.confirmation,
+                        report.outreach,
+                        report.disregarded
+                    ),
+                    // A failed pass has already written its reason to `inbox_runs`; this is the
+                    // database itself being unusable, which nothing downstream can record.
+                    Err(err) => eprintln!("inbox: sync could not run at all: {err:?}"),
+                }
+            }
+        }
+    });
 }
