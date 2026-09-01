@@ -28,7 +28,7 @@ edited.
 | Email producer — OA / interview / offer mail | ⬜ 8d, writes to the same table |
 | Gmail OAuth, sync, classify, match, labels | ⬜ 8a–8c |
 | CV autofill on ATS pages | ✅ Greenhouse, Lever, Ashby — verified live 2026-08-30 |
-| Answer library | ⬜ 8g |
+| Answer library | ◐ 8g — built; retrieval + the popup's request contract verified 2026-08-31, browser half unverified |
 
 ## The one structural idea
 

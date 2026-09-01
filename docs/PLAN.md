@@ -683,9 +683,25 @@ reading `applied` for a job you already interviewed at.
   table, which 8e built.
 - [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
 - [gen] **8f — Autofill. — complete 2026-08-30**
-- [gen] **8g — The answer library.** Save answers, similarity retrieval, company-specific
-  flagging. *Checkpoint:* a "why do you want to work here" answer stored against one company is
-  **not** offered for another, and a genuinely reusable one ("a project you're proud of") is.
+- [gen] **8g — The answer library. — checkpoint met at the HTTP layer 2026-08-31; the browser
+  half is still unverified.** Save answers, similarity retrieval, company-specific flagging.
+  *Checkpoint:* a "why do you want to work here" answer stored against one company is **not**
+  offered for another, and a genuinely reusable one ("a project you're proud of") is.
+
+  Both halves of that are now asserted through the real handlers in
+  `routes::hunt::answer_loop_tests`, driven with the **exact request shapes `popup.js` builds** —
+  its `?q=`/`&company=` query string and its three-field save body — because the seam between
+  the extension and the routes is in two languages, invisible to the compiler, and is what
+  "never closed by hand" would actually have caught. A renamed query parameter degrades to *no
+  suggestions*, which is indistinguishable from an empty library; the mutation that proves the
+  tests bite also shows the withholding assertion still passing under it, which is why the loop
+  needs asserting in **both** directions rather than just the safe one.
+
+  **What is still not verified is everything inside the browser**: whether `questions()` finds
+  the free-text boxes on a real ATS form, whether `describePage()` names the employer, and
+  whether the popup's Save and Suggest buttons behave against a live page. That needs the
+  extension loaded in Firefox on two real forms — it cannot be reached from here, and jsdom
+  would be a new npm dependency in a folder that is deliberately plain JS with no build step.
 
 ### The traps, in one place
 

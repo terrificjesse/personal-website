@@ -521,3 +521,205 @@ pub async fn delete_answer(
         Err(StatusCode::NOT_FOUND)
     }
 }
+
+/// The seam between `popup.js` and these handlers — 8g's loop, at the HTTP layer.
+///
+/// `hunt/answers.rs` already tests the retrieval rules thoroughly. What nothing tested is the
+/// *contract the extension actually depends on*: the query parameter names it builds, the JSON
+/// keys it reads back, and the exact body it posts. Those are invisible to a unit test and to
+/// the compiler, live in two different languages, and are precisely what "the loop was never
+/// closed by hand" would have discovered — a renamed parameter fails silently as "no
+/// suggestions", which is indistinguishable from an empty library.
+#[cfg(test)]
+mod answer_loop_tests {
+    use super::*;
+    use crate::models::User;
+    use axum::http::Uri;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("hunt-routes-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool) -> CurrentUser {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(format!("{id}@example.com"))
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        CurrentUser(User {
+            id,
+            email: "who@example.com".into(),
+            password_hash: None,
+            created_at: Utc::now(),
+            is_admin: false,
+        })
+    }
+
+    /// Exactly the body `popup.js` builds on Save: three fields, and no `tags`.
+    fn popup_save_body(question: &str, answer: &str, company: Option<&str>) -> NewAnswer {
+        serde_json::from_value(serde_json::json!({
+            "question_text": question,
+            "answer_text": answer,
+            "company_name": company,
+        }))
+        .expect("the popup's save body must deserialize; a required field here breaks Save")
+    }
+
+    /// Percent-encoding for the characters these questions actually contain.
+    fn urlencoded(text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+                other => {
+                    let mut buf = [0u8; 4];
+                    for byte in other.encode_utf8(&mut buf).as_bytes() {
+                        out.push_str(&format!("%{byte:02X}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Exactly the URL `popup.js` builds on Suggest.
+    fn popup_suggest_query(question: &str, company: Option<&str>) -> Query<AnswersQuery> {
+        let mut url = format!("/hunt/answers?q={}", urlencoded(question));
+        if let Some(company) = company {
+            url.push_str(&format!("&company={}", urlencoded(company)));
+        }
+        let uri: Uri = url.parse().unwrap();
+        Query::<AnswersQuery>::try_from_uri(&uri)
+            .expect("the popup's query string must parse into AnswersQuery")
+    }
+
+    fn suggestions_of(response: &AnswersResponse) -> Vec<serde_json::Value> {
+        let json = serde_json::to_value(response).unwrap();
+        json.get("suggestions")
+            .and_then(|s| s.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The loop itself: save an answer off one company's form, meet the question on another's.
+    #[tokio::test]
+    async fn a_generic_answer_saved_on_one_form_is_offered_on_another_companys() {
+        let pool = pool().await;
+        let me = user(&pool).await;
+
+        let (status, _) = create_answer(
+            State(pool.clone()),
+            me.clone(),
+            axum::Json(popup_save_body(
+                "Tell us about a project you are proud of.",
+                "I built a fridge app that estimates expiration dates from a FoodKeeper snapshot.",
+                Some("Acme Corp"),
+            )),
+        )
+        .await
+        .expect("save should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The same question, on a different employer's form.
+        let response = list_answers(
+            State(pool.clone()),
+            me,
+            popup_suggest_query("Tell us about a project you are proud of.", Some("Globex")),
+        )
+        .await
+        .expect("suggest should succeed");
+
+        let suggestions = suggestions_of(&response.0);
+        assert_eq!(suggestions.len(), 1, "a generic answer must cross companies");
+
+        // The keys `popup.js` reads off each suggestion. Renaming any of them turns the
+        // feature into a silent no-op.
+        let first = &suggestions[0];
+        assert!(first.get("id").and_then(|v| v.as_str()).is_some(), "popup reads suggestion.id");
+        assert!(
+            first.get("answer_text").and_then(|v| v.as_str()).is_some(),
+            "popup reads suggestion.answer_text"
+        );
+        assert!(first.get("similarity").is_some(), "the score is published");
+    }
+
+    /// The other half, and the one that costs an application if it is wrong.
+    #[tokio::test]
+    async fn an_employer_question_answered_for_one_company_is_withheld_from_another() {
+        let pool = pool().await;
+        let me = user(&pool).await;
+
+        let _saved = create_answer(
+            State(pool.clone()),
+            me.clone(),
+            axum::Json(popup_save_body(
+                "Why do you want to work at Stripe?",
+                "Stripe's payments infrastructure is the part of the internet I find most interesting.",
+                Some("Stripe"),
+            )),
+        )
+        .await
+        .expect("save should succeed");
+
+        let elsewhere = list_answers(
+            State(pool.clone()),
+            me.clone(),
+            popup_suggest_query("Why do you want to work at Datadog?", Some("Datadog")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            suggestions_of(&elsewhere.0).is_empty(),
+            "one employer's answer must never reach another's form"
+        );
+
+        let same = list_answers(
+            State(pool.clone()),
+            me,
+            popup_suggest_query("Why do you want to work at Stripe?", Some("Stripe")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            suggestions_of(&same.0).len(),
+            1,
+            "the same employer must still get its own answer back"
+        );
+    }
+
+    /// With no `q`, the popup's "whole library" call must come back under `answers`, not
+    /// `suggestions` — the untagged enum makes this a silent shape change if it ever flips.
+    #[tokio::test]
+    async fn the_library_listing_and_the_ranked_listing_are_different_json_keys() {
+        let pool = pool().await;
+        let me = user(&pool).await;
+
+        let _saved = create_answer(
+            State(pool.clone()),
+            me.clone(),
+            axum::Json(popup_save_body("Anything else?", "Not really.", None)),
+        )
+        .await
+        .unwrap();
+
+        let uri: Uri = "/hunt/answers".parse().unwrap();
+        let all = list_answers(
+            State(pool.clone()),
+            me,
+            Query::<AnswersQuery>::try_from_uri(&uri).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let json = serde_json::to_value(&all.0).unwrap();
+        assert!(json.get("answers").is_some(), "no q -> the whole library, under `answers`");
+        assert!(json.get("suggestions").is_none());
+    }
+}
