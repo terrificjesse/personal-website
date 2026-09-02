@@ -101,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
     // request handler, and disabled cleanly with `HUNT_NUDGE_INTERVAL_SECS=0`.
     hunt::nudge::spawn(pool.clone());
 
+    // Deadline warnings. Reads what the inbox agent extracted; raises alerts and nothing else.
+    hunt::deadline::spawn(pool.clone());
+
     // Sets up the router so the server is ready to handle HTTP requests from the frontend when the listening socket is set up
     let app = routes::build_router(routes::AppState {
         pool,

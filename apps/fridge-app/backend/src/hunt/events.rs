@@ -36,6 +36,12 @@ pub enum EventKind {
     /// A follow-up: an application that has had no response for long enough to be worth
     /// chasing. Phase 11e. A third *producer* on this table, not a second pipeline.
     Nudge,
+    /// A due date approaching — an OA closing, an interview to confirm. Phase 11f.
+    ///
+    /// Its own kind rather than a nudge, because the extension mutes by kind and the checkbox
+    /// that silences chatty follow-ups must not also silence the one alert whose whole purpose
+    /// is that missing it costs the opportunity.
+    Deadline,
 }
 
 impl EventKind {
@@ -46,6 +52,7 @@ impl EventKind {
             EventKind::Posting => "posting",
             EventKind::Email => "email",
             EventKind::Nudge => "nudge",
+            EventKind::Deadline => "deadline",
         }
     }
 }
@@ -529,6 +536,9 @@ mod hunt_event_rebuild_tests {
     use uuid::Uuid;
 
     const MIGRATION: &str = include_str!("../../migrations/0022_widen_hunt_event_kinds.sql");
+    /// The second rebuild, applied on top of the first — the order they run in production.
+    const MIGRATION_0023: &str =
+        include_str!("../../migrations/0023_create_application_deadlines.sql");
 
     /// Migration `0014`'s table, verbatim in shape, plus the one table it references.
     ///
@@ -578,6 +588,70 @@ mod hunt_event_rebuild_tests {
 
         sqlx::raw_sql(MIGRATION).execute(&mut conn).await.unwrap();
         conn
+    }
+
+    /// Both rebuilds in sequence, which is what a real database sees.
+    async fn rebuilt_twice() -> SqliteConnection {
+        let mut conn = rebuilt_from_seeded().await;
+        // 0023 also creates a table referencing `internship_applications`, which this fixture
+        // does not have — only the hunt_events half is under test here.
+        let hunt_events_half = MIGRATION_0023
+            .split("-- What was extracted, and from where")
+            .next()
+            .unwrap();
+        sqlx::raw_sql(hunt_events_half).execute(&mut conn).await.unwrap();
+        conn
+    }
+
+    /// The same guarantees as 0022, for the migration that repeats it.
+    #[tokio::test]
+    async fn the_second_rebuild_keeps_every_row_receipt_index_and_constraint() {
+        let mut conn = rebuilt_twice().await;
+
+        let row = sqlx::query("SELECT COUNT(*) AS rows, COUNT(acked_at) AS acked FROM hunt_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("rows"), 3, "rows lost in the second rebuild");
+        assert_eq!(row.get::<i64, _>("acked"), 2, "receipts lost in the second rebuild");
+
+        let duplicate = sqlx::query(
+            "INSERT INTO hunt_events
+                 (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+             VALUES ('dup', 'posting', NULL, 'posting-1', 't', 'b', NULL, '{}', 'now')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(duplicate.is_err(), "UNIQUE (kind, subject_id) did not survive 0023");
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'hunt_events'
+              AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(indexes, vec!["idx_hunt_events_created", "idx_hunt_events_unacked"]);
+    }
+
+    #[tokio::test]
+    async fn the_fourth_kind_is_accepted_and_a_typo_is_still_refused() {
+        let mut conn = rebuilt_twice().await;
+
+        let insert = |kind: &'static str, subject: &'static str| {
+            sqlx::query(
+                "INSERT INTO hunt_events
+                     (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+                 VALUES (?1, ?2, NULL, ?3, 't', 'b', NULL, '{}', '2026-09-02T00:00:00Z')",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(kind)
+            .bind(subject)
+        };
+
+        insert("deadline", "deadline-1:24").execute(&mut conn).await.expect("deadline accepted");
+        insert("nudge", "app-1:14").execute(&mut conn).await.expect("nudge still accepted");
+        assert!(insert("deadlines", "typo").execute(&mut conn).await.is_err());
     }
 
     /// The failure this migration could cause, and the one it must not.

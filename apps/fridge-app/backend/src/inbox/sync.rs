@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::hunt::events::{self, EventKind, NewHuntEvent};
 
+use super::due_dates;
 use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 
@@ -241,6 +242,19 @@ pub async fn run(
             propose_status(pool, user_id, &message, &verdict, &applications, threshold, now).await
         {
             eprintln!("inbox: could not record a status proposal: {err:?}");
+        }
+
+        // 11f: a due date, if the text carries one. Pressing categories only — a deadline in
+        // a newsletter is noise, and rule 7's "disregarded means unlabelled, not unrecorded"
+        // is about the verdict, not about mining every message for dates.
+        //
+        // Failure is logged and the pass continues: an unextracted deadline is a missing
+        // convenience, while a failed sync is a missing OA.
+        if verdict.category.is_pressing()
+            && let Err(err) =
+                record_deadline(pool, user_id, &message, &verdict, &applications, now).await
+        {
+            eprintln!("inbox: could not record a deadline for {}: {err:?}", message.id);
         }
 
         if verdict.category.is_pressing()
@@ -554,6 +568,70 @@ async fn propose_status(
     tx.commit().await?;
 
     Ok(true)
+}
+
+/// Store a due date if the message appears to carry one. **Rule 1: a pure extraction, and
+/// nothing else happens as a result.**
+///
+/// It writes one row and raises nothing; the sweep in `hunt::deadline` decides when to warn.
+/// It never advances a status — a date parsed out of untrusted marketing copy must not move
+/// the tracker, which is the same reasoning rule 2 applies to the classifier one layer up.
+///
+/// `application_id` is best-effort by rule 8: an unmatched pressing email still has its
+/// deadline recorded, because the matcher missing is not the deadline not existing.
+async fn record_deadline(
+    pool: &SqlitePool,
+    user_id: &str,
+    message: &gmail::Message,
+    verdict: &classify::EmailVerdict,
+    applications: &[(String, String)],
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let received = message
+        .received_at
+        .as_deref()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .unwrap_or(now);
+
+    let Some(found) = due_dates::extract(
+        message.subject.as_deref(),
+        message.snippet.as_deref(),
+        received,
+    ) else {
+        return Ok(false);
+    };
+
+    let message_row_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM email_messages WHERE gmail_message_id = ?")
+            .bind(&message.id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(message_row_id) = message_row_id else {
+        return Ok(false);
+    };
+
+    let application_id =
+        advance::match_application(verdict.company_guess.as_deref(), applications);
+
+    let inserted = sqlx::query(
+        "INSERT INTO application_deadlines
+             (id, message_id, user_id, application_id, due_at, source_text, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (message_id) DO NOTHING",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&message_row_id)
+    .bind(user_id)
+    .bind(application_id)
+    .bind(found.due_at.to_rfc3339())
+    .bind(&found.source_text)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(inserted == 1)
 }
 
 /// Raise a desktop alert for pressing mail.

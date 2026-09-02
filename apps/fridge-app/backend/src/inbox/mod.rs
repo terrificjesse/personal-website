@@ -33,6 +33,7 @@
 
 pub mod advance;
 pub mod classify;
+pub mod due_dates;
 pub mod gmail;
 pub mod labels;
 pub mod labelset;
