@@ -130,6 +130,14 @@ empty database, which reads as "all my applications vanished".
 Back up the WAL alongside the database, or use `sqlite3 … ".backup"`, which is consistent by
 construction. Copying `fridge.db` alone while the service is running can capture a torn state.
 
+### One thing not to change without checking
+
+`apiBase()` (`frontend/src/lib/apiClient.ts`) falls back to `http://127.0.0.1:8080` when there
+is no `window` — server-side. Nothing calls the backend from the server today (`proxy.ts`
+deliberately does not), so this never fires. If server-side code is ever added, note that
+`NEXT_PUBLIC_FRIDGE_API_URL` would send it out through the public origin and back in, which
+works but hairpins through Caddy and fails outright under split-horizon DNS.
+
 ## Is it alive?
 
 Logs:
@@ -162,6 +170,7 @@ Each blocks or degrades something after deploy. None is written by this task.
 | **The extension cannot reach a deployed backend.** `host_permissions` are exactly `localhost:8080` and `127.0.0.1:8080` | `apps/hunt-extension/manifest.json` | After deploy the extension reports `unpermitted` — Firefox MV3 grants host permissions per origin and the manifest never names the new one. Add the public origin, then re-grant via **Test connection**. Until then: no desktop alerts at all |
 | **The rate limiter cannot see the caller behind a proxy** | `apps/fridge-app/backend/src/rate_limit.rs` (10j, Codex) | See the risk table below. This is the one that can lock the user out |
 | **The tier file path is compiled in** | `src/internships/prestige.rs:97` | Resolve it from the executable's own directory or an env var instead of `CARGO_MANIFEST_DIR`, so the deployed layout stops being load-bearing |
+| **Three write paths still open *deferred* transactions** | `internships/expiry.rs:129`, `routes/auth.rs:367` and `:619` | `pool.begin()` cannot wait for a competing writer — it fails instantly with `SQLITE_BUSY_SNAPSHOT`, and the busy timeout is never consulted. Measured, not theorised: it took down 5 of 8 concurrent writes before Phase 10 switched its own writers to `db::begin_write` (`BEGIN IMMEDIATE`). The expiry sweep is a background writer, so it is a real collision candidate against the request path. One-line change each |
 
 ---
 

@@ -75,9 +75,14 @@ else
   if [[ "$db_path" != /* ]]; then
     problems+=("DATABASE_URL is a relative path ('$db_path'); it must be absolute")
   else
+    # Compare against THIS script's own checkout rather than a list of likely directory
+    # names: the list did not catch /srv/hunt/app, which is the layout this repo prescribes.
+    checkout_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     case "$db_path" in
-      */current/*|*/releases/*|*/repo/*|*/personal-website/*)
-        problems+=("DATABASE_URL ('$db_path') is inside a checkout; a redeploy would orphan it") ;;
+      "$checkout_root"/*)
+        problems+=("DATABASE_URL ('$db_path') is inside the checkout at $checkout_root; a redeploy would orphan it") ;;
+      */current/*|*/releases/*|*/repo/*)
+        problems+=("DATABASE_URL ('$db_path') looks like it is inside a checkout; a redeploy would orphan it") ;;
     esac
     db_dir="$(dirname "$db_path")"
     [[ -d "$db_dir" ]] || problems+=("DATABASE_URL directory $db_dir does not exist")

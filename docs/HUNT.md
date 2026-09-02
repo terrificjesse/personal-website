@@ -493,7 +493,7 @@ POST /hunt/proposals/{id}/reject        mark reviewed; undoes an auto-applied ch
 
 | Variable | Default | Effect |
 |---|---|---|
-| `INBOX_SYNC_INTERVAL_SECS` | unset | The unattended pass. `0` disables. Spawned in `main.rs:93`, never called from a request handler |
+| `INBOX_SYNC_INTERVAL_SECS` | **900s when unset** | The unattended pass. Unset is *not* off — `DEFAULT_SYNC_INTERVAL_SECS` is 900. `0` disables deliberately; a non-number disables it and logs, which looks identical to a Gmail outage from outside. Spawned in `main.rs:93`, never called from a request handler |
 | `INBOX_APPLY_LABELS` | **on** | `false` or `0` stops all mailbox writes without touching anything else (`sync.rs:354`) |
 | `INBOX_AUTO_APPLY_CONFIDENCE` | **unset — nothing auto-applies** | A float in `0.0..=1.0`. Only forwards, and **never `offer` or `rejected` at any confidence** |
 
