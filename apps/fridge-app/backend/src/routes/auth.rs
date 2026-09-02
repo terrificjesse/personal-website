@@ -365,7 +365,9 @@ pub async fn register(
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(&pool).await?;
 
     let insert =
         sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
@@ -633,7 +635,9 @@ async fn resolve_google_identity(
     let user_id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, NULL, ?)")
         .bind(&user_id)
@@ -927,5 +931,59 @@ mod credential_tests {
         assert_eq!(Credential::Session.actor(), "manual");
         // Never `manual`: the provenance rule is that an origin that cannot be proved says so.
         assert_eq!(Credential::Anonymous.actor(), "unknown");
+    }
+
+    // ---- the merge seam: rate-limited login (10j) meeting credential provenance (10e) ----
+
+    /// One flow through both branches' changes, which neither branch could have tested.
+    ///
+    /// 10j rewrote `login` to run behind a rate limiter and return `Response` instead of a
+    /// typed `Result`; 10e added the `Credential` extractor that reads the cookie `login`
+    /// issues. A clean textual merge says nothing about whether the cookie that comes out of
+    /// the new handler is still the one the new extractor recognises.
+    #[tokio::test]
+    async fn a_rate_limited_login_still_produces_a_session_credential() {
+        let pool = pool().await;
+        let email = "merge@example.com";
+        let password = "correct horse battery staple";
+
+        sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?1,?2,?3,?4)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(email)
+            .bind(crate::auth::hash_password(password).unwrap())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = login(
+            State(pool.clone()),
+            State(crate::rate_limit::RateLimits::default()),
+            crate::rate_limit::ClientIp(std::net::IpAddr::from([203, 0, 113, 9])),
+            CookieJar::new(),
+            Json(LoginRequest {
+                email: email.into(),
+                password: password.into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("login must still set a session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        // The cookie the rate-limited handler issued, read back by the extractor that decides
+        // what `application_events.actor` will say.
+        assert_eq!(
+            credential_for(&pool, &[("cookie", cookie)]).await,
+            Credential::Session
+        );
     }
 }

@@ -41,10 +41,32 @@ const REVIEW_MAX_SUBMISSIONS: usize = 30;
 const REVIEW_WINDOW: Duration = Duration::from_secs(60 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The direct TCP peer. Missing connection metadata collapses into one shared bucket rather
-/// than failing open; `main` supplies it with `into_make_service_with_connect_info`.
+/// Address used as the per-IP bucket key. Missing connection metadata collapses into one
+/// shared bucket rather than failing open; `main` supplies it with
+/// `into_make_service_with_connect_info`.
+///
+/// # Why a forwarded header is trusted, and only here
+///
+/// This deliberately did not trust `X-Forwarded-For`, because a caller-controlled header would
+/// make the IP limit optional. That is right for a directly-exposed server and **wrong behind
+/// the reverse proxy the deploy installs**: there the TCP peer is always loopback, so every
+/// caller on the internet shares one bucket — and an attacker can exhaust the login bucket and
+/// lock the real user out. A denial of service produced by the anti-denial-of-service measure.
+///
+/// So the header is trusted **only when the peer is loopback**. Nothing but the proxy on this
+/// host can be the peer there, and `deploy/Caddyfile` *sets* `X-Forwarded-For` to the address
+/// it saw rather than appending to it, so a header forged by a remote client does not survive
+/// the hop. From any non-loopback peer the header is ignored entirely — that is the case a
+/// direct-exposure deployment depends on, and it is the one the tests below exist for.
+///
+/// The **last** entry is taken, not the first: each hop appends the address it received from,
+/// so with exactly one trusted hop the rightmost value is the one the proxy wrote. The leftmost
+/// is whatever the client claimed.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientIp(pub IpAddr);
+
+/// The bucket every request with no connection metadata shares.
+const UNKNOWN_PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 impl<S> FromRequestParts<S> for ClientIp
 where
@@ -53,13 +75,37 @@ where
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let ip = parts
+        let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(address)| address.ip())
-            .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            .map(|ConnectInfo(address)| address.ip());
+
+        let ip = match peer {
+            Some(peer) if peer.is_loopback() => {
+                forwarded_for(&parts.headers).unwrap_or(peer)
+            }
+            Some(peer) => peer,
+            None => UNKNOWN_PEER,
+        };
         Ok(Self(ip))
     }
+}
+
+/// The last address in `X-Forwarded-For`, if the header is present and parses.
+///
+/// An unparseable header returns `None` and the caller falls back to the peer, which is the
+/// conservative direction: a malformed header must not become a distinct bucket key, or
+/// varying the garbage would mint a fresh allowance per request.
+fn forwarded_for(headers: &header::HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .rsplit(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -407,6 +453,101 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("JSON body"),
             serde_json::json!({ "error": "Too many requests. Try again later." })
+        );
+    }
+
+    // ---- the proxy trust boundary ----
+
+    fn parts_from(peer: Option<&str>, forwarded: Option<&str>) -> Parts {
+        let mut builder = axum::http::Request::builder();
+        if let Some(forwarded) = forwarded {
+            builder = builder.header("x-forwarded-for", forwarded);
+        }
+        let (mut parts, _) = builder.body(()).unwrap().into_parts();
+        if let Some(peer) = peer {
+            let address: SocketAddr = peer.parse().unwrap();
+            parts.extensions.insert(ConnectInfo(address));
+        }
+        parts
+    }
+
+    async fn client_ip(peer: Option<&str>, forwarded: Option<&str>) -> IpAddr {
+        let mut parts = parts_from(peer, forwarded);
+        let ClientIp(ip) = ClientIp::from_request_parts(&mut parts, &()).await.unwrap();
+        ip
+    }
+
+    /// Behind the proxy the deploy installs, this is the only thing that keeps the login
+    /// bucket per-caller instead of one bucket for the whole internet.
+    #[tokio::test]
+    async fn a_forwarded_header_is_honoured_from_a_loopback_peer() {
+        assert_eq!(
+            client_ip(Some("127.0.0.1:54321"), Some("203.0.113.7")).await,
+            IpAddr::from([203, 0, 113, 7])
+        );
+    }
+
+    /// **The one that matters.** If this ever passes the header through, any caller can mint
+    /// itself a fresh rate-limit allowance per request by varying a header it controls.
+    #[tokio::test]
+    async fn a_forwarded_header_is_ignored_from_a_remote_peer() {
+        assert_eq!(
+            client_ip(Some("198.51.100.9:44444"), Some("203.0.113.7")).await,
+            IpAddr::from([198, 51, 100, 9]),
+            "a header from a non-loopback peer is caller-controlled and must not be believed"
+        );
+    }
+
+    /// One trusted hop: each proxy appends what it saw, so the rightmost entry is the one our
+    /// proxy wrote and everything left of it is the client's own claim.
+    #[tokio::test]
+    async fn the_last_hop_wins_not_the_first() {
+        assert_eq!(
+            client_ip(Some("[::1]:54321"), Some("10.0.0.1, 203.0.113.7")).await,
+            IpAddr::from([203, 0, 113, 7])
+        );
+    }
+
+    /// A malformed header must not become its own bucket key — varying the garbage would mint
+    /// a fresh allowance per request.
+    #[tokio::test]
+    async fn an_unparseable_forwarded_header_falls_back_to_the_peer() {
+        assert_eq!(
+            client_ip(Some("127.0.0.1:54321"), Some("not-an-address")).await,
+            IpAddr::from([127, 0, 0, 1])
+        );
+    }
+
+    #[tokio::test]
+    async fn no_connection_metadata_shares_one_bucket_rather_than_failing_open() {
+        assert_eq!(client_ip(None, Some("203.0.113.7")).await, UNKNOWN_PEER);
+    }
+
+    /// Header shapes a proxy or an attacker can actually produce. None of these may panic, and
+    /// anything that does not parse cleanly must collapse to the peer rather than becoming a
+    /// bucket key of its own.
+    #[tokio::test]
+    async fn malformed_forwarded_headers_collapse_to_the_peer() {
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        for header in [
+            "",                       // present but empty
+            "203.0.113.7, ",          // trailing separator
+            ",",                      // separators only
+            "203.0.113.7:1234",       // an address:port, which some proxies write
+            "unknown",                // RFC 7239's placeholder
+            "   ",                    // whitespace
+        ] {
+            assert_eq!(
+                client_ip(Some("127.0.0.1:54321"), Some(header)).await,
+                loopback,
+                "{header:?} should have fallen back to the peer"
+            );
+        }
+
+        // IPv6 is a legitimate client address and must survive.
+        assert_eq!(
+            client_ip(Some("127.0.0.1:54321"), Some("2001:db8::1")).await,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
         );
     }
 }

@@ -1,13 +1,12 @@
 # Backend: Rust/axum, serving the fridge app, the blog, the internship tab and the hunt
 # alert channel. Install to /etc/systemd/system/personal-website-backend.service.
 #
-# The path below is deliberately NOT a dated release directory. `CompanyTiers::load()`
-# resolves its data file against `env!("CARGO_MANIFEST_DIR")` — the path the binary was BUILT
-# in — so a layout that builds in `releases/<date>/` and then prunes old releases leaves the
-# compiled-in path dangling. The tier file then fails to load, prestige silently becomes
-# derived-only, and the tier-1/2 alert predicate stops firing. The symptom is no
-# notifications, which is indistinguishable from a quiet job market.
-# See docs/DEPLOY.md § The build path is load-bearing.
+# A release-directory layout is now survivable: `CompanyTiers::load()` tries
+# INTERNSHIP_COMPANY_TIERS first, then the directory beside the executable, and only then the
+# path the binary was built in. Set INTERNSHIP_COMPANY_TIERS in the environment file if you
+# ever move the data away from the checkout, and check the "company tiers loaded from" line at
+# boot either way — the failure mode is no notifications, which is indistinguishable from a
+# quiet job market. See docs/DEPLOY.md § Where the tier file is found.
 
 [Unit]
 Description=Hunt backend (axum)
