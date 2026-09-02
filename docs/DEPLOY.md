@@ -37,24 +37,27 @@ database nobody writes to.
 /var/log/caddy/hunt.log   access log; app logs go to the journal
 ```
 
-### The build path is load-bearing
+### Where the tier file is found
 
-`internships::prestige::CompanyTiers::load()` resolves its data file against
-`env!("CARGO_MANIFEST_DIR")` — **the path the binary was built in, compiled into the binary**.
-A `releases/<date>/` layout that prunes old releases leaves that path dangling. The tier file
-then fails to load, prestige silently degrades to derived-only, and the tier-1/2 alert
-predicate stops firing.
+`CompanyTiers::load()` backs the tier-1/2 alert predicate, and losing it is silent: prestige
+degrades to derived-only and notifications stop, which is indistinguishable from a quiet job
+market. It used to resolve **only** against `env!("CARGO_MANIFEST_DIR")` — the path the binary
+was built in — which made the deployed layout load-bearing: a `releases/<date>/` directory that
+is later pruned leaves the compiled-in path dangling.
 
-The symptom is *no notifications*, which is indistinguishable from a quiet job market, and the
-only evidence is one log line at startup. So: **build in place at a stable path**, and check the
-line after every deploy:
+Fixed 2026-09-02. It now tries, in order: `INTERNSHIP_COMPANY_TIERS`, then
+`data/internships/company-tiers.json` beside the executable, then the build path. Building in
+place at `/opt/personal-website` still works with no configuration; a release-directory layout
+needs `INTERNSHIP_COMPANY_TIERS` set, and that is now a supported choice rather than a trap.
+
+Check it after every deploy, because this is the one subsystem whose failure looks like success:
 
 ```bash
 journalctl -u personal-website-backend --since "5 min ago" | grep -i "company tier"
 ```
 
-Silence there is good; `no company tier file at …` means alerting is degraded. The durable fix
-is a required change, listed below.
+`company tiers loaded from /…` is what you want. `NO COMPANY TIER FILE` names every path it
+tried and means alerting is degraded.
 
 ---
 
@@ -173,7 +176,7 @@ Each blocks or degrades something after deploy. None is written by this task.
 |---|---|---|
 | **The extension cannot reach a deployed backend.** `host_permissions` are exactly `localhost:8080` and `127.0.0.1:8080` | `apps/hunt-extension/manifest.json` | After deploy the extension reports `unpermitted` — Firefox MV3 grants host permissions per origin and the manifest never names the new one. Add the public origin, then re-grant via **Test connection**. Until then: no desktop alerts at all |
 | ~~The rate limiter cannot see the caller behind a proxy~~ | `apps/fridge-app/backend/src/rate_limit.rs` | **Done 2026-09-02.** `X-Forwarded-For` is trusted only when the TCP peer is loopback, taking the last hop. From any other peer it is ignored, which is the property a direct-exposure deployment depends on |
-| **The tier file path is compiled in** | `src/internships/prestige.rs:97` | Resolve it from the executable's own directory or an env var instead of `CARGO_MANIFEST_DIR`, so the deployed layout stops being load-bearing |
+| ~~The tier file path is compiled in~~ | `src/internships/prestige.rs` | **Done 2026-09-02.** `INTERNSHIP_COMPANY_TIERS`, then beside the executable, then the build path — and it now logs which one it read |
 | ~~Three write paths still open *deferred* transactions~~ | `internships/expiry.rs`, `routes/auth.rs` ×2 | **Done, and the original claim here was too strong.** Measured: all three passed under contention as they were, because a deferred transaction whose *first* statement is a write takes the lock there and the busy handler waits. The instant-failure case (`SQLITE_BUSY_SNAPSHOT`, no wait) is specific to **read-then-write** transactions — which is what `decide` was, and why it lost 5 of 8 concurrent writes. All three now use `db::begin_write` so that a future edit adding a SELECT above the first write cannot silently reintroduce it |
 
 ---
