@@ -215,9 +215,17 @@ const BULK: &[&str] = &[
 /// difference between a person writing to you and a system announcing something.
 fn is_machine_sender(from: &str) -> bool {
     let from = from.to_lowercase();
-    ["no-reply", "noreply", "donotreply", "do-not-reply", "notifications@", "mailer@"]
-        .iter()
-        .any(|marker| from.contains(marker))
+    [
+        "no-reply",
+        "noreply",
+        "donotreply",
+        "do-not-reply",
+        "notifications@",
+        "mailer@",
+        "systemmessage@",
+    ]
+    .iter()
+    .any(|marker| from.contains(marker))
 }
 
 /// Domains that only ever carry application mail.
@@ -565,6 +573,11 @@ mod tests {
     fn a_machine_at_an_unknown_domain_saying_nothing_specific_is_disregarded() {
         let verdict = classify_with("noreply@shop.example.com", "Your receipt", "Order #123");
         assert_eq!(verdict.category, Category::Disregarded);
+    }
+
+    #[test]
+    fn paycom_systemmessage_sender_is_a_machine() {
+        assert!(is_machine_sender("systemmessage@paycomonline.com"));
     }
 
     #[test]
