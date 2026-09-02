@@ -168,9 +168,12 @@ between noticing in an hour and noticing in a fortnight is whether anybody looks
 
 ---
 
-## Required code changes — named here because 10h does not own these files
+## Required code changes — all done as of 2026-09-02
 
-Each blocks or degrades something after deploy. None is written by this task.
+**Nothing in this section blocks the deploy any more.** It is kept struck through rather than
+deleted: each row is a defect that only became visible once someone wrote down what deploying
+actually involves, which is the argument for writing the runbook before the deploy rather than
+during it. All three were found by 10h and fixed by the sessions after it.
 
 | What | Where | Why it matters |
 |---|---|---|
