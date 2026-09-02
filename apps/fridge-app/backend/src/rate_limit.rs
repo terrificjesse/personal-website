@@ -522,4 +522,32 @@ mod tests {
     async fn no_connection_metadata_shares_one_bucket_rather_than_failing_open() {
         assert_eq!(client_ip(None, Some("203.0.113.7")).await, UNKNOWN_PEER);
     }
+
+    /// Header shapes a proxy or an attacker can actually produce. None of these may panic, and
+    /// anything that does not parse cleanly must collapse to the peer rather than becoming a
+    /// bucket key of its own.
+    #[tokio::test]
+    async fn malformed_forwarded_headers_collapse_to_the_peer() {
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        for header in [
+            "",                       // present but empty
+            "203.0.113.7, ",          // trailing separator
+            ",",                      // separators only
+            "203.0.113.7:1234",       // an address:port, which some proxies write
+            "unknown",                // RFC 7239's placeholder
+            "   ",                    // whitespace
+        ] {
+            assert_eq!(
+                client_ip(Some("127.0.0.1:54321"), Some(header)).await,
+                loopback,
+                "{header:?} should have fallen back to the peer"
+            );
+        }
+
+        // IPv6 is a legitimate client address and must survive.
+        assert_eq!(
+            client_ip(Some("127.0.0.1:54321"), Some("2001:db8::1")).await,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
 }
