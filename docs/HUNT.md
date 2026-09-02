@@ -716,6 +716,55 @@ testing the null would score every reconstructed response as silence.
 about the application changed. `Actor::Sweep` is still unconstructed and still reserved for
 dead-application detection, which the contract defines as derived and never stored.
 
+## Deadlines (Phase 11f)
+
+`inbox::due_dates` extracts a due date from a message; `application_deadlines` (migration
+`0023`) stores it beside the message it came from; `hunt::deadline` warns before it passes.
+Nothing here advances a status, writes `application_events`, or touches a mailbox.
+
+### The two decisions
+
+**Extraction is cue-anchored.** A date counts only when *due*, *deadline*, *expires*, *by*,
+*within*, *closes* appears within 48 characters before it. A bare date in an email is usually
+not a deadline — it is a meeting time, a copyright year, a forwarded `Date:` header — and a
+false deadline trains you to ignore the one channel whose alerts you cannot miss. Recall is
+traded for precision on purpose.
+
+**A bare date becomes 00:00 UTC: the START of the named day.** Deliberately the earliest
+reading rather than the likeliest one. The likeliest is end-of-day in the sender's timezone, up
+to 31 hours later, and taking it means alerting after a deadline that has already passed for
+the reader. *A day early is a nuisance; a day late is the failure this feature exists to
+prevent.* The residual risk is a sender at UTC+13 or beyond, where start-of-day local precedes
+start-of-day UTC; if that ever matters the fix is a fixed slack, not a guessed timezone.
+
+### What it can see, which is less than you would expect
+
+`gmail.rs` fetches `format=metadata` on purpose — *"it is a burner account, but it is still
+someone's mail"* — so **the body is never transferred**. Extraction sees the subject and
+Gmail's snippet, which across the real corpus averages **199 characters** (201 max). Deadlines
+usually sit further down a message than that.
+
+Measured 2026-09-02 over all **23** stored messages: **zero** extracted. The only date-shaped
+text in the corpus is an event range in a subject (`Roblox Week @ CMU - 9/8-9/10`) and a
+forwarded message's `Date: Sun, Aug 30` header — both exactly the false positives cue-anchoring
+refuses, and the second refused twice, since it also precedes the email carrying it.
+
+**So this feature does approximately nothing until either more mail arrives or bodies are
+fetched, and the second is a decision nobody has taken.** Fetching bodies would raise recall a
+great deal and would reverse a privacy choice recorded in `gmail.rs`; it also widens what
+untrusted text reaches the classifier. It is the user's call, not an agent's.
+
+### The alert
+
+`kind = 'deadline'`, its own kind rather than a nudge: the extension mutes by kind, and the
+checkbox that silences chatty follow-ups must not silence the one alert whose whole purpose is
+that missing it costs the opportunity. `subject_id` is `"{deadline_id}:{lead_hours}"`, so the
+24-hour warning is a different event from the 72-hour one and neither can repeat.
+
+`HUNT_DEADLINE_INTERVAL_SECS` (hourly by default, `0` disables) and
+`HUNT_DEADLINE_LEAD_HOURS` (`72,24`). **A deadline already past raises nothing** — a "you
+missed it" notification is noise arriving exactly when it can no longer help.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
