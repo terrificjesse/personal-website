@@ -36,6 +36,15 @@ use uuid::Uuid;
 
 use super::models::ApplicationStatus;
 
+/// Whether an event's destination proves that an application received a response.
+///
+/// Both analytics and the Phase 11 nudge producer use this predicate. Keeping it beside the
+/// event model prevents the dashboard and notifications from disagreeing about the same
+/// application. `Rejected` is a response; only another `applied` event is not.
+pub fn is_response_status(status: ApplicationStatus) -> bool {
+    status != ApplicationStatus::Applied
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Actor {
     Email,
