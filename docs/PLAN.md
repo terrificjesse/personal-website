@@ -1287,14 +1287,14 @@ that is actually about *you* rather than about the market.
 
 | # | Task | Tag | Lane | Primary | Swap | Est. |
 |---|---|---|---|---|---|---|
-| 12a | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
-| 12b | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
-| 12c | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
-| 12d | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
-| 12e | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
-| 12f | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
-| 12g | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
-| 12h | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
+| 12a ✅ | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
+| 12b ✅ | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
+| 12c ✅ | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
+| 12d ⬜ | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
+| 12e ⬜ | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
+| 12f ✅ | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
+| 12g ⬜ | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
+| 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
 
 **Load:** Claude Code ≈ 13h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1329,6 +1329,278 @@ exception was granted for the ranking, not for NLP. Three outcomes, all legitima
    file, and `f17d983` is what ignoring it costs.
 5. **12g is the only verification neither agent can do alone**, and it is the one that has been
    deferred twice. Two real forms, nothing submitted on either.
+
+---
+
+### 12b — the re-key measured, 2026-09-02, and it found something bigger than a merge risk
+
+Measured over a **consistent snapshot of the live database** (`sqlite3 .backup`, not `cp` — a
+collection run was writing at the time). 12a is purely additive — 351 lines added, none removed
+— so a posting's key can only change where the new parser recognises a host the old one did not.
+
+| | |
+|---|---|
+| Postings | **1,828** |
+| Keys that change | **481** (26%) |
+| ATS coverage | **707 → 1,188**, i.e. **38.7% → 65.0%** (§ C predicted 73%; previously measured 35%) |
+| Groups that would newly merge | **60** |
+| Groups that would split apart | **0** |
+| **True over-merges — distinct jobs colliding** | **0** |
+
+**The over-merge count is zero, and that is the headline.** All 60 merging groups are duplicates
+the *old* key wrongly kept apart:
+
+- **46** have byte-identical URLs in every row — the same posting stored twice, once before the
+  `gh_jid` query-param handling existed and once after.
+- **11** share one ATS job id under different titles (Epic Games' "Machine Learning Intern -
+  Special Projects" and "Machine Learning Research Intern" are one Greenhouse job with two
+  surface names).
+- **5** look like different companies and are not: `Tower Research` / `Tower Research Capital`,
+  `SpreeAI` / `SPREEAI`, `pony.ai` / `Pony.ai`, `Monolithic Power Systems` /
+  `Monolithic Power Systems, Inc.`, `Nightwing` / `Nightwing Intelligence Solutions` — same ATS,
+  same board, same job id. **These are exactly the cases the deferred fuzzy matcher (12d/12e)
+  exists for, and the ATS key solves them for free.** Worth knowing before that decision is made.
+
+### What the measurement actually surfaced
+
+**The next collection run will duplicate 481 postings rather than update them.**
+`collector::upsert_posting` computes `dedup_key(posting)` and relies on `ON CONFLICT` against
+the unique index to keep the existing row's id. A posting whose key changed does not conflict
+with its own row, so it is **inserted as a new row**; the old row then stops being seen, its
+disappearance counters climb, and it expires.
+
+Nobody planned this, and it is not a defect in 12a — it is what shipping a key change against a
+populated table means. It matters most for the **one application that reached OA**: of the two
+applications pointing at a posting, the Roblox one is inside a merging group and its key
+changes, so after the next uncapped run it points at a row that is on its way to expiring.
+
+### Recommendation — re-key, but only with repointing, and before the next uncapped run
+
+1. **Keep 12a as shipped.** Coverage 38.7% → 65.0%, zero splits, zero true over-merges. It is a
+   clear improvement and needs no revision.
+2. ~~Add a migration that re-keys existing rows and merges the affected groups~~ — **done,
+   `0025_rekey_ats_postings.sql`.** Applied to a copy: 1,828 → 1,764 postings, ATS-keyed
+   707 → 1,120, zero orphaned applications or sightings, and the Roblox application repointed
+   to its survivor. It is a generated list of literal ids rather than logic, because
+   `ats_identity` is Rust and a boot-time routine would decide at runtime what to merge. Three
+   defects surfaced by applying it to a copy rather than reading it: a UNIQUE collision from
+   claim-before-release (fixed with a two-phase swap through `rekey-0025:<id>`), a second from
+   rewriting both rows of a *refused* group to their shared key, and `sqlx::migrate!` embedding
+   at compile time so a changed `.sql` needs `touch src/main.rs` before it is really being
+   tested. The original recommendation to
+   **repoints `internship_applications.posting_id` at the surviving row before deleting the
+   loser**. Test it against the Roblox row specifically, by name: it is the one row in this
+   database whose loss would be felt.
+3. **Do not simply do nothing.** Doing nothing produces the same 60 merges anyway, via new rows
+   and expiry, but *without* repointing anything — strictly worse than doing it deliberately.
+   "Leave it and let expiry sort it out" is the option that looks cheapest and is not.
+
+**What would change this recommendation:** a non-zero true over-merge count, or evidence that
+any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
+id. Neither appeared in 1,828 rows.
+
+### 12c — the first uncapped run: what it needs and what to watch
+
+**Not run yet.** It is `[you]`: it fetches from every live source and takes roughly ten minutes
+(sources are polled one host at a time to stay polite). Everything below is the preparation, so
+the run itself is a decision rather than a project.
+
+**Before it:** take a backup (`ops/backup-fridge-db.sh`). This is the first run permitted to
+expire anything, and expiry is the one thing here that removes rows nobody asked it to.
+
+**The environment.** Unset `INTERNSHIP_MAX_BOARDS_PER_RUN` entirely and leave
+`INTERNSHIP_DISABLED_SOURCES` empty. **A cap is not a smaller version of this run — it is a
+different run**: a capped source reports `partial` by construction, and `partial` is never
+permitted to advance disappearance counters. Every measurement below is unavailable under a cap,
+which is why the last pay-coverage number (2 of 808) means nothing.
+
+**What "it worked" looks like:**
+
+- Every source reaches `success`, `partial` or `failed` on its own merits, and **none is
+  `skipped`** for reasons of the cap. `source_runs.counts_for_expiry = 1` for the successful
+  ones — that flag flipping true for the first time is the actual event here.
+- `consecutive_misses` advances for postings the successful sources did not return, and
+  `swept_vanished` is non-zero once a source crosses `INTERNSHIP_MISS_THRESHOLD`. Expiry firing
+  for the first time is the point of the run.
+- **Pay coverage measured honestly.** § B expects "well under half"; the standing figure of 2 of
+  808 is an artefact of Simplify (which carries no salary at all) having supplied almost
+  everything under the cap. This run is the first that can answer the question.
+- **A prediction worth checking, from the capped run:** Tower Research gains one row —
+  `ats:greenhouse:gh_jid:8044334` — beside its two stale `co:` rows, exactly as Nightwing did.
+  If it does not, something about that URL does not parse and § C wants to know.
+
+**What makes it a failure rather than a slow success:**
+
+- **A source failing is a normal run.** The scraping rules are explicit: LinkedIn, Indeed and
+  Handshake are best-effort, and a run where all three fail is normal. Do not treat a failure
+  count as the result.
+- It is a failure if a **failed or partial** source's postings get expired — that is the named
+  data-loss bug of Phase 7, and `a_failed_source_does_not_expire_the_postings_it_previously_supplied`
+  is the test that says it must not happen.
+- It is a failure if `postings_created` is large relative to `accepted` — that would mean keys
+  are still diverging after 0025, and the corpus is re-accumulating duplicates.
+- It is a failure if expiry removes a posting an application points at. There are two such
+  applications; check them by id before and after.
+
+### 12c — the first uncapped run, 2026-09-02
+
+Backup taken first (`fridge-20260902T204138Z.db`). ~15 minutes, every source attempted.
+
+```
+fetched 49,913 · accepted 2,058 · filtered 47,854
+postings_created 81 · postings_updated 1,977 · alerts_created 1
+swept_deadline 0 · swept_vanished 0 · marked_closed 15
+```
+
+| Source | Outcome | Counts for expiry |
+|---|---|---|
+| vanshb03, simplify, lever, ashby | success | **yes** — the first time this flag has ever been true for four sources at once |
+| greenhouse | partial (1 of 485 boards failed: a network error on `designmehair`) | no |
+| weworkremotely | partial (the feed publishes only recent postings and is never a complete enumeration) | no |
+| linkedin, indeed, handshake | skipped | no |
+
+**The skips are the scraping rules working, not a cap.** LinkedIn's robots.txt disallows every
+path and carries an explicit notice against automated access; Indeed permits `/jobs` in robots
+but answers a polite, honestly-identified GET with a 403 behind a CAPTCHA. Both are recorded as
+skipped with the reason, which is what "give up quickly when a source pushes back" looks like
+when it is written down instead of retried.
+
+**Pay coverage: 105 of 1,845 (5.7%).** § B expected "well under half" and the standing figure of
+2 of 808 was an artefact of the cap. 5.7% is the honest number, and it is stable — the uncapped
+run added no pay data, because the sources that carry salary are the ATS ones and they are a
+small share of the corpus.
+
+### Three findings, one of which corrects an earlier claim in this document
+
+**1. Greenhouse can almost never expire anything.** One failed board out of 485 makes the whole
+source `partial`, and `partial` may never advance disappearance counters. That is exactly the
+rule Phase 7 wanted — a blocked fetch must not expire what it used to supply — but at 485 boards
+the chance of a clean sweep is small, so in practice the largest ATS source is permanently
+disqualified from expiry. Worth deciding deliberately rather than discovering later: per-board
+outcomes, rather than one verdict for the source, would let the 484 that succeeded count.
+
+**2. Expiry still did not fire (`swept_vanished 0`), and that is correct.** The threshold is 3
+consecutive expiry-eligible runs, and this was the first. Counters advanced — sightings with
+misses went 275 → 280, and the run's own eligible sources will advance them again next time.
+Two more uncapped runs are needed before anything vanishes.
+
+**3. ~~The stale rows go quiet, and expiry removes them.~~ It does not, and they are immortal.**
+The previous section claimed the refused groups self-heal. They do not.
+
+When a re-key makes a sighting compute a different key, the sighting is **moved onto the row
+that holds that key** — `UNIQUE (source, external_id)` means it is updated, not duplicated. The
+row it left keeps no sightings at all. And `expiry.rs:260` will never sweep a posting with zero
+sightings, deliberately and with the reasoning attached: `NOT EXISTS (a sighting below
+threshold)` is vacuously true for a posting with none, so without that guard a brand-new posting
+whose sightings failed to record would expire on its first sweep.
+
+The consequence nobody had traced: **a posting whose sightings all migrate away can never
+expire.** There are **4** such rows live today, two of them the stale Tower Research rows this
+run vacated. It is a slow leak rather than a problem — 4 rows in 1,643 — but the "it self-heals"
+argument for refusing to merge is void, and should not be reused.
+
+**Recommended:** a follow-up migration deleting orphaned postings that have no sightings, no
+applications, and were created before this run. The alternative — teaching the sweep to expire
+sighting-less rows past an age — reopens exactly the hazard the guard was written for, and is a
+change to `expiry.rs` that wants its own decision.
+
+**Tower Research, the falsifiable prediction: wrong in its detail, right in its mechanism.** It
+did not gain a fourth row, because the `ats:greenhouse:gh_jid:8044334` row already existed —
+both sightings simply moved onto it, and the two `co:` rows were left with none. The prediction
+of "one new row per refused group" holds only where no ATS-keyed row exists yet.
+
+**The two applications are intact**, both still pointing at present postings.
+
+### 0025 verified against a real collection run, 2026-09-02
+
+The migration was argued for on a claim about `upsert_posting`, verified against copies and
+against the schema, and applied to the real database — but never watched during a collection,
+which is the only thing that could show the claim was wrong. A capped run (Simplify only, board
+cap 2) against a snapshot of the post-0025 database:
+
+```
+fetched 2,763 · accepted 1,328 · postings_created 79 · postings_updated 1,249
+```
+
+**335 of the 413 re-keyed postings were re-seen and updated rather than duplicated**, and all
+413 are still present. That is the premise confirmed on live data: without 0025 those 335 would
+have computed a key no row held and been inserted as new rows, with the originals left to
+expire.
+
+Postings sharing a canonical URL went **24 → 25**. Exactly one duplicate appeared, and it is the
+interesting one.
+
+### The refusal has a cost, and it is self-healing
+
+The new duplicate is `ats:workday:nwis.wd12:JR101733` — the ATS-keyed row for a job the two
+stale `co:`-keyed **Nightwing** rows already represent. That is one of the two groups 0025
+deliberately refused to merge.
+
+**Refusing to merge does not leave things as they were.** It leaves rows carrying keys that no
+longer match what the collector computes, so the next run inserts the ATS-keyed row alongside
+them. The choice was never "merge or leave alone"; it was "merge, or gain one row per refused
+group at the next collection".
+
+That is still the right call, but **the end state is not what this paragraph originally claimed
+— see 12c below.** The new `ats:` row is the one future runs update and the `co:` rows do go
+stale, but they are never expired: their sightings migrate away, and a posting with no sightings
+is deliberately never swept. They are permanent.
+The cost is a transient duplicate and the loss of the old rows' sighting history — acceptable
+here because **no application points at either of them**. Had one done so, this would need the
+repointing 0025 does for the merged groups, and the refusal would have been the wrong call.
+
+Tower Research stayed at 3 rows this run: its posting was not re-fetched under the board cap.
+Expect the same one-row addition there on a run that reaches it.
+
+### The two counts, reconciled 2026-09-02
+
+Exactly, not plausibly. Their tool filters to the three parsers 12a added —
+`matches!(identity.ats.as_str(), "workday" | "workable" | "rippling")` — and treats every other
+sighting as keeping its stored key. The independent probe recomputes every key from each
+posting's canonical URL.
+
+| | Groups |
+|---|---|
+| Probe (all postings, canonical URL, any ATS) | **60** — greenhouse 46, workday 11, rippling 2, workable 1 |
+| Their tool (sightings, three new parsers only) | **18** |
+| In the probe only | **46** — every one Greenhouse, which their filter excludes by design |
+| In their tool only | **4** — Workday rows whose *sighting* URL yields an identity where the posting's canonical URL does not |
+
+60 − 46 = 14 shared, + 4 = **18**. The arithmetic closes; both tools are correct about different
+questions. Theirs measures *what 12a caused*. The probe measures *what the next collection run
+will do*, which is the question a migration has to answer — and the 46 Greenhouse groups are
+rows whose stored keys predate an earlier parser fix and were never back-applied.
+
+The third hypothesis on record — the 53 postings with no sighting — is **killed**: every
+probe-only group is explained by the ATS filter.
+
+**The definitive set is 60 groups**, of which the conservative rule merges **58** and refuses 2.
+
+### Two measurements, and they do not agree on the count
+
+**Correction to an earlier claim in this section: the 12a handoff DID happen, and the first
+version of this write-up said it had not.** `861dce0` ships
+`dedup::tests::report_new_ats_key_merge_and_split_candidates` — an `#[ignore = "…"]` test —
+and § C documents the exact `sqlite3 .backup` command and invocation. It was missed by checking
+the commit's *file list* rather than reading § C, which is the file this task was told to read
+first. The error is worth keeping visible: it produced a public claim that another agent had
+skipped its work, from evidence that never supported it.
+
+Running Codex's tool against the same snapshot reports **18 merge candidates**, where the
+independent measurement above found **60 groups**. They measure different populations:
+
+| | This section's probe | `report_new_ats_key_merge_and_split_candidates` |
+|---|---|---|
+| Source of the URL | `internship_postings.canonical_url`, one per posting | `posting_sightings.url`, one per source per posting |
+| Population | all 1,828 postings | the 1,775 with at least one sighting |
+| Counts a group where one row already carries the new key | yes | apparently not |
+
+**The disagreement does not change the recommendation** — both report zero splits, every group
+either measurement prints is a duplicate rather than two different jobs, and the
+upsert-creates-a-new-row finding below is independent of either count. But **a migration would
+need the exact set**, not the direction, so reconciling the two is a prerequisite for step 2
+and not for the decision. The sighting-based population is the more faithful one to how
+collection actually keys a posting, and is where a reconciliation should start.
 
 ---
 
