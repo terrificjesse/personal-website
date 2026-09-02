@@ -126,7 +126,13 @@ pub async fn settle_source_run(
         SourceOutcome::Skipped => "skipped",
     };
 
-    let mut tx = pool.begin().await?;
+    // `begin_write`, not `begin()`. This transaction's first statement is a write today, so a
+    // deferred BEGIN would take the write lock there and the busy handler would do its job —
+    // measured, in `concurrent_source_settlements_do_not_collide`, which passes either way.
+    // What it must not depend on is *staying* that way: adding a SELECT above the INSERT would
+    // silently turn this into a read-then-write transaction, and those fail instantly under a
+    // competing writer with no wait. See `db::begin_write`.
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO source_runs
@@ -288,6 +294,7 @@ pub fn miss_threshold() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     // ---- the eligibility rule, which is the whole of trap 2 ----
 
@@ -380,5 +387,66 @@ mod tests {
             None,
             "0 must not be accepted as a threshold"
         );
+    }
+
+    // ---- concurrency: the sweep is a background writer sharing a pool with the request path ----
+
+    /// Eight sources settling at once, which is what a collection run does at the end.
+    ///
+    /// The sweep writes on its own schedule while requests are being served, so it is the
+    /// most likely collision partner for anything on the request path. This asserts the whole
+    /// call succeeds under contention rather than that any particular locking scheme is used.
+    #[tokio::test]
+    async fn concurrent_source_settlements_do_not_collide() {
+        let path = std::env::temp_dir().join(format!("expiry-concurrency-{}.db", Uuid::new_v4()));
+        let pool = crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations");
+
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        // `source_runs.run_id` is a real enforced foreign key, so the parent has to exist.
+        sqlx::query(
+            "INSERT INTO collection_runs (id, started_at, trigger) VALUES (?1, ?2, 'manual')",
+        )
+        .bind(&run_id)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let pool = pool.clone();
+            let run_id = run_id.clone();
+            handles.push(tokio::spawn(async move {
+                let result = SourceRunResult {
+                    source: format!("source-{index}"),
+                    outcome: SourceOutcome::Success,
+                    seen_external_ids: Vec::new(),
+                    fetched: 10,
+                    accepted: 10,
+                    filtered: 0,
+                    rejected: 0,
+                    error: None,
+                };
+                settle_source_run(&pool, &run_id, &Uuid::new_v4().to_string(), &result, now).await
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("a settlement failed under contention");
+        }
+
+        let settled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_runs WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(settled, 8);
     }
 }

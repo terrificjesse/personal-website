@@ -365,7 +365,9 @@ pub async fn register(
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(&pool).await?;
 
     let insert =
         sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
@@ -633,7 +635,9 @@ async fn resolve_google_identity(
     let user_id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, NULL, ?)")
         .bind(&user_id)
