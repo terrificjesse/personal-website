@@ -1289,7 +1289,7 @@ that is actually about *you* rather than about the market.
 |---|---|---|---|---|---|---|
 | 12a ✅ | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
 | 12b ✅ | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
-| 12c ⬜ | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
+| 12c ✅ | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
 | 12d ⬜ | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
 | 12e ⬜ | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
 | 12f ✅ | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
@@ -1442,6 +1442,75 @@ which is why the last pay-coverage number (2 of 808) means nothing.
 - It is a failure if expiry removes a posting an application points at. There are two such
   applications; check them by id before and after.
 
+### 12c — the first uncapped run, 2026-09-02
+
+Backup taken first (`fridge-20260902T204138Z.db`). ~15 minutes, every source attempted.
+
+```
+fetched 49,913 · accepted 2,058 · filtered 47,854
+postings_created 81 · postings_updated 1,977 · alerts_created 1
+swept_deadline 0 · swept_vanished 0 · marked_closed 15
+```
+
+| Source | Outcome | Counts for expiry |
+|---|---|---|
+| vanshb03, simplify, lever, ashby | success | **yes** — the first time this flag has ever been true for four sources at once |
+| greenhouse | partial (1 of 485 boards failed: a network error on `designmehair`) | no |
+| weworkremotely | partial (the feed publishes only recent postings and is never a complete enumeration) | no |
+| linkedin, indeed, handshake | skipped | no |
+
+**The skips are the scraping rules working, not a cap.** LinkedIn's robots.txt disallows every
+path and carries an explicit notice against automated access; Indeed permits `/jobs` in robots
+but answers a polite, honestly-identified GET with a 403 behind a CAPTCHA. Both are recorded as
+skipped with the reason, which is what "give up quickly when a source pushes back" looks like
+when it is written down instead of retried.
+
+**Pay coverage: 105 of 1,845 (5.7%).** § B expected "well under half" and the standing figure of
+2 of 808 was an artefact of the cap. 5.7% is the honest number, and it is stable — the uncapped
+run added no pay data, because the sources that carry salary are the ATS ones and they are a
+small share of the corpus.
+
+### Three findings, one of which corrects an earlier claim in this document
+
+**1. Greenhouse can almost never expire anything.** One failed board out of 485 makes the whole
+source `partial`, and `partial` may never advance disappearance counters. That is exactly the
+rule Phase 7 wanted — a blocked fetch must not expire what it used to supply — but at 485 boards
+the chance of a clean sweep is small, so in practice the largest ATS source is permanently
+disqualified from expiry. Worth deciding deliberately rather than discovering later: per-board
+outcomes, rather than one verdict for the source, would let the 484 that succeeded count.
+
+**2. Expiry still did not fire (`swept_vanished 0`), and that is correct.** The threshold is 3
+consecutive expiry-eligible runs, and this was the first. Counters advanced — sightings with
+misses went 275 → 280, and the run's own eligible sources will advance them again next time.
+Two more uncapped runs are needed before anything vanishes.
+
+**3. ~~The stale rows go quiet, and expiry removes them.~~ It does not, and they are immortal.**
+The previous section claimed the refused groups self-heal. They do not.
+
+When a re-key makes a sighting compute a different key, the sighting is **moved onto the row
+that holds that key** — `UNIQUE (source, external_id)` means it is updated, not duplicated. The
+row it left keeps no sightings at all. And `expiry.rs:260` will never sweep a posting with zero
+sightings, deliberately and with the reasoning attached: `NOT EXISTS (a sighting below
+threshold)` is vacuously true for a posting with none, so without that guard a brand-new posting
+whose sightings failed to record would expire on its first sweep.
+
+The consequence nobody had traced: **a posting whose sightings all migrate away can never
+expire.** There are **4** such rows live today, two of them the stale Tower Research rows this
+run vacated. It is a slow leak rather than a problem — 4 rows in 1,643 — but the "it self-heals"
+argument for refusing to merge is void, and should not be reused.
+
+**Recommended:** a follow-up migration deleting orphaned postings that have no sightings, no
+applications, and were created before this run. The alternative — teaching the sweep to expire
+sighting-less rows past an age — reopens exactly the hazard the guard was written for, and is a
+change to `expiry.rs` that wants its own decision.
+
+**Tower Research, the falsifiable prediction: wrong in its detail, right in its mechanism.** It
+did not gain a fourth row, because the `ats:greenhouse:gh_jid:8044334` row already existed —
+both sightings simply moved onto it, and the two `co:` rows were left with none. The prediction
+of "one new row per refused group" holds only where no ATS-keyed row exists yet.
+
+**The two applications are intact**, both still pointing at present postings.
+
 ### 0025 verified against a real collection run, 2026-09-02
 
 The migration was argued for on a claim about `upsert_posting`, verified against copies and
@@ -1472,8 +1541,10 @@ longer match what the collector computes, so the next run inserts the ATS-keyed 
 them. The choice was never "merge or leave alone"; it was "merge, or gain one row per refused
 group at the next collection".
 
-That is still the right call, and the end state is correct without a risky merge: the new
-`ats:` row is the one future runs update, the two `co:` rows go stale, and expiry removes them.
+That is still the right call, but **the end state is not what this paragraph originally claimed
+— see 12c below.** The new `ats:` row is the one future runs update and the `co:` rows do go
+stale, but they are never expired: their sightings migrate away, and a posting with no sightings
+is deliberately never swept. They are permanent.
 The cost is a transient duplicate and the loss of the old rows' sighting history — acceptable
 here because **no application points at either of them**. Had one done so, this would need the
 repointing 0025 does for the merged groups, and the refusal would have been the wrong call.
