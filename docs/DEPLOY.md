@@ -283,10 +283,21 @@ Nothing below can be done by an agent: it needs an account, a card, DNS, or a de
 6. Create the Google Cloud OAuth client and register **both** redirect URIs.
 7. Fill `/etc/personal-website/backend.env` from `deploy/env.production.example` and run the preflight.
 8. Deploy per **First deploy**, then confirm **Is it alive?** — including the company-tier line.
-9. Update the extension: set its Settings backend URL to `https://hunt.example.com/api` and
+9. **Run the event backfill once**, before looking at any analytics:
+
+   ```bash
+   sudo -u personal-website ./fridge_backend application-events backfill
+   ```
+
+   Without it the dashboard is not empty — it is *wrong*. `applications` is counted from the
+   applications table while every conversion number comes from `application_events`, so an
+   un-backfilled database shows a populated funnel in which nothing has ever responded.
+   Measured on a real copy during Checkpoint 11: `responded 0 → 1`, `reached_oa 0 → 1`, with no
+   indication in the response that the log had been empty.
+10. Update the extension: set its Settings backend URL to `https://hunt.example.com/api` and
    press **Test connection**, which is what triggers Firefox's permission prompt for that
    origin — accept it. No manifest edit and no reload: the grant is per origin and happens at
    runtime. The backend must also name the extension's own `moz-extension://…` origin in
    `ALLOWED_ORIGINS`; **Test connection** prints the exact value when it is missing.
-10. Watch it for 48 hours without touching it. That is Checkpoint 10, and it is also when the
+11. Watch it for 48 hours without touching it. That is Checkpoint 10, and it is also when the
     corpus Phase 13 needs begins to accumulate.
