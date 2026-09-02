@@ -33,7 +33,7 @@ const DEFAULTS = {
   token: "",
   siteUrl: "http://localhost:3000",
   pollMinutes: 5,
-  kinds: { posting: true, email: true },
+  kinds: { posting: true, email: true, nudge: true },
   maxNotificationsPerPoll: 3,
 };
 
@@ -55,6 +55,9 @@ async function load() {
   }
   document.getElementById("kind-posting").checked = settings.kinds.posting !== false;
   document.getElementById("kind-email").checked = settings.kinds.email !== false;
+  // `!== false` and not a truthiness check: a kind absent from stored settings is enabled,
+  // which is what `background.js`'s `kindEnabled` does with it too.
+  document.getElementById("kind-nudge").checked = settings.kinds.nudge !== false;
 }
 
 function fromForm() {
@@ -70,6 +73,7 @@ function fromForm() {
     kinds: {
       posting: document.getElementById("kind-posting").checked,
       email: document.getElementById("kind-email").checked,
+      nudge: document.getElementById("kind-nudge").checked,
     },
   };
 }

@@ -97,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
     // server binding its port. Placed here because it needs the Google config above.
     inbox::sync::spawn(pool.clone(), google_oauth.clone());
 
+    // The follow-up sweep. Reads applications and writes `hunt_events`; never called from a
+    // request handler, and disabled cleanly with `HUNT_NUDGE_INTERVAL_SECS=0`.
+    hunt::nudge::spawn(pool.clone());
+
     // Sets up the router so the server is ready to handle HTTP requests from the frontend when the listening socket is set up
     let app = routes::build_router(routes::AppState {
         pool,

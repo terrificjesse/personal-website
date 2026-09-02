@@ -265,6 +265,30 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
     }
 }
 
+/// SQL that is true for an application which has had a **response**.
+///
+/// The definition is `docs/HUNT.md` § The analytics contract: *the first event after creation
+/// whose `to_status` is not `applied`, whatever the actor*. Written once, as a fragment, so the
+/// analytics endpoint (11b) and the nudge sweep (11e) cannot drift into disagreeing about the
+/// same application — a dashboard that says "they replied" beside a notification that says
+/// "chase them" is worse than either alone.
+///
+/// The correlated subquery excludes the **earliest** event rather than testing `from_status IS
+/// NULL`, and the difference matters: a backfilled fallback event also has a NULL
+/// `from_status`, and it represents a real transition whose provenance simply could not be
+/// proved. Testing the null would silently score every backfilled response as no response.
+///
+/// The fragment expects the applications table to be aliased `a`.
+pub const HAS_RESPONDED: &str = "EXISTS (
+    SELECT 1 FROM application_events e
+     WHERE e.application_id = a.id
+       AND e.to_status <> 'applied'
+       AND e.id <> (SELECT e2.id FROM application_events e2
+                     WHERE e2.application_id = a.id
+                     ORDER BY e2.at ASC, e2.created_at ASC, e2.id ASC
+                     LIMIT 1)
+)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldMismatch {
     pub application_id: String,

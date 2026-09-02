@@ -17,5 +17,6 @@
 
 pub mod answers;
 pub mod events;
+pub mod nudge;
 pub mod profile;
 pub mod tokens;
