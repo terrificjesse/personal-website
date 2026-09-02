@@ -155,12 +155,18 @@ what the classifier proposes" — the number 13e needs to set a confidence thres
 to ask.
 
 **`extension` is decided by the credential, not by a field in the request body.** The extension
-authenticates with a `hunt_tokens` bearer and the site with a session cookie, and which one
-arrived is already known inside `MaybeUser` (`src/routes/auth.rs:71`). 10e adds one field there
-carrying it through to `CurrentUser`. The alternative — the client asserting `source:
-"extension"` — is a claim by the party being described, and it is wrong exactly when someone is
-debugging why it is wrong. **If 10e lands before that field exists, the creation event records
-`unknown`**, never a guess.
+authenticates with a `hunt_tokens` bearer and the site with a session cookie. The alternative —
+the client asserting `source: "extension"` — is a claim by the party being described, and it is
+wrong exactly when someone is debugging why it is wrong.
+
+**Shipped 2026-09-02 as `routes::auth::Credential`**, not as the field on `CurrentUser` this
+paragraph originally predicted: `CurrentUser` is a tuple struct destructured at 42 call sites
+across 7 route files, and all 42 would have changed so that one handler could read one value.
+`Credential` is its own extractor, so only the handler that cares mentions it. Resolution is
+cached in the request extensions and shared with `MaybeUser`/`CurrentUser`, so a handler taking
+both validates once and cannot get two different answers from the two extractors.
+`Credential::actor()` is the mapping, in one place: `HuntToken → extension`, `Session → manual`,
+`Anonymous → unknown`.
 
 ### `cause_id` is a loose reference, deliberately
 
@@ -307,6 +313,37 @@ the reason `record` takes a `&mut Transaction` rather than a pool. The same appl
    `routes/internships.rs:31`, which is where migration `0012`'s note had to move to.
 2. **Do not take `0022`.** Lane A owns `0021–0029`; `0021` is this table and the rest are
    unassigned. Announce a number before using it.
+
+### Handoff — 10e part 1 landed 2026-09-02, and what 10d can now assume
+
+The two halves of 10e that do not need the table are done (`d0caf73`, `8cb4c10`). What changed
+that `record()` depends on:
+
+**Every status write now runs inside a transaction, so there is something to hang `record` on.**
+None of them was transactional before, and one was actively losing writes:
+
+| Call site | The transaction | What it was |
+|---|---|---|
+| `routes::inbox::decide` (`src/routes/inbox.rs:356`) | Opens at the top, commits after the proposal is marked reviewed | Two statements, and the application UPDATE's `Result` was discarded with `let _ =` — a failed status change left the proposal *reviewed and accepted* while the tracker never moved |
+| `routes::internships::update_application` (`src/routes/internships.rs:262`) | Wraps the status and notes updates together | Two independent statements; half an edit could land and still return 200 |
+| `inbox::sync::propose_status` (`src/inbox/sync.rs:486`) | Wraps the `status_proposals` INSERT with the auto-apply UPDATE | A proposal could survive a failed UPDATE while claiming `applied_automatically = 1`, which the panel renders as *"already applied — rejecting undoes it"* |
+
+Both status updates now assert `rows_affected() == 1`. Three tests in `routes::inbox::decide_tests`
+pin it, including one that forces a real database failure on the undo path.
+
+**The credential is available as an extractor**, described above: `routes::auth::Credential`,
+with `Credential::actor()` returning `"extension"` / `"manual"` / `"unknown"`. When 10d lands the
+`Actor` enum, that method becomes a `From<Credential> for Actor` and the `&'static str` goes
+away — it is deliberately the events table's vocabulary and not a second one.
+
+**What 10d still does not need from 10e.** The backfill has no live credential to read and
+records `unknown` for every creation event regardless, so nothing here blocks it.
+
+**What is left of 10e** is the part that needs the table: adding `record(&mut tx, …)` inside the
+three transactions above, plus `routes::internships::create_application`, which currently logs
+its provenance rather than storing it (`internships.rs:225`). That is one commit once 10d
+merges, and 10f's fold invariant then covers live writes as well as backfilled ones — so run it
+again after that, not only after the backfill.
 
 ### Handoff — ready for 10d
 
