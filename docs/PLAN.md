@@ -1098,8 +1098,25 @@ to, and found out at the first restore. Unified on 10i's naming.
 
 - The backend has run **48 unattended hours** on the deployed host with the laptop closed, and
   `inbox_runs` shows successful incremental passes with an advancing `historyId` watermark.
-- `application_events` contains rows from **all four actors** — `email`, `extension`, `manual`,
-  `sweep` — and `status == fold(events)` holds for every application in a copy of the live DB.
+- `application_events` contains rows from `extension`, `manual` and `unknown`, and
+  `status == fold(events)` holds for every application in a copy of the live DB.
+
+  **This clause originally said "all four actors — `email`, `extension`, `manual`, `sweep`",
+  and that was unmeetable by two decisions taken after it was written.** Corrected 2026-09-02
+  rather than quietly failed:
+
+  - **`sweep` has no producer at all.** 10c reserved the value and said so; Phase 11's
+    dead-application detection is the first thing that will write one. Asking for it here was
+    asking for a row nothing can create.
+  - **`email` requires auto-apply, which is deliberately off.** `auto_apply_threshold()`
+    returns `None` until `INBOX_AUTO_APPLY_CONFIDENCE` is set, and setting it is **13e**, after
+    Phase 13 measures a real number. A classified email still writes a `status_proposals` row —
+    rule 2 — but the status does not move, so there is no transition to record. An `email`
+    actor row appearing during Phase 10 would mean the threshold had been guessed.
+
+  `unknown` replaces them: it is what the backfill writes for history whose origin cannot be
+  proved, and its presence is evidence the backfill ran. The full four-actor check belongs to
+  Phase 13's checkpoint, once 13e sets the threshold.
 - The restore drill produced a working database from a backup **before** it was needed.
 - A cookie issued by the deployed backend carries `Secure`.
 - The login limiter refuses the eleventh attempt and the log says so.
