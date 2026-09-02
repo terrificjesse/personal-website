@@ -1295,8 +1295,9 @@ that is actually about *you* rather than about the market.
 | 12f ✅ | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
 | 12g ⬜ | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
 | 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
+| 12i ✅ | **Scoped expiry** — per-board verdicts, so one dead board out of 485 stops disqualifying Greenhouse. Found by 12c | `[gen]` | A (+ the panel half) | Claude Code | ✅ | 4–5h |
 
-**Load:** Claude Code ≈ 13h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
+**Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
 
 ### The decision in 12d, stated plainly so it can be made in one sitting
@@ -1478,6 +1479,7 @@ rule Phase 7 wanted — a blocked fetch must not expire what it used to supply �
 the chance of a clean sweep is small, so in practice the largest ATS source is permanently
 disqualified from expiry. Worth deciding deliberately rather than discovering later: per-board
 outcomes, rather than one verdict for the source, would let the 484 that succeeded count.
+**Decided and built — see 12i below.**
 
 **2. Expiry still did not fire (`swept_vanished 0`), and that is correct.** The threshold is 3
 consecutive expiry-eligible runs, and this was the first. Counters advanced — sightings with
@@ -1510,6 +1512,75 @@ both sightings simply moved onto it, and the two `co:` rows were left with none.
 of "one new row per refused group" holds only where no ATS-keyed row exists yet.
 
 **The two applications are intact**, both still pointing at present postings.
+
+### 12i — scoped expiry, 2026-09-02
+
+12c's first finding, acted on. Migration `0026`, and the mechanism is source-agnostic.
+
+A **scope** is a sub-unit of a source that can be enumerated completely on its own. Greenhouse's
+scope is the board slug; every other source is one endpoint and reports none, taking a settle
+path that is the pre-0026 code verbatim. The rule Phase 7 wrote is unchanged — absence is
+evidence only from a complete enumeration — and only its grain moved.
+
+**Confirmed against a copy of the live database.** 2,341 sightings, all `scope IS NULL`, which
+is the correct reading of every row that predates 0026 and is why there is nothing to backfill.
+Tagging 150 greenhouse sightings to a completed board, 50 to a failed one, and leaving 54
+untagged, then issuing the exact increment the settle path issues for a `partial` run:
+
+| | before | after |
+|---|---|---|
+| tagged to the completed board (150 rows) | 48 misses | **198** — every one advanced |
+| tagged to the failed board (50 rows) | 1 | **1** — untouched |
+| untagged, i.e. every pre-0026 row (54) | 12 | **12** — untouched on a partial run |
+| every other source | 3,254 | **3,254** |
+
+#### Is per-scope eligibility sound? Mostly it under-expires, and once it does not
+
+Asked before the settle query was written, and the honest answer is not "yes".
+
+**Under-expiry, which is the safe direction and most of the behaviour.** A sighting whose scope
+failed is untouched. Sightings recorded before 0026 carry `scope IS NULL` and do not advance on
+a scoped *partial* run — they are tagged the next time they are seen, so it self-clears in a run
+or two. And a slug dropped from the board directory now produces no completed scope, so its
+postings stop advancing entirely: a **strict improvement**, because `BoardDirectory`'s own doc
+warns that pruning a slug used to make every posting on it expire at once, indistinguishable
+from the board genuinely closing.
+
+**The one over-expiry path, stated rather than explained away.** A sighting is tagged with the
+board it was last seen in. If a job's only sighting is tagged board A, the job moves to board B,
+and B then fails on three consecutive runs while A completes — A really is a complete
+enumeration and really does not contain the job, so its counter climbs and the posting expires
+while live on B. Today the source-level rule would have saved it, because B's failure would make
+the whole source partial.
+
+That is a real regression in one narrow case. It is bounded three ways: the sweep expires a
+posting only when **every** sighting is at threshold, so a Simplify or Lever sighting protects it
+outright; expiry is a soft delete, so an application referencing the posting still resolves; and
+reappearance anywhere resets the counter to 0. It is also not a new *kind* of error — the
+source-level rule already concludes "gone" from absence in an enumeration that may not cover
+where the job now lives, since a board whose slug was never harvested has always been invisible
+in exactly this way. Scoping makes that assumption reachable in one more situation rather than
+introducing it.
+
+The trade: 484 boards' worth of expiry that could not happen at all, against one narrow path to a
+soft delete that reverses itself the moment the job is seen again. Taken knowingly, and written
+into `expiry.rs`'s module doc so the next reader inherits the reasoning and not just the code.
+
+#### Two things worth knowing
+
+- **`counts_for_expiry` widened.** It meant "this source was fully enumerated"; it now means
+  "this run was trusted for at least one scope". Identical for every unscoped source. The
+  granularity that would otherwise be lost lives in the new `source_run_scopes` table, and the
+  run-health panel reads it: a run that advanced 484 of 485 boards renders as
+  `expired 484/485 boards`, which is neither "expired" nor the old `didn't expire` badge.
+- **A test the code claimed to have did not exist.** `expiry.rs`'s comment on the sweep's
+  `EXISTS` guard has cited `a_posting_with_no_sightings_is_never_swept` as pinning it since
+  Phase 7. Nothing by that name was ever written — the guard was load-bearing, correct, and
+  entirely unpinned. It is written now, with a control so it cannot pass by the sweep doing
+  nothing. Worth a moment's suspicion about other "pinned by" comments in this codebase.
+
+**Lever and Ashby are the obvious next scoped sources** and were deliberately left out of this
+change: both are multi-board with the same problem, and the adapter half is all that is missing.
 
 ### 0025 verified against a real collection run, 2026-09-02
 

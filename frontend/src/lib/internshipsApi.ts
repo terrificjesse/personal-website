@@ -457,6 +457,16 @@ export type SourceRunSummary = {
    * "succeeded but expired nothing" is a real state a person needs to be able to see.
    */
   counts_for_expiry: boolean;
+  /**
+   * Scopes — Greenhouse boards — this run enumerated completely, and how many it reached a
+   * verdict on at all. `0`/`0` for every source that is a single endpoint.
+   *
+   * `counts_for_expiry` is a boolean and a 485-board source is not: a run can advance
+   * disappearance counters for 484 boards and not the 485th, which is neither "expired" nor
+   * "didn't expire". These two are what lets the panel say which.
+   */
+  scopes_completed: number;
+  scopes_attempted: number;
   error: string | null;
 };
 

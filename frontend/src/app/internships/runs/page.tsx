@@ -143,11 +143,19 @@ export default function RunHealthPage() {
                             )}
                           </td>
                           <td className="py-0.5 text-black/45 dark:text-white/45">
-                            {!sourceRun.counts_for_expiry && (
+                            {!sourceRun.counts_for_expiry ? (
                               <span title="This run was not trusted to conclude that a missing posting has closed — a failed, partial, or suspiciously empty run leaves every posting exactly as it was.">
                                 didn’t expire
                               </span>
-                            )}
+                            ) : sourceRun.scopes_attempted > sourceRun.scopes_completed ? (
+                              /* Neither "expired" nor "didn't". A multi-board source is trusted
+                                 board by board, so a run can conclude closure for 484 boards
+                                 and nothing at all for the one that failed. */
+                              <span title="Expiry ran for the boards this source enumerated completely, and for no others. A board that failed leaves its postings exactly as they were.">
+                                expired {sourceRun.scopes_completed}/{sourceRun.scopes_attempted}{" "}
+                                boards
+                              </span>
+                            ) : null}
                           </td>
                         </tr>
                       ))}

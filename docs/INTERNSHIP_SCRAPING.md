@@ -643,6 +643,46 @@ had already 404'd. Where the ATS is authoritative — it is the system of record
 treat a list's `active` flag as a *lagging* indicator useful mainly for postings you cannot
 reach directly.
 
+### D.4 — Scopes: "the fetch succeeded" at board granularity (added 2026-09-02, migration 0026)
+
+Rule 3 above says absence counts only from a run where the fetch itself succeeded, and rule
+"never let a failed fetch mark postings closed" says one broken board makes the whole source
+untrusted. Both are right, and together they made the largest ATS source unable to expire
+anything at all.
+
+Measured on the first uncapped run (2026-09-02): Greenhouse polled **485 boards, 484 read
+cleanly, one — `designmehair` — returned a network error**, and the source-level verdict was
+therefore `partial`. Not one of those 484 complete enumerations counted toward closure. At 485
+boards a fully clean sweep is improbable, so that was the steady state, not an unlucky run.
+
+A **scope** is a sub-unit of a source that can be enumerated completely on its own. The rule is
+unchanged — absence is evidence only from a complete enumeration — but completeness is now
+answerable per scope instead of per source.
+
+| source | scope | why |
+|---|---|---|
+| Greenhouse | the board slug | Whole board in one request, no pagination, so "this board was completely read" is unambiguous. 485 of them under one source name. |
+| Lever, Ashby | *none yet* | Also multi-board and the obvious next candidates. The mechanism is source-agnostic; only the adapter half is missing. Deliberately not done in the same change. |
+| Simplify, vanshb03, WeWorkRemotely | *none, and none needed* | One endpoint each. A scope would be the whole source. |
+| LinkedIn, Indeed, Handshake | *none* | Never enumerate at all — see A.4. |
+
+Three properties worth knowing before touching this:
+
+- **A scope is all-or-nothing.** There is no partial scope. If a sub-unit can be half-read it is
+  not a scope; split it further or leave it unscoped. This is why Workday, whose paginated POST
+  can stop mid-board, is not a scope candidate as-is.
+- **A board that 404s on its list endpoint is a *completed* scope with zero postings**, not a
+  failed one. Per rule 2 above, "no such board" is an unambiguous statement that it offers
+  nothing, and its postings should expire. Before scopes they could only expire on a run where
+  all 485 boards succeeded.
+- **A scope's verdict and its posting ids must come from one parse.** `greenhouse::board_result`
+  returns both in a tuple for exactly this reason. A scope reported complete whose ids went
+  missing gets its whole board's miss counters incremented with nothing reset — every posting on
+  it expiring after three runs. That is the one way this mechanism loses data.
+
+`expiry.rs`'s module doc carries the soundness analysis, including the single narrow case where
+scoped expiry can over-expire where the source-level rule would not.
+
 ---
 
 ## E. Prestige signals

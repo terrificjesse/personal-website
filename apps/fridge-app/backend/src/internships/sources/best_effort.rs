@@ -548,6 +548,7 @@ mod tests {
                 source: "handshake".to_string(),
                 outcome: fetch.outcome(),
                 seen_external_ids: Vec::new(),
+                scopes: Vec::new(),
                 fetched: 1,
                 accepted: 0,
                 filtered: 0,

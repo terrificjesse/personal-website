@@ -84,6 +84,29 @@ early reports healthy while 80% of its postings appear to vanish at once.
 rows that should have parsed and didn't is a defect. Summed into one number the defect is
 invisible.
 
+### `source_run_scopes` — the same four-valued question, per board (migration 0026)
+
+Greenhouse is 485 endpoints under one source name, so "did it work" has 485 answers and the
+table above has room for one. One unreachable board made the whole source `partial` and
+therefore unable to expire anything — measured on the 2026-09-02 uncapped run, where 484 boards
+read cleanly and the source contributed nothing to expiry.
+
+A **scope** is a sub-unit a source can enumerate completely on its own; Greenhouse's is the
+board slug, and no other source has one today. `source_run_scopes` holds one row per scope per
+source run — `outcome` (`completed` / `failed`, two-valued because a scope that can be half-read
+is not a scope), `fetched_count`, and `error`, with `(outcome = 'failed') = (error IS NOT NULL)`
+enforced by CHECK. It is also the only place a run's 400th failed board is legible: the
+source-level error string shows three and a count.
+
+`posting_sightings.scope` records which scope a sighting was last seen in. `NULL` means the
+source has one implicit scope, which is true of every row written before 0026 and of every
+unscoped source since — so there is no backfill.
+
+**`counts_for_expiry` widened with this migration**, from "the source was fully enumerated" to
+"this run was trusted for at least one scope". Unchanged in meaning for every single-endpoint
+source. `docs/INTERNSHIP_SCRAPING.md` § D.4 covers what a scope is; `expiry.rs`'s module doc
+carries the soundness analysis, including the one case where scoped expiry can over-expire.
+
 ### `internship_postings` — where "absent is not zero" is enforced in SQL
 
 CHECK constraints, not conventions: `pay_min` requires both `pay_currency` and `pay_period`
@@ -305,6 +328,12 @@ is true. `posting_is_live` is three-valued and a `None` must never render as "Cl
 | `CollectionStatus.tsx` | Shared progress banner, so an empty list can say a run is in flight |
 | `applications/page.tsx` | The applied tracker: status transitions, notes, delete |
 | `runs/page.tsx` | Run health — per-source outcomes, counts, `counts_for_expiry`, errors |
+
+`GET /internships/runs` carries two additive fields per source run, `scopes_completed` and
+`scopes_attempted` (both `0` for a source with no scopes). They exist because
+`counts_for_expiry` is a boolean and a 485-board source is not: `runs/page.tsx` renders
+`expired 484/485 boards` when they disagree, which is neither the `didn't expire` badge nor
+silence.
 
 ## Environment
 
