@@ -1287,14 +1287,14 @@ that is actually about *you* rather than about the market.
 
 | # | Task | Tag | Lane | Primary | Swap | Est. |
 |---|---|---|---|---|---|---|
-| 12a | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
-| 12b | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
-| 12c | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
-| 12d | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
-| 12e | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
-| 12f | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
-| 12g | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
-| 12h | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
+| 12a ✅ | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
+| 12b ✅ | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
+| 12c ⬜ | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
+| 12d ⬜ | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
+| 12e ⬜ | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
+| 12f ✅ | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
+| 12g ⬜ | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
+| 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
 
 **Load:** Claude Code ≈ 13h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1398,6 +1398,49 @@ changes, so after the next uncapped run it points at a row that is on its way to
 **What would change this recommendation:** a non-zero true over-merge count, or evidence that
 any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
 id. Neither appeared in 1,828 rows.
+
+### 12c — the first uncapped run: what it needs and what to watch
+
+**Not run yet.** It is `[you]`: it fetches from every live source and takes roughly ten minutes
+(sources are polled one host at a time to stay polite). Everything below is the preparation, so
+the run itself is a decision rather than a project.
+
+**Before it:** take a backup (`ops/backup-fridge-db.sh`). This is the first run permitted to
+expire anything, and expiry is the one thing here that removes rows nobody asked it to.
+
+**The environment.** Unset `INTERNSHIP_MAX_BOARDS_PER_RUN` entirely and leave
+`INTERNSHIP_DISABLED_SOURCES` empty. **A cap is not a smaller version of this run — it is a
+different run**: a capped source reports `partial` by construction, and `partial` is never
+permitted to advance disappearance counters. Every measurement below is unavailable under a cap,
+which is why the last pay-coverage number (2 of 808) means nothing.
+
+**What "it worked" looks like:**
+
+- Every source reaches `success`, `partial` or `failed` on its own merits, and **none is
+  `skipped`** for reasons of the cap. `source_runs.counts_for_expiry = 1` for the successful
+  ones — that flag flipping true for the first time is the actual event here.
+- `consecutive_misses` advances for postings the successful sources did not return, and
+  `swept_vanished` is non-zero once a source crosses `INTERNSHIP_MISS_THRESHOLD`. Expiry firing
+  for the first time is the point of the run.
+- **Pay coverage measured honestly.** § B expects "well under half"; the standing figure of 2 of
+  808 is an artefact of Simplify (which carries no salary at all) having supplied almost
+  everything under the cap. This run is the first that can answer the question.
+- **A prediction worth checking, from the capped run:** Tower Research gains one row —
+  `ats:greenhouse:gh_jid:8044334` — beside its two stale `co:` rows, exactly as Nightwing did.
+  If it does not, something about that URL does not parse and § C wants to know.
+
+**What makes it a failure rather than a slow success:**
+
+- **A source failing is a normal run.** The scraping rules are explicit: LinkedIn, Indeed and
+  Handshake are best-effort, and a run where all three fail is normal. Do not treat a failure
+  count as the result.
+- It is a failure if a **failed or partial** source's postings get expired — that is the named
+  data-loss bug of Phase 7, and `a_failed_source_does_not_expire_the_postings_it_previously_supplied`
+  is the test that says it must not happen.
+- It is a failure if `postings_created` is large relative to `accepted` — that would mean keys
+  are still diverging after 0025, and the corpus is re-accumulating duplicates.
+- It is a failure if expiry removes a posting an application points at. There are two such
+  applications; check them by id before and after.
 
 ### 0025 verified against a real collection run, 2026-09-02
 
