@@ -469,6 +469,9 @@ Backend in `apps/fridge-app/backend/` (auth and `users` are there — same reaso
 blog, see root `CLAUDE.md`). Frontend at `frontend/src/app/internships/`. Vendored source
 snapshots under `apps/fridge-app/backend/data/internships/`, following `data/themealdb/`.
 
+**Full reference — every file and function — is `docs/INTERNSHIPS.md`** (written 2026-08-29,
+after the fact). This section stays the phase record: scope, decisions, and the checkpoint.
+
 ### Sources — all four classes, isolated from each other
 
 Chosen by the user with the tradeoffs stated. `docs/INTERNSHIP_SCRAPING.md` holds the
@@ -526,16 +529,410 @@ than working around it.
    from a run that actually succeeded**, or one blocked LinkedIn fetch silently expires
    everything it ever supplied. This is the single most likely data-loss bug in the phase.
 
-### Checkpoint
+### Checkpoint — met 2026-08-20, with one clause verified by test rather than live
 
-Run a collection with at least one source deliberately failing; confirm the others still land
-and the failure is visible in both the run record and the log. Confirm a posting present in two
-sources appears once. Confirm the ranking reorders sensibly when pay and deadline change, and
-that a posting with unknown pay is neither first nor last by accident. Mark one applied, let it
-expire, and confirm the application survives with its details intact. Confirm a failed run does
-**not** expire that source's postings.
+Verified against a **real collection run**, not fixtures: 2,746 rows fetched from Simplify,
+Greenhouse, Lever, Ashby and WeWorkRemotely in 22 seconds, capped at
+`INTERNSHIP_MAX_BOARDS_PER_RUN=6` so the run was a few dozen polite requests rather than the
+~2,084-board, half-hour sweep an uncapped run performs.
+
+- **The others still land when a source doesn't.** LinkedIn and Indeed recorded `skipped` with
+  their honest `robots.txt` reasons and **made zero requests**; three ATS sources recorded
+  `partial` on hitting the board cap; Simplify still returned 924 accepted postings. Every
+  outcome carried a reason into `source_runs` and the log. ✅
+- **A posting present in two sources appears once.** `AfterQuery — Software Engineering Intern`
+  arrived from both `simplify` and `ashby` and is one posting with two sightings. Beyond the
+  checkpoint, the key also merged **65 postings that one source had exploded per-location** —
+  RTX 14 listings, American Express 8, TikTok 7 — which is exactly the multi-location
+  double-counting § C warned about, and the reason location is not in the key. ✅
+- **Every fetched row is accounted for.** `fetched = accepted + filtered + rejected`:
+  2,746 = 926 + 1,820 + 0. The 1,820 filtered are non-SWE-internship rows, which is healthy
+  bulk; **0 rejected** means nothing that should have parsed didn't. ✅
+- **A posting with unknown pay is neither first nor last.** Only 2 of 808 postings state pay.
+  Under `sort=composite` they land at ranks **247 and 634 of 808** — mid-pack — while both
+  first place (0.615) and last place (0.386) are unknown-pay postings. Under `sort=pay` the two
+  stated figures lead and every unknown follows. ✅
+- **Pay parses to the right magnitude.** `USD 10000.00 per month` → `10000.00 USD/month`, not
+  an hourly rate; `USD 30.00 - 35.00 per hour` → `30–35 USD/hour`. Ashby's explicit interval
+  survived stringification and beat the magnitude heuristic, which is the whole point of the
+  `pay_raw` contract. ✅
+- **An applied posting survives expiry with its details intact.** Applied to a real posting,
+  then expired it, then deleted the row outright. The application kept company, title, URL,
+  pay, term and notes through all three states; `posting_is_live` went `true` → `false` →
+  `null`, and **`null` renders no badge at all** rather than claiming "Closed", which would be
+  a lie. ✅
+- **A failed run does not expire that source's postings.** ⚠️ **Verified by test, not live.**
+  No source hard-failed during the real run — they succeeded, hit the board cap (`partial`), or
+  skipped. The behaviour is pinned by
+  `collector::integration_tests::a_failed_source_does_not_expire_the_postings_it_previously_supplied`
+  (three consecutive failed runs leave `consecutive_misses` at 0 and the posting live), by its
+  non-vacuous counterpart `a_genuine_disappearance_from_successful_runs_does_expire`, and by
+  the run-health panel rendering `counts_for_expiry = false` against seeded failure data. A
+  live hard failure is worth catching opportunistically the first time a source really breaks.
+
+`cargo test`: **510 passed**, clippy clean, `tsc`/`eslint` clean.
+
+### What the real run caught that the test suite could not
+
+Both are dedup bugs, both invisible to 510 green tests, both found within minutes of real data —
+the pattern `apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
+
+1. **`job-boards.eu.greenhouse.io` is a third Greenhouse hostname**, not recorded in
+   `INTERNSHIP_SCRAPING.md`, which lists only `boards.` and `job-boards.`. Postings on the EU
+   host fell through to the fallback key.
+2. **`boards.greenhouse.io/embed/job_app?token=N`** puts the job id in the query string —
+   which every other URL shape treats as strippable tracking noise, so it was discarded.
+
+Both were **over-merging**, the dangerous direction: without an ATS key these collapsed into
+`company|title`, so two distinct jobs at one company sharing a title became one row. After the
+fix, ATS-triple coverage went **266/804 → 285/808**, and the four extra postings are jobs that
+had been wrongly merged into each other.
+
+### Known gaps, recorded rather than fixed
+
+- **ATS-triple coverage is ~35%, where § C predicted 73%.** The shortfall is entirely ATS
+  platforms `dedup::ats_identity` does not parse: **Workday** (`*.myworkdayjobs.com`,
+  `*.myworkdaysite.com` — listed in § C's own table and never implemented), plus
+  `apply.workable.com` and `ats.rippling.com`, which § C does not mention at all. Everything
+  else in the fallback is a company's own careers page (TikTok 82, Tesla 51, ByteDance 38,
+  Apple 7), which correctly has no ATS identity.
+- **Pay coverage in this run was 2 of 808 (0.2%)**, far below § B's "well under half". That is
+  an artefact of the board cap, not a defect: Simplify supplied 924 of 926 accepted postings
+  and carries no salary at all, while the ATS sources that do were capped at 6 boards each. An
+  uncapped run is the only way to measure this honestly.
+- **A capped run can never expire anything.** `INTERNSHIP_MAX_BOARDS_PER_RUN` makes a source
+  report `partial` by construction, and `partial` is not permitted to advance disappearance
+  counters. Convenient for development, wrong for steady state — an uncapped run is required
+  for expiry to function at all.
+- **Fuzzy company/title matching is still an unimplemented seam** (`dedup::FuzzyMatcher`), so
+  `KLA` / `KLA Corporation` remain two postings. Under-merging, which § C calls the safer
+  failure.
+- The frontend's filters are **not URL-synced**, so a filtered view cannot be bookmarked or
+  shared. The backend accepts every parameter; only the page ignores them.
 
 ---
+
+## Phase 8 — Internship-hunt tooling (inbox agent + Firefox extension)
+
+**Not a Learning Mode phase, and that includes the email classifier and the email→application
+matcher.** The user decided this explicitly on 2026-08-29: *"This is meant to be a tool for me
+that I want quickly, so I don't want to be writing any of it."* Classification is NLP-shaped
+and matching is fuzzy-matching-shaped, and both are `[gen]` here. This is the second such
+exception after Phase 7's ranking — do not re-litigate either, and **do not stop at a stub
+boundary and hand back a signature.**
+
+The exception does not reach the `[learn]` files themselves. `src/nlp.rs` and its neighbours
+may be **called** and never edited — including to fix a compile error they throw. If Phase 8
+needs one of them to change, say so and stop.
+
+**Full rules are `apps/hunt-extension/CLAUDE.md`** — read it before touching any of this; it
+governs Phase 8 wherever the code lives. The reference for what exists is `docs/HUNT.md`.
+
+### Where it lives
+
+The extension is `apps/hunt-extension/`. The backend half is `apps/fridge-app/backend/` —
+`src/hunt/` for the alert channel, `src/inbox/` for the Gmail agent when it lands — for the
+same reason the blog and internship tabs are there: auth and `users` are there. That makes it
+the *fourth* tab in a folder named after the first one. The root `CLAUDE.md` already calls that
+name a lie; **extracting it is its own deliberate change and must not be bundled into Phase 8.**
+
+### Two tracks, and B does not depend on A
+
+| Track | What | Needs |
+|---|---|---|
+| **A — inbox agent** | Read a burner Gmail, match mail to applications, propose status transitions, project them onto Gmail labels | OAuth, a Google Cloud project, an Anthropic key |
+| **B — filling applications** | Autofill CV details into ATS forms, plus an answer library for questions already answered well | Nothing |
+
+**8e + 8f is the shortest path to something useful every day.** Track B needs no OAuth and no
+API key at all.
+
+### The one structural idea
+
+**The four email categories already exist in the database.** Phase 7 shipped
+`internship_applications.status` — `applied → oa → interview → offer → rejected` — which is
+exactly "confirmation folder / OA folder / interview folder". So the classifier's job is **not**
+"sort this email into a folder"; it is *match this email to an application row, and propose a
+status transition.* Gmail labels are written afterwards as a **projection** of application
+status. Build it the other way round and you get two taxonomies that drift, and a tracker still
+reading `applied` for a job you already interviewed at.
+
+### Build order — classification earns write access, it does not start with it
+
+- [gen] **8a — Read-only pipeline. — complete 2026-08-31.** Verified against the real burner
+  inbox: 10 messages synced and recorded, `outcome=success`, and a second pass reported
+  `already_seen=10, classified=0` — rule 4's no-op, live. Rule 7's invariant balanced
+  (`10 = 0+0+0+10`), the `historyId` watermark was stored for the next incremental pass, and
+  **nothing was written outside our own tables** — no labels, no status changes, no alerts.
+  Every message classified `disregarded` because the stub says so rather than guessing.
+
+  Two failures worth keeping: the callback read its state cookie *after* clearing the jar, so
+  every consent 400'd and the flow could not have worked once — invisible to 677 tests because
+  the path needs Google at the other end, which is the Phase 5 lesson in the same function it
+  was learned in. And a stale `cargo run` debug binary held port 8080, so a freshly built
+  release binary failed to bind and the *old* build kept answering, which read as a missing
+  route.
+- [gen] **8b — Classify + match. Rules layer built; checkpoint NOT met — see below.** Rules first, Claude API on ambiguity.
+  Verdicts stored. *Checkpoint:* against a hand-labelled set of **real burner-inbox mail across
+  a whole two-week window**, not 50 curated job emails — a curated set contains no newsletters,
+  so it cannot measure the relevance gate, which is the highest-volume decision in the system.
+  Measure junk leaking into `Hunt/Outreach` and **real mail getting disregarded** separately;
+  the second is the one that costs an interview.
+- [gen] **8c — Writes.** Gmail labels + `status_proposals`. *Checkpoint:* a late-arriving
+  autoresponder does not drag an interview back to `applied`.
+- [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
+  table, which 8e built.
+- [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
+- [gen] **8f — Autofill. — complete 2026-08-30**
+- [gen] **8g — The answer library. — checkpoint met at the HTTP layer 2026-08-31; the browser
+  half is still unverified.** Save answers, similarity retrieval, company-specific flagging.
+  *Checkpoint:* a "why do you want to work here" answer stored against one company is **not**
+  offered for another, and a genuinely reusable one ("a project you're proud of") is.
+
+  Both halves of that are now asserted through the real handlers in
+  `routes::hunt::answer_loop_tests`, driven with the **exact request shapes `popup.js` builds** —
+  its `?q=`/`&company=` query string and its three-field save body — because the seam between
+  the extension and the routes is in two languages, invisible to the compiler, and is what
+  "never closed by hand" would actually have caught. A renamed query parameter degrades to *no
+  suggestions*, which is indistinguishable from an empty library; the mutation that proves the
+  tests bite also shows the withholding assertion still passing under it, which is why the loop
+  needs asserting in **both** directions rather than just the safe one.
+
+  **What is still not verified is everything inside the browser**: whether `questions()` finds
+  the free-text boxes on a real ATS form, whether `describePage()` names the employer, and
+  whether the popup's Save and Suggest buttons behave against a live page. That needs the
+  extension loaded in Firefox on two real forms — it cannot be reached from here, and jsdom
+  would be a new npm dependency in a folder that is deliberately plain JS with no build step.
+
+### The traps, in one place
+
+Each is a real failure mode, not a style preference. `apps/hunt-extension/CLAUDE.md` carries all
+twelve with their reasoning; these are the ones that shape the schema.
+
+1. **Email is untrusted content, and the classifier sits upstream of Gmail write access.**
+   `classify` is a pure function that gets no tools and returns a constrained enum — never an
+   action, a label name, or SQL. Every write happens in Rust, outside the model call. Never
+   fetch a URL found in an email.
+2. **A misclassification must never silently rewrite the tracker.** Every email-driven change
+   writes a `status_proposals` row linking back to the message. Auto-apply only above the
+   confidence threshold and only forwards; **never auto-apply `offer` or `rejected`.**
+3. **Status advances; it does not follow the newest email.** Email order is not event order.
+4. **"Disregarded" means unlabelled, not unrecorded.** This is `posting_rejects` one subsystem
+   over: a dropped email that leaves no trace makes "correctly ignored 400 newsletters" and
+   "ate an OA" produce identical output. Pin
+   `classified = pressing + confirmation + outreach + disregarded` with a test.
+5. **Category is decided before the match, and a pressing email is never disregarded.** The
+   matcher is fuzzy and will miss; if unmatched routed to disregard, one miss silently eats an
+   interview invite. An OA email matching no application is still labelled and still alerted.
+6. **Autofill never fires on its own and never submits.** Explicit user action only; hard
+   blocklist on password/payment/SSN fields checked *before* the fuzzy mapper; EEO questions
+   opt-in and default off. **Do not ship `<all_urls>`.**
+
+### 8e — complete 2026-08-30
+
+**The vertical slice that ends in a desktop notification**, and it needed no Gmail and no API
+key: `hunt_events`, the poll and ack endpoints, the posting producer, and the extension shell.
+It proves the whole alert path before the inbox agent exists. Full reference: `docs/HUNT.md`.
+
+Two producers were designed in from the start (`kind` is `posting | email`) so 8d adds a
+producer rather than a pipeline.
+
+Verified against a **real Simplify run over a copy of the live database**, not fixtures:
+
+- **A new tier-1/2 posting writes exactly one row.** 2,247 fetched, 206 postings created,
+  **22 alerts, every one a tier-1 or tier-2 company.** Tier-3 controls produced none. ✅
+- **Re-running collection writes no second event.** A second run updated 1,097 postings and
+  reported `alerts_created: 0`. Dedup is structural — `UNIQUE (kind, subject_id)` — not a
+  caller remembering to check. ✅
+- **The alert predicate is the existing `prestige::CompanyTiers::tier()`, tiers 1 and 2.** No
+  new ranking code. **`None` is not tier 3**: unlisted means *unknown*, the curated file names
+  44 of ~455 companies, and alerting on unknown would alert on nearly everything. ✅
+- **Endpoints:** `204` first ack, `204` repeat, `404` unknown, `401` signed out, `400` on a
+  malformed `since`. ✅
+- **The extension's logic against the live backend**, driven with a stubbed WebExtension API:
+  10 waiting events → 3 notifications plus one "+7 more", all 10 acked, immediate second poll
+  raised nothing. All three failure modes distinct and badged. ✅
+
+**Notification dedup is the server's job** (`hunt_events.acked_at`), because an MV3 background
+page is killed and restarted at the browser's convenience and anything it remembers is lost.
+`browser.storage.local` is a cache, never the record. `acked_at` is a **delivery receipt** — the
+extension acks what it showed — so the popup lists *recent* events rather than unacked ones.
+
+**What the real run caught that 22 green tests could not.** Simplify packs every city into one
+location string, so a single Google posting produced a **429-character** notification body with
+the role pushed off the end — the normal shape of a big-company listing, since `dedup`
+deliberately keeps location out of the merge key. Locations now collapse to `first +N more`,
+body capped at 140 characters, pinned by a test using the real 30-city string. Same pattern
+`apps/fridge-app/CLAUDE.md` records for four earlier scoring functions.
+
+**Verified in Firefox 2026-08-30, and the cookie plan did not survive it.** `SameSite=Lax`
+means Firefox never attaches `fridge_session` to a request from a `moz-extension://` page, so
+the backend answered a truthful 401 to a signed-in user. The recorded fallback — a dedicated
+bearer token — is now what the extension uses: `hunt_tokens` (migration `0015`), minted from an
+**Extension access** panel on the internships tab. It is a second *credential*, not a second
+auth system: it reuses `auth`'s hashing by calling it, and is accepted inside the existing
+`MaybeUser` extractor, so every route keeps its `CurrentUser` signature.
+
+Three other faults wore that same "can't reach the backend" symptom on the way: the dev servers
+genuinely dying, Firefox MV3 declining to grant `host_permissions` the manifest merely requests
+(Chrome grants them at install), and CORS never naming the extension's origin so responses were
+discarded before the extension could read them. **The durable fix is that all four now report
+themselves distinctly** — `unpermitted`, `unreachable`, `no-token`, `token-rejected` — because
+one message covering four unrelated causes is what turned a ten-minute check into a day. 8f
+authenticates identically and inherits the diagnosis rather than the search.
+
+### 8f — complete 2026-08-30
+
+Content script, label-based mapper, `cv_profile`, the `activeTab` path and the
+"track this application" offer. Full reference: `docs/HUNT.md`.
+
+**All three checkpoint ATSs fill from a real posting**, including the hardest variant: the
+Greenhouse one was reached through a *company careers page* (`jumptrading.com/hr/job?gh_jid=…`)
+that embeds `job-boards.greenhouse.io` in an iframe, exercising `activeTab`, cross-frame
+injection and frame selection at once. Lever and Ashby are direct ATS pages on the declarative
+path.
+
+**Reading the live forms before filling them found three defects a synthetic form could not**,
+and one was in the safety layer:
+
+- **The demographic blocklist silently failed on Lever.** It renders a `<select>`'s option text
+  into the label with no separator, so "Gender" arrives as `GenderSelect ...MaleFemale…` —
+  normalized `genderselect`, and `\bgender\b` never fires. Race the same. Veteran status was
+  caught *only* because its pattern happens to lack a word boundary, which is what made the
+  failure look like success. Refusal checks now also see the label with run-together words
+  split; matching deliberately does not, since the same split breaks `LinkedIn` and `GitHub`.
+- **"Other website" was filled with the portfolio URL**, and sits beside "Portfolio URL" on
+  Lever — one URL in two different questions.
+- **Ashby labels its name field simply "Name"**, which was excluded on purpose because it
+  matches inside "Company Name". Now an exact-only match, with tests holding that line.
+
+CAPTCHA fields are also refused outright: Ashby renders a real `g-recaptcha-response` textarea
+into the form. Nothing mapped to it, but "nothing happens to match" is not a policy and rule 11
+is.
+
+Every label from all three live forms is now a test — 79 checks against markup that exists.
+
+**The other three clauses hold too**, each confirmed on a live form rather than inferred:
+values survive clicking around a React-controlled form, so the native-setter path really does
+register with the framework rather than being wiped on the next render; nothing fires on page
+load, which is rule 10's core promise; and no EEO field is touched — refused by the classifier,
+pinned by tests, and visibly untouched on Lever's gender, race and veteran selects.
+
+Nothing was submitted on any of the three.
+
+### 8b — measured 2026-08-31, and the checkpoint is not met
+
+Run honestly, and the honest result is that **the checkpoint cannot be met yet and this is not
+it.** Recorded because a partial measurement stated as partial is worth more than an unmeasured
+classifier, and far more than a number that looks like a pass.
+
+**Why it is not the checkpoint.** It asks for a hand-labelled set of every message across ~2
+weeks. The burner holds **14 messages over 2 days, with zero digests, newsletters or staffing
+blasts** — so the relevance gate, which the checkpoint singles out as the highest-volume
+decision in the system, has nothing to measure against at all.
+
+**And most of the corpus was already spent.** 8 of the 14 were the mail the rules were written
+by reading, with three defects fixed against them. Grading on those measures the tuning, not the
+classifier, and would have returned ~100%.
+
+**What was measurable:** 6 messages arrived after the rules were committed. On that held-out
+set, hand-labelled by the user rather than by the author of the rules:
+
+| | |
+|---|---|
+| Correct | **4 of 6** |
+| Junk leaked into `Hunt/Outreach` | **1** — an event RSVP confirmation |
+| Real application mail disregarded | **1** — an ATS account-setup email |
+
+Both failure modes the checkpoint names, one instance each, on six messages. Both diagnosed and
+fixed:
+
+- The RSVP reached outreach because its sender was `…@connect.roblox.com` — the domain matched
+  a known company and the address did not contain "noreply", which is a thin basis for deciding
+  a human wrote to you. Event RSVPs and registrations now fall to the relevance gate.
+- The account-setup mail said "Thank you for **expressing** interest in", and only the "your
+  interest in" phrasing was listed. It also came from `msg.paycomonline.com` — Paycom, an ATS
+  nothing recognised, the same shape as Phase 7's ATS-coverage gap one subsystem over.
+
+All 14 now agree with the user's labels, and both real strings are pinned as tests.
+
+**The held-out set is now spent.** Fixing against it made those six in-sample too; a set can
+only be measured once. The next honest measurement needs mail that arrives from here, and the
+relevance gate stays unmeasured until digests and staffing blasts actually turn up.
+
+**The harness for the next attempt is built** — `src/inbox/labelset.rs`, reached as
+`cargo run --release -- labelset export|score`. It exports *every* stored message to a CSV with
+an empty label column (no verdict shown, so the labels are not anchored), re-runs the rules over
+the filled-in sheet, and reports the two failure modes against separate denominators, with no
+single accuracy figure to quote instead of them. It keeps a ledger beside the labels file
+recording the fingerprint of the rules each grading ran under, so a set that was graded and then
+tuned against reports itself as in-sample rather than silently passing as fresh.
+
+It surfaced two defects before a single message had been labelled.
+
+**Fixed — `guess_company` matched a company as a bare substring** (2026-08-31). The known-company
+list is real and holds 586 names, including three-letter ones, so a bare `contains` matched the
+*inside of ordinary words*. The worst case was not in the sender at all: **PPL** is a utility in
+the corpus, and "a*ppl*y" / "a*ppl*ication" appear in **9 of the 14** messages in the burner
+inbox. Longest-match-wins hid it in eight of them; in the ninth it was the guess, and
+`company_guess` is what `advance::match_application` keys on — rule 2's failure exactly, an
+email matched to a company it has nothing to do with. Three more, all verbatim from live mail:
+`systemmessage@paycomonline.com` named **Sage** ("mes*sage*"), `donotreply@msg.paycomonline.com`
+named **KLA** ("O*kla*homa City Thunder"), and `jobs@ziprecruiter.com` named **Zip** — the last
+being the same bug pointed at the relevance gate, where a job-board digest "names a specific
+employer" and stops looking like junk.
+
+The fix requires a non-alphanumeric boundary on both sides of the match, compared as `char`s
+rather than bytes so a two-byte letter is not mistaken for a delimiter. Measured over every real
+message: **11 of 14 guesses unchanged, 3 changed** — two false positives removed, and one *true*
+positive recovered (`Zip Hiring Team <no-reply@ashbyhq.com>` guessed `ppl` before and now
+guesses `zip`). Every legitimate match in the corpus — Roblox, Tesla, Jump Trading, Epic Games,
+Google — survives, via a whole domain label or a display-name word.
+
+**Still open — `is_machine_sender` does not know `systemmessage@`**, so that sender reads as a
+person. No effect on today's mail (`paycomonline.com` is an ATS domain and reaches outreach
+either way), but it is the same shape of gap.
+
+### Open questions
+
+- Should `Hunt/Outreach` raise a notification? **Currently no.** Cold outreach is high-volume
+  and low-precision, and a noisy channel gets muted wholesale, taking the OA alerts with it.
+  8e made this a one-line predicate plus an existing checkbox in the options page.
+- Confidence threshold for auto-apply — set it after 8b gives real numbers, not by guessing.
+- Does the extension need the internship *list*, or only alerts? 8e shipped alerts only.
+- How does an answer first get into the library? Cheapest: after a fill, offer to save what you
+  typed into the free-text boxes — also the version most likely to catch answers while good.
+- Does the answer library want embeddings, or is `strsim` over normalized question text enough?
+  Start with `strsim`; it is already a dependency and the corpus is tiny.
+
+---
+
+## Phase 9 — Make the hunt tooling usable daily
+
+**Not new capability. The gap between built and used.**
+
+Phase 8 works and is driven entirely by hand: the inbox syncs only when something POSTs to it,
+status proposals are reachable only by `curl`, and nothing anywhere shows whether the agent is
+alive. A tool that needs an operator does not get used during an actual internship hunt — and
+being used is also what produces the corpus 8b's checkpoint needs, so this unblocks that too.
+
+### Scope
+
+- [gen] **An interval worker for the inbox.** Same shape as `BLOG_SYNC_INTERVAL_SECS` and the
+  collector: cadence from an env var, `0` disables, and it **never fetches from a request
+  handler** — the root `CLAUDE.md` cache rule applies to Gmail as much as to a job board.
+- [gen] **A proposals review panel** on the internships tab. Accept or reject a status change,
+  with the email that caused it visible beside it — rule 2's audit trail is worthless if the
+  only way to read it is SQL.
+- [gen] **Inbox status in the extension.** Whether an account is connected, when the last run
+  was, and its outcome. Rule 5 says a broken sync must be visible, and "visible" has so far
+  meant a JSON endpoint nobody opens. The 7-day token expiry makes this the difference between
+  noticing in an hour and noticing in a fortnight.
+
+### What this phase is not
+
+Not the Gmail label writes. Those are 8c's remaining half and stay held until 8b has met a real
+corpus — write access to a mailbox on the strength of a classifier measured against ten
+messages is exactly what the build order exists to prevent.
 
 ## After Phase 5
 

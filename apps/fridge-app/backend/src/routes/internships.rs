@@ -17,10 +17,21 @@
 //!
 //! 1. An `INNER JOIN` drops the application entirely once the posting is gone — trap 1
 //!    arriving by the back door after the snapshot was supposed to have closed it.
-//! 2. Foreign keys are **not enforced** in this database (`db::init_pool` sets no
-//!    `PRAGMA foreign_keys`), so a hard-deleted posting leaves `posting_id` *dangling* rather
-//!    than NULL. `ON DELETE SET NULL` never fires. Verified against a real database, not
-//!    assumed.
+//! 2. A hard-deleted posting can leave `posting_id` either NULL **or dangling**, and this
+//!    code has to handle both.
+//!
+//!    Correcting the note in migration `0007`: **sqlx turns `PRAGMA foreign_keys` ON per
+//!    connection**, so through the application the `REFERENCES` clauses really are enforced
+//!    and `ON DELETE SET NULL` does fire. That was proved the hard way — an insert-ordering
+//!    bug in `internships::collector` failed with `FOREIGN KEY constraint failed`, which is
+//!    impossible if they are off. But the `sqlite3` CLI does *not* enable them, so a delete
+//!    performed by hand leaves the column pointing at an id that no longer resolves. Both
+//!    states were reproduced against a real database.
+//!
+//!    (This note lived in migration `0012` briefly and was moved here: **editing an applied
+//!    migration changes its checksum and sqlx then refuses to start**, with
+//!    `migration 12 was previously applied but has been modified`. A migration is immutable
+//!    once it has run anywhere — corrections go in the code or in a new migration.)
 //!
 //! Together those mean the liveness column cannot be written as `p.expired_at IS NULL`:
 //! when the join misses, every column of `p` is NULL, and `NULL IS NULL` is **true** — so a
@@ -49,7 +60,7 @@ use crate::internships::models::{
     Application, Season, ApplicationStatus, CreateApplicationRequest, MAX_APPLICATION_NOTES_LENGTH,
     UpdateApplicationRequest,
 };
-use crate::routes::auth::CurrentUser;
+use crate::routes::auth::{CurrentUser, RequireAdmin};
 
 /// The application columns plus the one derived field.
 ///
@@ -547,6 +558,76 @@ pub struct SourceHealth {
 pub struct RunHealthResponse {
     pub runs: Vec<CollectionRunSummary>,
     pub sources: Vec<SourceHealth>,
+    /// Present only while a run is actually in flight. See [`current_progress`].
+    pub in_progress: Option<RunProgress>,
+}
+
+/// A collection run that has started and not yet finished.
+///
+/// This exists because a running scrape was previously indistinguishable from a broken one:
+/// the tab was empty, the health panel was empty, and nothing said whether anything was
+/// happening. `sources_done` climbs as each source lands, which is only meaningful because the
+/// coordinator persists per-source rather than batching — see `internships::collector`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunProgress {
+    pub run_id: String,
+    pub started_at: DateTime<Utc>,
+    pub trigger: String,
+    /// Sources that have finished and been recorded so far.
+    pub sources_done: i64,
+    /// How many there are in total, from the registry.
+    pub sources_total: usize,
+    /// Postings accepted so far in this run — visible progress rather than a spinner.
+    pub postings_so_far: i64,
+}
+
+/// The in-flight run, if there is one.
+///
+/// A run is in flight when its `collection_runs` row has no `finished_at`. Note this is also
+/// true of a run whose process died mid-way, which is deliberate: a run that never finished is
+/// a real thing to surface, and the alternative — treating it as complete — would hide it.
+async fn current_progress(pool: &SqlitePool) -> Result<Option<RunProgress>, StatusCode> {
+    let row = sqlx::query_as::<_, InFlightRow>(
+        "SELECT id, started_at, trigger FROM collection_runs
+         WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(internal("reading the in-flight run"))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let sources_done: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM source_runs WHERE run_id = ?")
+            .bind(&row.id)
+            .fetch_one(pool)
+            .await
+            .map_err(internal("counting finished sources"))?;
+
+    let postings_so_far: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(accepted_count), 0) FROM source_runs WHERE run_id = ?")
+            .bind(&row.id)
+            .fetch_one(pool)
+            .await
+            .map_err(internal("counting accepted postings"))?;
+
+    Ok(Some(RunProgress {
+        run_id: row.id,
+        started_at: row.started_at,
+        trigger: row.trigger,
+        sources_done,
+        sources_total: crate::internships::sources::registry().len(),
+        postings_so_far,
+    }))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct InFlightRow {
+    id: String,
+    started_at: DateTime<Utc>,
+    trigger: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -555,6 +636,10 @@ pub struct CollectionRunSummary {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub trigger: String,
+    /// The process running this died before it finished. Reconciled at the next startup —
+    /// see `collector::reconcile_interrupted_runs`. Worth showing: a source that keeps being
+    /// interrupted is a real signal, and it explains a gap in the data.
+    pub interrupted: bool,
     pub sources: Vec<SourceRunSummary>,
 }
 
@@ -564,9 +649,10 @@ struct CollectionRunRow {
     started_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
     trigger: String,
+    interrupted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunHealthQuery {
     /// How many recent runs to include. Clamped rather than rejected — an oversized `limit`
     /// is a UI bug, not a reason to fail the request.
@@ -586,7 +672,7 @@ pub async fn run_health(
     let limit = params.limit.unwrap_or(DEFAULT_RUN_LIMIT).min(MAX_RUN_LIMIT);
 
     let run_rows = sqlx::query_as::<_, CollectionRunRow>(
-        "SELECT id, started_at, finished_at, trigger
+        "SELECT id, started_at, finished_at, trigger, interrupted
          FROM collection_runs ORDER BY started_at DESC LIMIT ?",
     )
     .bind(limit)
@@ -612,6 +698,7 @@ pub async fn run_health(
             started_at: run.started_at,
             finished_at: run.finished_at,
             trigger: run.trigger,
+            interrupted: run.interrupted,
             sources,
         });
     }
@@ -648,7 +735,12 @@ pub async fn run_health(
     .await
     .map_err(internal("computing source health"))?;
 
-    Ok(Json(RunHealthResponse { runs, sources }))
+    let in_progress = current_progress(&pool).await?;
+    Ok(Json(RunHealthResponse {
+        runs,
+        sources,
+        in_progress,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -670,11 +762,40 @@ pub struct RejectSummary {
 /// This endpoint is the reason `posting_rejects` keeps `raw_json`: a reject count tells you
 /// something went wrong and nothing at all about what. Note `kind` — `filtered` in bulk is
 /// healthy, `rejected` is a defect worth chasing.
+/// What a run threw away, plus whether we still hold the evidence.
+///
+/// `payloads_pruned` is the whole reason this is an envelope rather than a bare array. Old
+/// `filtered` payloads are deleted by `collector::prune_rejects`, and without this flag a
+/// pruned run and a run that filtered nothing return the identical empty list — which is
+/// precisely the ambiguity `posting_rejects` was built to prevent, reintroduced by the
+/// housekeeping that keeps it from eating the disk.
+///
+/// It is derived rather than stored: the run says it filtered rows, and none are here.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectsResponse {
+    pub rejects: Vec<RejectSummary>,
+    /// From `source_runs`, which pruning never touches. The accounting outlives the evidence.
+    pub filtered_count: i64,
+    pub rejected_count: i64,
+    pub payloads_pruned: bool,
+}
+
 pub async fn list_rejects(
     State(pool): State<SqlitePool>,
     CurrentUser(_user): CurrentUser,
     Path(source_run_id): Path<String>,
-) -> Result<Json<Vec<RejectSummary>>, StatusCode> {
+) -> Result<Json<RejectsResponse>, StatusCode> {
+    let counts: Option<(i64, i64)> =
+        sqlx::query_as("SELECT filtered_count, rejected_count FROM source_runs WHERE id = ?")
+            .bind(&source_run_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal("reading a source run"))?;
+
+    let Some((filtered_count, rejected_count)) = counts else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
     let rejects = sqlx::query_as::<_, RejectSummary>(
         "SELECT id, source, kind, reason, field, detail, url, external_id, raw_json, created_at
          FROM posting_rejects WHERE source_run_id = ?
@@ -686,7 +807,15 @@ pub async fn list_rejects(
     .await
     .map_err(internal("listing rejects"))?;
 
-    Ok(Json(rejects))
+    let filtered_present = rejects.iter().filter(|r| r.kind == "filtered").count() as i64;
+
+    Ok(Json(RejectsResponse {
+        rejects,
+        filtered_count,
+        rejected_count,
+        // Only `filtered` payloads are ever pruned, so only they can go missing.
+        payloads_pruned: filtered_count > 0 && filtered_present == 0,
+    }))
 }
 
 /// Logs a database error and turns it into a 500, so handlers don't each repeat the closure.
@@ -727,7 +856,7 @@ fn internal(context: &'static str) -> impl Fn(sqlx::Error) -> StatusCode {
 ///
 /// `pay_unknown=drop` is the one users will reach for most — "only postings that actually say
 /// what they pay" is a reasonable thing to want, and it is one parameter away.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ListPostingsQuery {
     /// `composite` (default), `pay`, `posted`, `deadline`, `prestige`.
     pub sort: Option<String>,
@@ -790,6 +919,8 @@ pub struct ListPostingsResponse {
     pub returned: usize,
     pub sort: String,
     pub postings: Vec<RankedPosting>,
+    /// Set while a collection is running, so an empty or partial list can say why.
+    pub collection: Option<RunProgress>,
 }
 
 /// The ranked, filtered list of open postings.
@@ -887,6 +1018,7 @@ pub async fn list_postings(
         returned: ranked.len(),
         sort: sort.as_str().to_string(),
         postings: ranked,
+        collection: current_progress(&pool).await?,
     }))
 }
 
@@ -902,4 +1034,376 @@ pub async fn list_sources(
         eprintln!("internships: listing sources failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// Trigger a collection by hand.
+///
+/// Admin-only, matching `POST /blog/sync`: it reaches out to every configured source, so it is
+/// not something an ordinary signed-in user should be able to set off repeatedly. The scheduled
+/// runner is the normal path — this exists for "I just changed a source, show me".
+///
+/// Runs inline and returns the report, so the caller sees what happened rather than a 202 and
+/// a shrug. That makes it slow by design; the scheduler is what you want for routine use.
+pub async fn collect_now(
+    State(pool): State<SqlitePool>,
+    RequireAdmin(_user): RequireAdmin,
+) -> Result<Json<CollectionSummary>, StatusCode> {
+    use crate::internships::collector::CollectError;
+
+    let report = crate::internships::collector::collect(&pool, "manual")
+        .await
+        .map_err(|err| match err {
+            // A refusal, not a failure. 409 rather than 500 so a double-clicked button reads
+            // as "one is already running" instead of "the server broke" — the same distinction
+            // the blog phase drew between 403 and 401.
+            CollectError::AlreadyRunning => {
+                println!("internships: manual collection refused — one is already running");
+                StatusCode::CONFLICT
+            }
+            CollectError::Failed(err) => {
+                eprintln!("internships: manual collection failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+
+    Ok(Json(CollectionSummary {
+        run_id: report.run_id,
+        sources_run: report.sources_run,
+        sources_succeeded: report.sources_succeeded,
+        fetched: report.fetched,
+        accepted: report.accepted,
+        filtered: report.filtered,
+        rejected: report.rejected,
+        postings_created: report.postings_created,
+        postings_updated: report.postings_updated,
+        alerts_created: report.alerts_created,
+        rejects_pruned: report.rejects_pruned,
+        marked_closed: report.marked_closed,
+        swept_deadline: report.swept_deadline,
+        swept_vanished: report.swept_vanished,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionSummary {
+    pub run_id: String,
+    pub sources_run: usize,
+    pub sources_succeeded: usize,
+    pub fetched: i64,
+    pub accepted: i64,
+    pub filtered: i64,
+    pub rejected: i64,
+    pub postings_created: i64,
+    pub postings_updated: i64,
+    /// Desktop-notification events this run raised. See `internships::alerts`.
+    pub alerts_created: i64,
+    /// Old `filtered` reject payloads deleted. See `collector::prune_rejects`.
+    pub rejects_pruned: u64,
+    pub marked_closed: u64,
+    pub swept_deadline: u64,
+    pub swept_vanished: u64,
+}
+
+/// Handler-level tests (audit finding F8).
+///
+/// `routes/internships.rs` had 1,051 lines and 8 tests, every one of them covering the
+/// class-year parser — so no HTTP handler was exercised at all. These call the handlers
+/// directly with constructed extractors, which is possible because `CurrentUser` and
+/// `RequireAdmin` are tuple structs with public fields.
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use crate::models::User;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("routes-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool, email: &str) -> CurrentUser {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(email)
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        CurrentUser(User {
+            id,
+            email: email.into(),
+            password_hash: None,
+            created_at: Utc::now(),
+            is_admin: false,
+        })
+    }
+
+    async fn posting(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO internship_postings
+                 (id, dedup_key, company_key, company_name, title, canonical_url,
+                  location_raw, pay_min, pay_max, pay_currency, pay_period,
+                  term_season, term_year, first_seen_at, last_seen_at, created_at, updated_at)
+             VALUES (?1, ?2, 'acme', 'Acme Corp', 'Software Engineer Intern',
+                     'https://acme.example/jobs/1', 'San Francisco, CA',
+                     45.0, 55.0, 'USD', 'hour', 'summer', 2027, ?3, ?3, ?3, ?3)",
+        )
+        .bind(id)
+        .bind(format!("key-{id}"))
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // --- the applied tracker: trap 1 and per-user scoping ---
+
+    #[tokio::test]
+    async fn applying_snapshots_the_posting_onto_the_application() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let (status, Json(app)) = create_application(
+            State(pool.clone()),
+            me,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: Some("first choice".into()),
+            }),
+        )
+        .await
+        .expect("apply should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        // Every field the tracker renders must be copied, not referenced.
+        assert_eq!(app.company_name, "Acme Corp");
+        assert_eq!(app.title, "Software Engineer Intern");
+        assert_eq!(app.url, "https://acme.example/jobs/1");
+        assert_eq!(app.pay_min, Some(45.0));
+        assert_eq!(app.pay_currency.as_deref(), Some("USD"));
+        assert_eq!(app.term_year, Some(2027));
+        assert_eq!(app.notes.as_deref(), Some("first choice"));
+        assert_eq!(app.posting_is_live, Some(true));
+    }
+
+    #[tokio::test]
+    async fn an_application_survives_its_posting_being_deleted() {
+        // Trap 1, at the handler rather than in SQL: the tracker must render from the snapshot
+        // alone. Foreign keys are enforced through sqlx, so this exercises `ON DELETE SET NULL`
+        // — the other reachable state, a dangling id, is what the `sqlite3` CLI produces.
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let _ = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM internship_postings WHERE id = 'p1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(apps) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(apps.len(), 1, "the application must outlive the posting");
+        assert_eq!(apps[0].company_name, "Acme Corp");
+        assert_eq!(apps[0].pay_min, Some(45.0));
+        assert_eq!(
+            apps[0].posting_is_live, None,
+            "unknown, not false — we cannot claim it closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn applications_are_scoped_to_their_owner() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let stranger = user(&pool, "b@test.local").await;
+
+        let _ = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: Some("mine".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(theirs) = list_applications(State(pool.clone()), stranger)
+            .await
+            .unwrap();
+        assert!(theirs.is_empty(), "a stranger must not see my applications");
+        let Json(mine) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(mine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_modify_or_delete_my_application() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let stranger = user(&pool, "b@test.local").await;
+        let (_, Json(app)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let updated = update_application(
+            State(pool.clone()),
+            stranger.clone(),
+            Path(app.id.clone()),
+            Json(UpdateApplicationRequest {
+                status: Some("offer".into()),
+                notes: Some("hijacked".into()),
+            }),
+        )
+        .await;
+        assert!(updated.is_err(), "a stranger must not update my application");
+
+        let deleted = delete_application(State(pool.clone()), stranger, Path(app.id.clone())).await;
+        assert!(deleted.is_err(), "a stranger must not delete my application");
+
+        // And it is genuinely untouched.
+        let Json(mine) = list_applications(State(pool.clone()), me).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].status, "applied");
+        assert_eq!(mine[0].notes, None);
+    }
+
+    #[tokio::test]
+    async fn applying_twice_to_one_posting_is_refused() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let req = || {
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            })
+        };
+        let _ = create_application(State(pool.clone()), me.clone(), req())
+            .await
+            .unwrap();
+        let second = create_application(State(pool.clone()), me, req()).await;
+        assert_eq!(second.unwrap_err(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn applying_to_a_posting_that_does_not_exist_is_not_found() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+        let result = create_application(
+            State(pool.clone()),
+            me,
+            Json(CreateApplicationRequest {
+                posting_id: "nope".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    // --- the ranked list: the 400 paths ---
+
+    #[tokio::test]
+    async fn malformed_filters_are_rejected_rather_than_silently_ignored() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+
+        let cases: Vec<(&str, ListPostingsQuery)> = vec![
+            ("unknown sort", ListPostingsQuery { sort: Some("bogus".into()), ..Default::default() }),
+            ("unknown season", ListPostingsQuery { term_season: Some("monsoon".into()), ..Default::default() }),
+            ("misspelled on_unknown", ListPostingsQuery { pay_min: Some(10.0), pay_unknown: Some("dorp".into()), ..Default::default() }),
+            ("inverted pay window", ListPostingsQuery { pay_min: Some(80.0), pay_max: Some(20.0), ..Default::default() }),
+            ("negative pay floor", ListPostingsQuery { pay_min: Some(-5.0), ..Default::default() }),
+            ("misspelled study year", ListPostingsQuery { class_year: Some("sophmore".into()), ..Default::default() }),
+        ];
+
+        for (label, query) in cases {
+            let result = list_postings(State(pool.clone()), me.clone(), Query(query)).await;
+            assert_eq!(
+                result.err(),
+                Some(StatusCode::BAD_REQUEST),
+                "{label} should be a 400, not a silently different result set"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_still_reports_the_live_total() {
+        // What stops "nothing matched" and "nothing collected yet" looking identical.
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let Json(body) = list_postings(
+            State(pool.clone()),
+            me,
+            Query(ListPostingsQuery {
+                company: Some("nobody-by-this-name".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.returned, 0);
+        assert_eq!(body.total_live, 1, "the denominator must survive filtering");
+        assert_eq!(body.sort, "composite");
+    }
+
+    // --- run health ---
+
+    #[tokio::test]
+    async fn an_unfinished_run_is_reported_as_in_progress() {
+        let pool = pool().await;
+        let me = user(&pool, "a@test.local").await;
+        sqlx::query("INSERT INTO collection_runs (id, started_at, trigger) VALUES ('r1', ?1, 'manual')")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(health) = run_health(State(pool.clone()), me.clone(), Query(RunHealthQuery::default()))
+            .await
+            .unwrap();
+        let progress = health.in_progress.expect("a live run should be reported");
+        assert_eq!(progress.run_id, "r1");
+        assert_eq!(progress.sources_done, 0);
+
+        // Once it finishes, the banner must clear.
+        sqlx::query("UPDATE collection_runs SET finished_at = ?1 WHERE id = 'r1'")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(health) = run_health(State(pool.clone()), me, Query(RunHealthQuery::default()))
+            .await
+            .unwrap();
+        assert!(health.in_progress.is_none());
+    }
 }

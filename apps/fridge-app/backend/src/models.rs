@@ -288,6 +288,79 @@ pub struct ListPostsQuery {
     pub sort: SortOrder,
     /// Free-text search across title and body. Whitespace-only is treated as absent.
     pub q: Option<String>,
+    /// How many posts to return. Absent means `DEFAULT_BLOG_PAGE_SIZE`.
+    ///
+    /// `u32` rather than `i64` so a negative value is rejected by the `Query` extractor as a
+    /// 400 before it can reach SQL, where `LIMIT -1` means *no limit*.
+    pub limit: Option<u32>,
+    /// Where to resume from — the `next_cursor` of the previous page. Absent means the start.
+    ///
+    /// Replaced `offset`, which could not be made correct: offsets are positions in a list
+    /// that shifts. Publishing a post while someone browsed pushed every row down one, so the
+    /// next page re-served the last row of the previous one and a Load more list showed it
+    /// twice; removing a row skipped one instead.
+    pub cursor: Option<String>,
+}
+
+/// Encodes the position of the last row on a page.
+///
+/// `(created_at, id)` because that is exactly the `ORDER BY`, and a cursor that does not match
+/// the sort key cannot describe a position in it. Hex-encoded to make it opaque — clients
+/// should hand back what they were given rather than construct one — using `hex`, which is
+/// already a dependency, rather than adding a base64 crate for the same job.
+pub fn encode_cursor(created_at: DateTime<Utc>, id: &str) -> String {
+    hex::encode(format!("{}|{}", created_at.to_rfc3339(), id))
+}
+
+/// The inverse. `None` for anything malformed, which the handler turns into a 400 — a cursor
+/// that cannot be read is a caller error, not an empty page.
+pub fn decode_cursor(raw: &str) -> Option<(DateTime<Utc>, String)> {
+    let text = String::from_utf8(hex::decode(raw).ok()?).ok()?;
+    let (timestamp, id) = text.split_once('|')?;
+    if id.is_empty() {
+        return None;
+    }
+    let created_at = DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .with_timezone(&Utc);
+    Some((created_at, id.to_string()))
+}
+
+/// Returned when no `limit` is given.
+pub const DEFAULT_BLOG_PAGE_SIZE: u32 = 20;
+
+/// The largest page a caller may ask for.
+///
+/// Asking for more is a **400, not a silent clamp**. A clamp would hand back 100 posts to a
+/// caller who asked for 1000 and believes it now holds everything — the same
+/// looks-complete-but-isn't failure that makes `?sort=oldset` a 400 rather than a quiet
+/// fallback to newest.
+pub const MAX_BLOG_PAGE_SIZE: u32 = 100;
+
+/// A default larger than the maximum would make every unparameterised request a 400. Checked
+/// at compile time rather than in a test, so it cannot be broken by an edit that skips `cargo
+/// test`.
+const _: () = assert!(DEFAULT_BLOG_PAGE_SIZE <= MAX_BLOG_PAGE_SIZE);
+
+/// One page of posts.
+///
+/// An envelope rather than a bare array because the count is not derivable from the page: a
+/// full page tells you nothing about whether more exist, and the admin view needs to say how
+/// many posts there are. Sending it in a header instead would need
+/// `Access-Control-Expose-Headers`, and a header the browser silently refuses to expose is a
+/// worse failure than a slightly larger body.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlogPostPage {
+    pub posts: Vec<BlogPost>,
+    /// Total matching posts **the requester may see** — filtered exactly like the page, so it
+    /// never reveals how many drafts exist to someone who cannot read them.
+    ///
+    /// Deliberately counted *without* the cursor: this is the size of the whole result set, so
+    /// "showing 20 of 143" stays true on every page rather than shrinking as you advance.
+    pub total: i64,
+    pub limit: u32,
+    /// Pass as `?cursor=` for the next page. `None` means this is the last one.
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +381,35 @@ pub struct UpdateBlogPostRequest {
 
 pub const MAX_BLOG_TITLE_LENGTH: usize = 200;
 pub const MAX_BLOG_BODY_LENGTH: usize = 100_000;
+
+/// Whether `text` is longer than `max` **characters**.
+///
+/// Exists because `str::len()` is a byte count, and using it here silently made the limits
+/// stricter for anyone not writing in ASCII: a 200-character CJK title is 600 bytes and was
+/// rejected, despite `docs/BLOG.md` documenting the limit in characters. The limits are a
+/// contract with the author about how much they may write, so characters is the honest unit.
+///
+/// `chars()` counts Unicode scalar values, not grapheme clusters — a family emoji or a
+/// combining accent still costs more than one. That is a far smaller discrepancy than
+/// bytes-vs-chars, and closing it would mean a dependency for a limit nobody writes up
+/// against.
+pub fn exceeds_char_limit(text: &str, max: usize) -> bool {
+    text.chars().count() > max
+}
+
+/// Whether `text` is empty or contains nothing but whitespace.
+///
+/// Named and shared because the two ingest paths disagreed: `create_post` tested
+/// `is_empty()`, so a body of `"   "` was a valid post through the API, while the file path
+/// tested `trim().is_empty()` and rejected the same content. The same post was simultaneously
+/// legal and illegal depending on how it arrived.
+///
+/// Only ever used to *validate*. The body is stored exactly as written — trimming it here
+/// would silently rewrite an author's markdown, and leading whitespace is significant to an
+/// indented code block.
+pub fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
 
 /// Turns a title into a URL-safe slug: lowercased, runs of non-alphanumeric characters
 /// collapsed to a single hyphen, no leading or trailing hyphen. Not unique by itself — see
@@ -393,6 +495,81 @@ mod tests {
     // and that is decided by the derive, not by the wire format.
     fn parse_sort(value: &str) -> Result<SortOrder, serde_json::Error> {
         serde_json::from_value(serde_json::Value::String(value.to_string()))
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_rejects_anything_else() {
+        let at: DateTime<Utc> = "2026-08-19T00:00:00+00:00".parse().unwrap();
+        let encoded = encode_cursor(at, "post-1");
+        assert_eq!(decode_cursor(&encoded), Some((at, "post-1".to_string())));
+
+        // Fractional seconds must survive too — API-written posts have them, and a cursor that
+        // rounded would re-serve or skip the row it points at.
+        let precise: DateTime<Utc> = "2026-08-30T15:16:57.656421+00:00".parse().unwrap();
+        assert_eq!(
+            decode_cursor(&encode_cursor(precise, "post-2")),
+            Some((precise, "post-2".to_string()))
+        );
+
+        assert_eq!(decode_cursor("not-hex"), None);
+        assert_eq!(decode_cursor(&hex::encode("no-separator")), None);
+        assert_eq!(
+            decode_cursor(&hex::encode("2026-08-19T00:00:00+00:00|")),
+            None
+        );
+        assert_eq!(decode_cursor(&hex::encode("not-a-date|post-1")), None);
+        assert_eq!(decode_cursor(""), None);
+    }
+
+    #[test]
+    fn blankness_covers_every_flavour_of_whitespace() {
+        assert!(is_blank(""));
+        assert!(is_blank("   "));
+        assert!(is_blank("\t\n\r\n  "));
+        assert!(is_blank("\u{00a0}"), "a non-breaking space is still blank");
+
+        assert!(!is_blank("a"));
+        assert!(!is_blank("  a  "));
+    }
+
+    #[test]
+    fn limits_are_measured_in_characters_not_bytes() {
+        let ascii = "a".repeat(MAX_BLOG_TITLE_LENGTH);
+        let cjk = "字".repeat(MAX_BLOG_TITLE_LENGTH);
+
+        assert!(
+            cjk.len() > MAX_BLOG_TITLE_LENGTH,
+            "premise: bytes exceed chars"
+        );
+        assert!(!exceeds_char_limit(&ascii, MAX_BLOG_TITLE_LENGTH));
+        assert!(
+            !exceeds_char_limit(&cjk, MAX_BLOG_TITLE_LENGTH),
+            "a non-ASCII title at exactly the limit is within it"
+        );
+
+        assert!(exceeds_char_limit(
+            &"a".repeat(MAX_BLOG_TITLE_LENGTH + 1),
+            MAX_BLOG_TITLE_LENGTH
+        ));
+        assert!(exceeds_char_limit(
+            &"字".repeat(MAX_BLOG_TITLE_LENGTH + 1),
+            MAX_BLOG_TITLE_LENGTH
+        ));
+    }
+
+    #[test]
+    fn paging_params_default_and_are_bounded() {
+        let q: ListPostsQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, None, "absent means the handler's default");
+        assert_eq!(q.cursor, None);
+
+        let q: ListPostsQuery = serde_json::from_str(r#"{"limit":50}"#).unwrap();
+        assert_eq!(q.limit, Some(50));
+
+        // `u32`, so a negative never reaches SQL — where `LIMIT -1` means *no limit*, which
+        // would turn a typo into "return everything" rather than an error.
+        assert!(serde_json::from_str::<ListPostsQuery>(r#"{"limit":-1}"#).is_err());
+        assert!(serde_json::from_str::<ListPostsQuery>(r#"{"limit":"20"}"#).is_err());
     }
 
     #[test]

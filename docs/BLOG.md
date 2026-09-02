@@ -44,6 +44,7 @@ means every new account is a non-admin without anyone remembering to set it.
 | `published` | `0` = draft (admin-only), `1` = public |
 | `created_at`, `updated_at` | `updated_at` moves on every edit; `created_at` never does |
 | `source` | migration `0011`. `'db'` = written in the browser, `'file'` = synced from `content/blog/*.md`. `DEFAULT 'db'` backfilled every pre-existing row correctly |
+| `source_path` | migration `0016`. The filename a file post came from. NULL for db posts and for file posts predating the migration. **This is what the mirror sweep keys on** — see below |
 
 ## Backend
 
@@ -51,7 +52,7 @@ means every new account is a non-admin without anyone remembering to set it.
 
 | Function | What it does |
 |---|---|
-| `list_posts` | `GET /blog/posts?sort=&q=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
+| `list_posts` | `GET /blog/posts?sort=&q=&limit=&cursor=`. Takes `MaybeUser`, so it works signed out. Admins get drafts too; everyone else gets `published = 1` only. Builds one statement from a list of conditions — draft filter, optional search, `ORDER BY` — so sort and search compose and cover both post kinds. |
 | `like_pattern` | Escapes `\`, `%`, `_` and wraps in `%…%`, paired with `ESCAPE '\'`. Without it, searching `100%` returns every post. Unit-tested. |
 | `reject_if_file_sourced` | The **409** on a file-sourced post. Called by `update_post` and `delete_post`. |
 | `sync_posts` | `POST /blog/sync`. Admin-only. Re-runs the file sync and returns `{created, updated, deleted, skipped}` so a push can publish without a backend restart. |
@@ -68,9 +69,12 @@ Ingests `content/blog/*.md`. Runs at startup from `main.rs` and on demand from `
 | Function | What it does |
 |---|---|
 | `content_dir` | `BLOG_CONTENT_DIR`, else `content/blog` resolved off `CARGO_MANIFEST_DIR`. **`include_str!` can't be used here** — the pattern `foodkeeper.rs`/`themealdb.rs` use needs a fixed file list at compile time, and the whole point is adding a file without touching code. A runtime read means the working directory matters, hence the manifest-relative default. |
-| `parse_front_matter` | Hand-rolled, no crate: the schema is four flat scalars. Returns `(FrontMatter, body)`. **An unknown key is an error** — a misspelled `pubished: true` would otherwise leave a post a draft forever with no symptom. |
+| `parse_front_matter` | Hand-rolled, no crate: the schema is four flat scalars. Returns `(FrontMatter, body)`. **An unknown key is an error, and so is a repeated one** — a misspelled `pubished: true` would otherwise leave a post a draft forever with no symptom, and a duplicated `published:` would leave the file plainly contradicting the live post. |
+| `slug_for` | The slug, or *why there isn't one*. Names whichever source was at fault — a bad frontmatter `slug:` used to blame the filename. |
 | `read_dir_posts` | Reads and validates every `.md`; skips `README.md`; enforces the same title/body length limits `create_post` does, since a file bypasses that handler. A bad file is skipped and logged, never fatal. |
-| `sync` | Upserts by slug among `source = 'file'` rows, then **deletes file-sourced rows whose file is gone**. Mirrors the directory rather than importing from it. |
+| `sync` / `sync_in` | Upserts by slug among `source = 'file'` rows, then **deletes rows whose file is absent from disk**. Mirrors the directory rather than importing from it. Returns a `SyncOutcome`, not a bare report. `sync_in` takes an explicit directory — the seam tests use, since `content_dir()` reads an env var and mutating process env races every other test. |
+| `SyncOutcome` | `Completed(report)` = the directory was reconciled. `Deferred(reason)` = nothing was attempted (no admin yet, or the directory could not be read). **The watcher advances its fingerprint only on `Completed`**; see below. |
+| `watch_tick` / `WatchState` | One watcher iteration, extracted so tests can drive it. `WatchState` holds the last *successfully reconciled* fingerprint plus the current deferral reason, so a retry loop logs its reason once rather than every tick. |
 | `is_post_file` | The one predicate for "is this a post" (`.md`, not `README`). **Shared by the reader and the watcher on purpose** — if their idea of which files matter drifted, you'd get changes that never trigger a sync, or a sync that loops on a file it then ignores. |
 | `fingerprint` | `(filename, mtime, size)` per post file, sorted. `None` for a missing directory, distinct from `Some(vec![])` for an empty one — creating the directory is itself a change. |
 | `parse_interval` / `sync_interval` | `BLOG_SYNC_INTERVAL_SECS`, default 5, `0` disables. Split so the parsing is testable — mutating process env from a test races every other test in the binary. |
@@ -78,12 +82,21 @@ Ingests `content/blog/*.md`. Runs at startup from `main.rs` and on demand from `
 
 Rules that are easy to break by "simplifying":
 
+- **The sweep tests file presence, not parse success.** It originally matched rows against the
+  slugs of *successfully parsed* files, so a frontmatter typo deleted the live post — a failure
+  to *read* was being treated as evidence of *absence*, and repairing the typo reinserted the
+  post under a fresh UUID. Rows now carry `source_path` and are deleted only when that file is
+  genuinely gone. Slug alone could not carry this: a file with an explicit frontmatter `slug:`
+  cannot be matched back to its row once it stops parsing. Pre-`0016` rows (NULL `source_path`)
+  fall back to the old slug test so upgrading deletes nothing, and backfill on the next sync.
 - **A file's slug comes from its filename, not its title** (frontmatter `slug` overrides).
   The filename is the only identity a file has that editing its contents doesn't change —
   which is what makes the never-rewrite-a-slug rule hold for files too.
 - **`created_at` comes from frontmatter `date`, never file mtime.** mtime is reset by
   `git clone`/`git checkout`, so sorting by it would reshuffle the blog on a fresh checkout.
-- **`author_id` is the first-registered admin.** The column is `NOT NULL REFERENCES users(id)`
+- **`author_id` is the first-registered admin** — `ORDER BY created_at ASC, id ASC`, with `id`
+  only as a tiebreaker. It once ordered by `id` alone, which sorts random UUIDs, so the owning
+  admin was arbitrary and contradicted this very sentence. The column is `NOT NULL REFERENCES users(id)`
   and a file carries no author. With no admin yet, the sync logs and skips rather than
   panicking during boot.
 - **On a slug collision with a `source = 'db'` post, the file loses** and is logged. Taking the
@@ -98,13 +111,18 @@ Rules that are easy to break by "simplifying":
 | `BlogPost.source` | `"db"` or `"file"`; serialized to JSON, which is how the admin UI knows to hide Edit/Delete |
 | `BLOG_SOURCE_DB` / `BLOG_SOURCE_FILE` | The two values, named once |
 | `SortOrder` | `newest` / `oldest` enum. Being an enum is the point: `Query` rejects `?sort=oldset` as **400** rather than silently defaulting to newest |
-| `ListPostsQuery` | `{ sort, q }`, both optional |
+| `ListPostsQuery` | `{ sort, q, limit, cursor }`, all optional. `limit` is `u32`, so a negative is a 400 before it reaches SQL — where `LIMIT -1` means *no limit*, turning a typo into "return everything". A malformed `cursor` is also a 400, not an empty first page |
+| `encode_cursor` / `decode_cursor` | Hex-encoded `(created_at, id)` — the sort key, because a cursor that doesn't match the `ORDER BY` can't name a position in it. Hex rather than base64 to avoid a crate for the job |
+| `DEFAULT_BLOG_PAGE_SIZE` / `MAX_BLOG_PAGE_SIZE` | 20 / 100. A `const _: () = assert!(default <= max)` fails the *build*, not a test |
+| `BlogPostPage` | `{ posts, total, limit, next_cursor }` — the response envelope. `next_cursor` is `null` on the last page |
 | `User.is_admin` | The flag, read fresh from the DB on every request |
 | `BlogPost` | The row struct — serialized straight to JSON as the API response |
 | `CreateBlogPostRequest` | `{ title, body, published }`; `published` defaults false |
 | `UpdateBlogPostRequest` | Same fields, all `Option` — absent means "leave alone" |
 | `slugify(title)` | Lowercases, collapses non-alphanumeric runs to one hyphen, trims hyphens. Pure and unit-tested (4 tests). |
-| `MAX_BLOG_TITLE_LENGTH` / `MAX_BLOG_BODY_LENGTH` | 200 / 100,000 chars |
+| `MAX_BLOG_TITLE_LENGTH` / `MAX_BLOG_BODY_LENGTH` | 200 / 100,000 **characters** |
+| `exceeds_char_limit` | The limit check. `str::len()` is bytes, and using it made the limits silently stricter for non-ASCII — a 200-character CJK title is 600 bytes and was rejected. Counts scalar values, not grapheme clusters. |
+| `is_blank` | Empty-or-whitespace. Used to *validate* only; bodies are stored verbatim, since trimming would rewrite an author's markdown and leading whitespace is significant to an indented code block. |
 
 ### `src/routes/auth.rs` *(changed)*
 
@@ -171,6 +189,15 @@ Publishing is **automatic**: a background task re-checks the directory every
 `BLOG_SYNC_INTERVAL_SECS` (default 5) and syncs when it changed. Startup sync and admin-only
 `POST /blog/sync` both remain — the latter forces a check immediately.
 
+**A tick advances the fingerprint only when the sync actually reconciled.** It used to advance
+before calling sync at all, so a tick whose sync did nothing still consumed the change. The
+realistic trigger was a fresh database: with no admin, `sync` correctly does nothing by design,
+the watcher recorded the change as handled, and files dropped in beforehand never appeared no
+matter how long it ran. `Deferred` now leaves the fingerprint untouched so the next tick
+retries. A missing directory is `Completed`, not `Deferred` — it is a stable state with nothing
+to reconcile, and deferring would spin forever; a directory that exists but cannot be *read* is
+`Deferred`, because an I/O error is not evidence its posts are gone.
+
 **Why polling rather than `notify`.** Two reasons. First, cost: a tick is one `read_dir` plus a
 `stat` per file, with no file reads, no database round-trip, and nothing logged unless the
 fingerprint actually changed — so the idle cost is real but negligible, and `notify` plus a
@@ -188,6 +215,46 @@ Three designs were considered (`docs/PLAN.md` lists all three). Sync-into-one-ta
 it is the only one where sort and search are written *once*: read-through and the GitHub API
 both merge two stores in the query layer, so every future query feature gets implemented twice.
 The cost is that changes need a sync rather than being live.
+
+## Pagination
+
+`GET /blog/posts?limit=&cursor=` returning `{ posts, total, limit, next_cursor }`. Default 20,
+max 100. Four decisions, each with a plausible-looking wrong answer:
+
+- **An envelope, not a bare array plus `X-Total-Count`.** A custom header needs
+  `Access-Control-Expose-Headers` to be readable cross-origin, and a header the browser
+  silently declines to expose is a worse failure mode than a slightly larger body. The count
+  is also not derivable from the page — a full page says nothing about whether more exist.
+- **Over-limit is a 400, not a clamp.** `?limit=1000` quietly returning 100 hands the caller a
+  partial answer it believes is complete. Same reasoning as `?sort=oldset` being a 400 rather
+  than a silent fallback to newest.
+- **`total` reuses the page's `WHERE`, draft filter included.** Counting without it would tell
+  a signed-out visitor exactly how many unpublished posts exist — the number leaks precisely
+  what hiding the rows protects. Verified: 25 published + 2 drafts reads as `total=25` to anon
+  and `total=27` to an admin.
+- **Keyset, not offset.** It shipped with `offset` and that was wrong: an offset is a position
+  in a list that moves. Publishing a post mid-browse shifted every row down one, so the next
+  page re-served the last row of the previous one and Load more showed it twice (finding J17).
+  The cursor carries `(created_at, id)` — the sort key itself — and `next_cursor` is `null` on
+  the last page, so "is there more" is the server's answer rather than arithmetic on `total`.
+  The predicate has to mirror the *mixed* `ORDER BY` (`created_at <dir>, id ASC`), so it cannot
+  be one row-value comparison; getting it wrong silently skips or repeats rather than erroring.
+- **`ORDER BY created_at …, id ASC` — the tiebreaker is load-bearing.** File posts take
+  `created_at` from a frontmatter *day*, so they are all midnight and ties are the norm, not
+  the exception. Without a total order SQLite may answer page 2 in a different order than page
+  1, **showing one post twice and silently dropping another** — and with keyset paging there
+  would be no single "next row" for a cursor to name at all. Verified by paging 25 tied posts
+  across no-search, `?q=`, and `sort=oldest`: every case covered all 25 exactly once.
+
+Frontend: `/blog` appends with a Load more button and a "Showing 20 of 23" line, clearing the
+cursor whenever the search or sort changes. The loading state only takes over the page when
+there is nothing to show yet — while *appending*, the list stays and the button carries it.
+`/blog/admin` asks for `BLOG_ADMIN_PAGE_LIMIT` (100) in one go rather than paging, and renders
+a visible warning if `total` exceeds it instead of silently showing a prefix.
+
+**This is a coupled change.** The frontend requires the envelope, so a backend still running a
+pre-pagination binary breaks `/blog` outright — restart the backend and the dev server
+together.
 
 ## Why `LIKE` and not FTS5
 
@@ -311,8 +378,8 @@ its counts. **A `<script>` tag typed into the editor renders as literal text —
 elements in the DOM**, which is the `react-markdown`-escapes-by-default property being real
 rather than assumed. No console errors.
 
-`cargo test`: **141 passed** (117 + 24 new), clippy clean, `tsc --noEmit` clean, `npm run lint`
-still exactly the 2 pre-existing errors.
+`cargo test` at the time: **141 passed** (117 + 24 new), clippy clean, `tsc --noEmit` clean,
+`npm run lint` still exactly the 2 pre-existing errors.
 
 **Auto-sync verified live** against the real `fridge.db`, with no restart and no button press:
 a dropped file appeared in ~3s, an in-place edit landed in ~6s, and deleting the file removed
@@ -323,3 +390,84 @@ every poll would bury every other line the backend prints.
 One bug the compiler caught that a test would not have: `sync` accumulated its skip count in a
 local that never reached the returned `SyncReport`, so `skipped` would always have been `0` —
 an `unused_assignments` warning, not a failing assertion.
+
+## Adversarial stress test (2026-08-30)
+
+The Phase 6 checkpoint above passed and proved less than it looked like it did: it was written
+by the same person who designed the feature, so it exercised the paths as designed. A
+deliberately adversarial pass — "assume there are real bugs you haven't seen" — found **five**,
+none of which the checkpoint could have caught, because each is a *combination* or a *failure
+mode* rather than a feature. Method and hypotheses: `docs/BLOG_STRESS_TEST_PLAN.md`.
+
+| # | Bug | Fixed by |
+|---|---|---|
+| H1 | A frontmatter typo **deleted the published post**, and repairing it reinserted the post under a new UUID | `source_path` (migration `0016`); the sweep keys on file presence |
+| H2 | The watcher advanced its fingerprint before the sync ran, so a tick that did nothing still consumed the change — files added before the first admin never appeared | `SyncOutcome::Deferred`; the fingerprint advances only on `Completed` |
+| H3 | Length limits counted **bytes** while the docs promised characters, so a 200-char CJK title 400'd | `models::exceeds_char_limit` |
+| H5 | A whitespace-only body was **valid via the API and invalid via a file** | `models::is_blank`, shared by all four call sites |
+| H7 | "First-registered admin" was really "lowest UUID" | `ORDER BY created_at ASC, id ASC` |
+| H8 | A long unbroken token made the page **2255px wide in a 900px viewport**, pushing every element sideways | `overflow-wrap: anywhere` + `min-width: 0` on `.markdown-body` |
+| H9 | A failed search kept the **previous query's results** on screen under the error banner, with no loading state | the catch clears `posts`; `loading` is derived from a request key |
+
+Two hypotheses were **refuted**, and are worth recording so nobody re-investigates them:
+
+- **Timestamp ordering.** File posts (`…T00:00:00+00:00`) and API posts
+  (`…T15:16:57.656421+00:00`) genuinely use different encodings, but lexicographic `ORDER BY`
+  is still chronologically correct, because the fraction appears only after the seconds field
+  and `+` (0x2B) sorts before `.` (0x2E). A **`Z`-suffixed** timestamp *would* break it, since
+  `Z` sorts after `.` — nothing in the app writes one, but the Phase 6 checkpoint backdated a
+  row by hand with exactly that. `created_at_sorts_chronologically_across_both_post_kinds`
+  guards the invariant.
+- **`javascript:` URLs in markdown.** `react-markdown` ships
+  `safeProtocol = /^(https?|ircs?|mailto|xmpp)$/i` and strips anything else. Note this is a
+  *separate* mechanism from the raw-HTML escaping already verified — both are needed, and
+  neither implies the other.
+
+**The pattern behind H1 and H2 is the same, and it is worth naming: treating "I looked" as "I
+succeeded."** H1 read a failure to parse as evidence the file was gone; H2 read a completed
+tick as evidence the work was done. Both are the "disappearance is not closure" trap written
+into `docs/PLAN.md` § Phase 7 — which was authored *after* this code shipped with the bug in it.
+
+**H3 and H5 also share a cause:** one rule written twice, in two places, which then drifted.
+Both were fixed by extracting a named predicate rather than patching the copy that was wrong.
+
+`cargo test`: **663 passed, 0 failed**, clippy clean, `tsc` clean, lint back to exactly the 2
+pre-existing errors. The five backend fixes were re-verified end-to-end against a copy of the
+real `fridge.db` over HTTP; H8 and H9 are frontend and were verified in the browser, since
+there is no JS test harness in this project.
+
+**Two rules the CSS fix encodes**, both easy to undo by accident:
+
+- `overflow-wrap: **anywhere**`, not `break-word` — only `anywhere` also shrinks the element's
+  intrinsic min-content width, which is what stops a flex or grid parent being sized by an
+  unbroken token.
+- `pre` keeps `overflow-wrap: normal` **on purpose**. Prose wraps; code scrolls. Re-flowing a
+  code block changes what it appears to say.
+
+### Second pass (2026-08-31)
+
+The "areas to probe" table, worked through: **four findings, five refutations**. Full detail in
+`docs/BLOG_STRESS_TEST_PLAN.md` § Second pass.
+
+| # | Finding | State |
+|---|---|---|
+| J1 | `create_post` returned **500 under contention** — `SELECT EXISTS` then `INSERT`, with nothing holding between. Ten concurrent creates of one title gave **six 500s** | **Fixed** — the `UNIQUE` constraint arbitrates; 10× 201 after |
+| J17 | Offset paging repeated a post if something published mid-browse | **Fixed** — keyset `cursor` replaces `offset` |
+| J2 | Duplicate frontmatter keys silently took the last, though an *unknown* key is a hard error | **Fixed** — a repeat fails the file and names itself |
+| J12 | A bad frontmatter `slug:` reported "**filename** produces an empty slug" | **Fixed** — `slug_for` names the source that caused it |
+
+Refuted: auth revocation (immediate, no re-login), pagination edges, hostile input, and sync ×
+API collision. Most usefully, **volume**: 1000 file posts sync in 380ms, re-sync in 127ms, and
+every read takes 9ms; a quiet watcher tick over 1006 files is 2.1ms. That is measured evidence
+for two decisions that had only been argued — **LIKE over FTS5**, and **polling over `notify`**.
+
+**One documented-behaviour gap:** removing the *entire* content directory keeps every post,
+while removing one file deletes its post. Conservative and consistent with the principle that
+fixed H1 — an I/O failure is not evidence of absence — but it does contradict the flat claim
+that sync "mirrors" the directory.
+
+### Still open from that pass
+
+- Untested areas: concurrency (racing `unique_slug` → UNIQUE violation → 500?), sync × API
+  interleaving, frontmatter fuzzing (BOM, CRLF, duplicate keys, non-UTF-8, symlinks), and
+  volume (1,000 posts).

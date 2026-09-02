@@ -1,0 +1,160 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #111827;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #b45309;
+  --bad: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111827;
+    --fg: #f3f4f6;
+    --muted: #9ca3af;
+    --line: #374151;
+    --accent: #fbbf24;
+    --bad: #f87171;
+  }
+}
+
+body {
+  width: 22rem;
+  margin: 0;
+  padding: 0.75rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.status {
+  margin: 0.5rem 0;
+  color: var(--muted);
+}
+
+.status.bad {
+  color: var(--bad);
+}
+
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+.events li {
+  border-top: 1px solid var(--line);
+  padding: 0.45rem 0;
+}
+
+.events a {
+  color: inherit;
+  text-decoration: none;
+  display: block;
+}
+
+.events a:hover .title {
+  text-decoration: underline;
+}
+
+.title {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.body {
+  color: var(--fg);
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.empty {
+  color: var(--muted);
+}
+
+footer {
+  display: flex;
+  gap: 0.75rem;
+  border-top: 1px solid var(--line);
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+footer a {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.autofill {
+  border-top: 1px solid var(--line);
+  margin: 0.5rem 0;
+  padding-top: 0.5rem;
+}
+
+.autofill button {
+  width: 100%;
+}
+
+.autofill .meta {
+  margin: 0.35rem 0 0;
+}
+
+.answers {
+  margin-top: 0.4rem;
+}
+
+.answers .question {
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+
+.answers .suggestion {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-top: 0.25rem;
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.answers .suggestion:hover {
+  border-color: var(--accent);
+}
+
+.answers .none {
+  color: var(--muted);
+  font-size: 0.9em;
+}

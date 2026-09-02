@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod blog;
 pub mod health;
+pub mod hunt;
+pub mod inbox;
 pub mod internships;
 pub mod items;
 pub mod recipes;
@@ -17,7 +19,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use sqlx::SqlitePool;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::GoogleOAuthConfig;
 use crate::foodkeeper::Catalog;
@@ -76,13 +78,73 @@ fn allowed_origins() -> Vec<HeaderValue> {
         .collect()
 }
 
+/// The scheme every Firefox extension page is served from.
+const FIREFOX_EXTENSION_SCHEME: &str = "moz-extension://";
+
+/// Whether a request's `Origin` may read our responses.
+///
+/// Two ways in, and the second is a deliberate widening made on 2026-08-30:
+///
+/// 1. It is listed in `ALLOWED_ORIGINS` — the site itself.
+/// 2. It is **any** `moz-extension://` origin — the hunt extension (Phase 8).
+///
+/// # Why the extension needs naming at all
+///
+/// The extension fetches with `credentials: "include"`, which makes every call a credentialed
+/// cross-origin request, and the browser **discards the response** unless it carries an
+/// `Access-Control-Allow-Origin` naming the caller. Reaching JS as a bare `TypeError`
+/// indistinguishable from a dead server, this cost an evening: the extension reported "can't
+/// reach localhost" while `curl` got 200s from the same URL.
+///
+/// # Why any extension rather than one
+///
+/// An extension's origin is `moz-extension://<uuid>` where the UUID is generated **per Firefox
+/// profile**, so pinning it means a per-machine, per-profile `.env` edit that breaks on a new
+/// profile and reads like a bug when it does.
+///
+/// The cost, accepted knowingly by the user: any Firefox extension they install could call
+/// this API with their session cookie attached. That is narrower than it sounds — the
+/// extension must also hold a host permission for this origin, which Firefox makes the user
+/// grant per extension — but it is wider than naming one UUID, and it is the reason this is a
+/// documented decision rather than a convenience.
+///
+/// **This is a local development posture.** Before deploying anywhere reachable from the
+/// internet, revisit it alongside the other three items in `docs/PLAN.md` § After Phase 5
+/// (`COOKIE_SECURE`, `SameSite`, rate limiting).
+fn is_allowed_origin(configured: &[HeaderValue], origin: &HeaderValue) -> bool {
+    if configured.iter().any(|allowed| allowed == origin) {
+        return true;
+    }
+    origin
+        .as_bytes()
+        .starts_with(FIREFOX_EXTENSION_SCHEME.as_bytes())
+}
+
 // This function first sets up the CORS layer for brower-enforced access control of communication between the frontend and backend.
 // It then builds the router to match client HTTP requests to (path,method) pairs to yield the correct handler
 pub fn build_router(state: AppState) -> Router {
+    let configured = allowed_origins();
     let cors = CorsLayer::new()
-        .allow_origin(allowed_origins())
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PATCH])
-        .allow_headers([header::CONTENT_TYPE])
+        // A predicate rather than a list, because the set is no longer enumerable in advance.
+        // It still echoes the specific requesting origin rather than `*`, which is required
+        // for a credentialed request and is why this cannot simply be `allow_origin(Any)`.
+        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
+            is_allowed_origin(&configured, origin)
+        }))
+        // PUT joins the list for `/hunt/profile`. A method missing here is refused at the
+        // preflight, which surfaces as a failed fetch rather than as a 405 — the same
+        // "looks like the backend is down" trap the AUTHORIZATION header hit.
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+        ])
+        // AUTHORIZATION is here for the extension's bearer token. Without it the preflight
+        // refuses the header and the request never arrives — which looks, once again, exactly
+        // like a backend that is down.
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         // Enables the server to send a response to the client
         .allow_credentials(true);
 
@@ -128,8 +190,39 @@ pub fn build_router(state: AppState) -> Router {
             "/internships/applications",
             get(internships::list_applications).post(internships::create_application),
         )
+        .route("/hunt/events", get(hunt::list_events))
+        .route("/hunt/events/{id}/ack", post(hunt::ack_event))
+        .route(
+            "/hunt/tokens",
+            get(hunt::list_tokens).post(hunt::create_token),
+        )
+        .route("/hunt/tokens/{id}", delete(hunt::revoke_token))
+        .route(
+            "/hunt/profile",
+            get(hunt::get_profile).put(hunt::put_profile),
+        )
+        .route("/hunt/posting-for", get(hunt::posting_for_page))
+        .route("/auth/gmail/start", get(inbox::start))
+        .route("/auth/gmail/callback", get(inbox::callback))
+        .route("/hunt/inbox/status", get(inbox::status))
+        .route("/hunt/inbox/sync", post(inbox::sync_now))
+        .route("/hunt/inbox/disconnect", post(inbox::disconnect))
+        .route("/hunt/proposals", get(inbox::proposals))
+        .route("/hunt/proposals/{id}/accept", post(inbox::accept_proposal))
+        .route("/hunt/proposals/{id}/reject", post(inbox::reject_proposal))
+        .route(
+            "/hunt/answers",
+            get(hunt::list_answers).post(hunt::create_answer),
+        )
+        .route(
+            "/hunt/answers/{id}",
+            patch(hunt::edit_answer).delete(hunt::delete_answer),
+        )
+        .route("/hunt/answers/{id}/revisions", get(hunt::answer_revisions))
+        .route("/hunt/answers/{id}/used", post(hunt::use_answer))
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
+        .route("/internships/collect", post(internships::collect_now))
         .route("/internships/runs", get(internships::run_health))
         .route(
             "/internships/runs/{source_run_id}/rejects",
@@ -145,4 +238,51 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(cors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured() -> Vec<HeaderValue> {
+        vec![HeaderValue::from_static("http://localhost:3000")]
+    }
+
+    #[test]
+    fn the_configured_site_origin_is_allowed() {
+        assert!(is_allowed_origin(
+            &configured(),
+            &HeaderValue::from_static("http://localhost:3000")
+        ));
+    }
+
+    #[test]
+    fn any_firefox_extension_origin_is_allowed() {
+        // Per-profile UUIDs, so the set cannot be enumerated in advance.
+        for uuid in [
+            "moz-extension://11111111-2222-3333-4444-555555555555",
+            "moz-extension://deadbeef-0000-0000-0000-000000000000",
+        ] {
+            assert!(
+                is_allowed_origin(&configured(), &HeaderValue::from_str(uuid).unwrap()),
+                "{uuid} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_origin_is_still_refused() {
+        for origin in [
+            "https://evil.example.com",
+            "http://localhost:3001",
+            // The prefix check must be on the scheme, not a substring anywhere in the value.
+            "https://moz-extension.evil.example.com",
+            "moz-extension-evil://11111111-2222-3333-4444-555555555555",
+        ] {
+            assert!(
+                !is_allowed_origin(&configured(), &HeaderValue::from_str(origin).unwrap()),
+                "{origin} should be refused"
+            );
+        }
+    }
 }

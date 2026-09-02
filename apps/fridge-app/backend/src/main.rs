@@ -3,6 +3,8 @@ mod blog_files;
 mod db;
 mod expiration;
 mod foodkeeper;
+mod hunt;
+mod inbox;
 mod internships;
 mod models;
 mod nlp;
@@ -27,6 +29,14 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init_pool(&database_url).await?;
 
+    // Dev tooling, dispatched before any of the server's background work starts: a harness
+    // that exports and grades a labelling sheet has no business spawning a blog watcher or a
+    // collector run. See `inbox::labelset` — it is 8b's measurement, not part of the pipeline.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("labelset") {
+        return inbox::labelset::main(&pool, &args[1..]).await;
+    }
+
     // Checks for expired sessions in the session table and purges them
     match auth::purge_expired_sessions(&pool).await {
         Ok(0) => {}
@@ -37,11 +47,16 @@ async fn main() -> anyhow::Result<()> {
     // Reconcile the blog with the markdown files in content/blog/. Deliberately not fatal:
     // the blog falling back to database-only posts shouldn't stop the fridge app from serving.
     match blog_files::sync(&pool).await {
-        Ok(report) if report == blog_files::SyncReport::default() => {}
-        Ok(report) => println!(
+        Ok(blog_files::SyncOutcome::Completed(report))
+            if report == blog_files::SyncReport::default() => {}
+        Ok(blog_files::SyncOutcome::Completed(report)) => println!(
             "blog sync: {} created, {} updated, {} deleted, {} skipped",
             report.created, report.updated, report.deleted, report.skipped
         ),
+        // Not a failure: the watcher will retry, so this is a state to report, not swallow.
+        Ok(blog_files::SyncOutcome::Deferred(reason)) => {
+            println!("blog sync: waiting — {reason}")
+        }
         Err(err) => eprintln!("blog sync failed, serving database posts only: {err:?}"),
     }
 
@@ -49,6 +64,11 @@ async fn main() -> anyhow::Result<()> {
     // Spawned after the startup sync above, which is what its first fingerprint is taken
     // against — otherwise it would immediately re-sync what startup just ingested.
     blog_files::spawn_watcher(pool.clone());
+
+    // Internship collection + the expiry sweep. Both are cadenced by env vars and both
+    // disable cleanly; see `internships::collector`. Spawned rather than awaited — a slow or
+    // blocked job board must never delay the server binding its port.
+    internships::collector::start(pool.clone()).await;
 
     // Load the FoodKeeper and MealDB catalogs
     let catalog = Arc::new(foodkeeper::Catalog::load()?);
@@ -66,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
         Some(_) => println!("Google OAuth configured"),
         None => println!("Google OAuth not configured — password login only"),
     }
+
+    // The inbox agent's background sync (Phase 9). Same shape as the collector: cadenced by an
+    // env var, disables cleanly, spawned rather than awaited so a slow Gmail cannot delay the
+    // server binding its port. Placed here because it needs the Google config above.
+    inbox::sync::spawn(pool.clone(), google_oauth.clone());
 
     // Sets up the router so the server is ready to handle HTTP requests from the frontend when the listening socket is set up
     let app = routes::build_router(routes::AppState {

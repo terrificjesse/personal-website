@@ -8,9 +8,16 @@
 //! - [`models`] — the shared type contract between every stage below. Read it first.
 //! - [`normalize`] — the QC pass. Every raw posting yields exactly one outcome, so
 //!   `fetched = accepted + filtered + rejected` holds and nothing is silently dropped.
+//! - [`prestige`] — the company prestige signal: curated tiers over a derived fallback.
+//! - [`alerts`] — which newly collected postings are worth a desktop notification. Phase 8e;
+//!   it reads `prestige`'s curated tiers and writes `hunt_events`. See `crate::hunt`.
 //! - [`rank`] — hard filters and the composite ranking. Its module doc carries the
 //!   per-input absent-data policy table; read that before changing any weight.
+//! - [`http`] — the shared polite-fetch layer. Every adapter goes through it.
+//! - [`sources`] — one trait per source, plus the isolated runner.
 //! - [`store`] — translation between SQLite rows and the typed models.
+//! - [`collector`] — the coordinator: fetch, QC, dedup, persist, settle, sweep.
+//! - [`dedup`] — the merge key. Exact-only by design; fuzzy matching is a reserved seam.
 //! - [`expiry`] — the disappearance rule and the sweep. Read its module doc before
 //!   touching anything about expiry; the split between its two functions is a safety
 //!   property, not an organizational preference.
@@ -25,8 +32,14 @@
 //!    posting as having vanished, and that rule lives at exactly one write site — see
 //!    `posting_sightings.consecutive_misses` in migration `0012`.
 
+pub mod alerts;
+pub mod collector;
+pub mod dedup;
 pub mod expiry;
+pub mod http;
 pub mod models;
 pub mod normalize;
+pub mod prestige;
 pub mod rank;
+pub mod sources;
 pub mod store;

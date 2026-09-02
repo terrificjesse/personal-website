@@ -75,5 +75,9 @@ export const config = {
   //
   // `/login` and `/register` are deliberately **not** matched. They must always render, or a
   // stale cookie locks the user out of the only page that could fix it.
-  matcher: ["/fridge/:path*", "/blog/admin/:path*"],
+  //
+  // The internship tab is entirely per-user — the ranked list, the applied tracker and the
+  // run-health panel all require a session on the backend — so the whole subtree is matched
+  // rather than just a sub-path, unlike the blog where only the editor is gated.
+  matcher: ["/fridge/:path*", "/blog/admin/:path*", "/internships/:path*"],
 };

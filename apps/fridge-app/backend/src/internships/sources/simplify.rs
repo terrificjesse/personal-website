@@ -38,7 +38,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use super::super::http::{Conditional, FetchError};
+use super::super::http::Conditional;
 use super::super::models::RawPosting;
 use super::{BoardDirectory, BoxFuture, Source, SourceContext, SourceFetch, first_string, join_locations};
 

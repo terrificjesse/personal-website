@@ -28,7 +28,10 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::models::{BLOG_SOURCE_FILE, MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, slugify};
+use crate::models::{
+    BLOG_SOURCE_FILE, MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, exceeds_char_limit, is_blank,
+    slugify,
+};
 
 /// Where the markdown lives, relative to the repo root.
 const DEFAULT_CONTENT_SUBPATH: &str = "content/blog";
@@ -48,6 +51,32 @@ pub struct SyncReport {
     /// Files that could not be ingested — unparseable, or their slug is taken by a
     /// browser-authored post. Each one is also logged with its reason.
     pub skipped: usize,
+}
+
+/// What a sync attempt amounted to.
+///
+/// The distinction exists for the watcher. `Completed` means the directory was reconciled, so
+/// the change has been consumed and the fingerprint may advance. `Deferred` means nothing was
+/// attempted and the change is **still outstanding** — advancing past it would lose it, which
+/// is exactly what happened when files were dropped in before any admin account existed: the
+/// sync correctly did nothing, the watcher recorded it as handled, and the posts never
+/// appeared no matter how long it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Completed(SyncReport),
+    /// Nothing was attempted, and why.
+    Deferred(&'static str),
+}
+
+impl SyncOutcome {
+    /// The report, treating a deferral as "nothing happened" — for callers that only want
+    /// counts and have already handled the reason.
+    pub fn report(&self) -> SyncReport {
+        match self {
+            SyncOutcome::Completed(report) => report.clone(),
+            SyncOutcome::Deferred(_) => SyncReport::default(),
+        }
+    }
 }
 
 /// The metadata block at the top of a post file.
@@ -103,7 +132,9 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
 
     let mut title: Option<String> = None;
     let mut date: Option<DateTime<Utc>> = None;
-    let mut published = false;
+    // `Option`, not `bool`, only so a repeat can be told from the default. Unwrapped to
+    // `false` at the end.
+    let mut published: Option<bool> = None;
     let mut slug: Option<String> = None;
     let mut closed = false;
     let mut body_offset = rest.len();
@@ -131,18 +162,37 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
         let key = key.trim();
         let value = unquote(value.trim());
 
+        // A key given twice is an error, not last-one-wins.
+        //
+        // The rule below — an *unknown* key fails the file — exists to catch typos. A
+        // *repeated* key is the same kind of mistake (a half-finished edit, a bad merge, a
+        // copied block) and silently keeping the last one hides it just as thoroughly: the
+        // file plainly says `published: false` on one line and the post is live anyway.
+        macro_rules! set_once {
+            ($slot:expr, $name:literal, $value:expr) => {{
+                if $slot.is_some() {
+                    return Err(format!(
+                        "frontmatter key `{}` appears more than once",
+                        $name
+                    ));
+                }
+                $slot = Some($value);
+            }};
+        }
+
         match key {
-            "title" => title = Some(value.to_string()),
-            "slug" => slug = Some(value.to_string()),
-            "date" => date = Some(parse_date(value)?),
+            "title" => set_once!(title, "title", value.to_string()),
+            "slug" => set_once!(slug, "slug", value.to_string()),
+            "date" => set_once!(date, "date", parse_date(value)?),
             "published" => {
-                published = match value {
+                let parsed = match value {
                     "true" | "yes" => true,
                     "false" | "no" => false,
                     other => {
                         return Err(format!("`published` must be true or false, got {other:?}"));
                     }
-                }
+                };
+                set_once!(published, "published", parsed);
             }
             other => {
                 return Err(format!(
@@ -172,7 +222,7 @@ pub fn parse_front_matter(text: &str) -> Result<(FrontMatter, String), String> {
         FrontMatter {
             title: title.trim().to_string(),
             date,
-            published,
+            published: published.unwrap_or(false),
             slug: slug.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         },
         body,
@@ -299,7 +349,7 @@ pub fn spawn_watcher(pool: SqlitePool) {
     );
 
     tokio::spawn(async move {
-        let mut previous = fingerprint(&dir);
+        let mut state = WatchState::new(fingerprint(&dir));
         let mut ticker = tokio::time::interval(interval);
         // The first tick of a tokio interval completes immediately; consume it so the first
         // real check happens one interval from now rather than instantly.
@@ -307,25 +357,72 @@ pub fn spawn_watcher(pool: SqlitePool) {
 
         loop {
             ticker.tick().await;
-
-            let current = fingerprint(&dir);
-            if current == previous {
-                continue;
-            }
-            previous = current;
-
-            match sync(&pool).await {
-                Ok(report) if report == SyncReport::default() => {}
-                Ok(report) => println!(
-                    "blog sync: {} created, {} updated, {} deleted, {} skipped",
-                    report.created, report.updated, report.deleted, report.skipped
-                ),
-                // Logged and swallowed: a failing sync must not kill the watcher, or one
-                // transient database error would silently end auto-sync for the whole run.
-                Err(err) => eprintln!("blog sync failed: {err:?}"),
-            }
+            watch_tick(&pool, &dir, &mut state).await;
         }
     });
+}
+
+/// One iteration of the watcher: re-fingerprint, and sync if it changed.
+///
+/// Extracted from the loop so it can be driven directly by tests; the ordering of its steps is
+/// exactly what `spawn_watcher` used inline.
+async fn watch_tick(pool: &SqlitePool, dir: &Path, state: &mut WatchState) {
+    let current = fingerprint(dir);
+    if current == *state.fingerprint() && state.deferred.is_none() {
+        return;
+    }
+
+    match sync_in(pool, dir).await {
+        Ok(SyncOutcome::Completed(report)) => {
+            // Only now is the change genuinely consumed.
+            state.seen = current;
+            state.deferred = None;
+
+            if report != SyncReport::default() {
+                println!(
+                    "blog sync: {} created, {} updated, {} deleted, {} skipped",
+                    report.created, report.updated, report.deleted, report.skipped
+                );
+            }
+        }
+        Ok(SyncOutcome::Deferred(reason)) => {
+            // The fingerprint deliberately does NOT advance: nothing was reconciled, so the
+            // change is still outstanding and the next tick must try again. Advancing here is
+            // what made files dropped in before the first admin account invisible forever.
+            //
+            // Logged only on transition, since this retries every interval.
+            if state.deferred != Some(reason) {
+                println!("blog sync: waiting — {reason}");
+                state.deferred = Some(reason);
+            }
+        }
+        // Logged and swallowed: a failing sync must not kill the watcher, or one transient
+        // database error would silently end auto-sync for the whole run. The fingerprint stays
+        // put, so the change is retried rather than lost.
+        Err(err) => eprintln!("blog sync failed, will retry: {err:?}"),
+    }
+}
+
+/// What the watcher remembers between ticks.
+struct WatchState {
+    /// The directory as of the last **successfully reconciled** sync.
+    seen: DirFingerprint,
+    /// Why the last attempt did nothing, if it did nothing. Held so a retry loop reports its
+    /// reason once rather than every interval.
+    deferred: Option<&'static str>,
+}
+
+impl WatchState {
+    fn new(seen: DirFingerprint) -> Self {
+        Self {
+            seen,
+            deferred: None,
+        }
+    }
+
+    fn fingerprint(&self) -> &DirFingerprint {
+        &self.seen
+    }
 }
 
 /// Whether a path is one of the files `sync` turns into a post.
@@ -345,8 +442,41 @@ fn is_post_file(path: &Path) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("README"))
 }
 
+/// The result of reading the content directory.
+struct DirScan {
+    /// Files that parsed into a usable post.
+    posts: Vec<FilePost>,
+    /// How many files were found but could not be ingested.
+    skipped: usize,
+    /// **Every** post file present on disk, parsed or not. The mirror sweep deletes only rows
+    /// whose file is absent from this set, so a broken file protects its own post.
+    present: HashSet<String>,
+}
+
+/// The slug a file will publish at, or why it has none.
+///
+/// Split out so the *reason* is testable rather than only observable in a log line. It used to
+/// report "filename produces an empty slug" whichever source was at fault, so a bad
+/// frontmatter `slug:` sent the reader off to rename a filename that was perfectly fine.
+fn slug_for(front_matter: &FrontMatter, file_stem: &str) -> Result<String, String> {
+    let (candidate, origin) = match &front_matter.slug {
+        Some(explicit) => (slugify(explicit), "frontmatter `slug:`"),
+        None => (slugify(file_stem), "filename"),
+    };
+
+    if candidate.is_empty() {
+        return Err(format!(
+            "its {origin} has no alphanumeric characters, so the slug would be empty"
+        ));
+    }
+    Ok(candidate)
+}
+
 /// One post read off disk, ready to be written to the database.
 struct FilePost {
+    /// The file this came from, relative to the content directory. Recorded on the row so the
+    /// sweep can ask "is this file still on disk?" without having to parse it.
+    file_name: String,
     slug: String,
     front_matter: FrontMatter,
     body: String,
@@ -355,9 +485,10 @@ struct FilePost {
 /// Reads and validates every `.md` file in `dir`. Returns the posts that parsed, plus the
 /// number that didn't — a bad file is skipped and logged, never fatal, so one malformed post
 /// can't stop the other twenty from publishing.
-fn read_dir_posts(dir: &Path) -> std::io::Result<(Vec<FilePost>, usize)> {
+fn read_dir_posts(dir: &Path) -> std::io::Result<DirScan> {
     let mut posts = Vec::new();
     let mut skipped = 0;
+    let mut present = HashSet::new();
 
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -370,6 +501,18 @@ fn read_dir_posts(dir: &Path) -> std::io::Result<(Vec<FilePost>, usize)> {
 
     for path in paths {
         let display = path.display();
+
+        // Recorded before anything that can fail: the sweep must know this file exists even
+        // when it turns out to be unreadable or unparseable. That distinction is the whole
+        // point — a file that failed to PARSE is not a file that was DELETED.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            present.insert(name.to_string());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
 
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
             Some(stem) => stem,
@@ -398,32 +541,31 @@ fn read_dir_posts(dir: &Path) -> std::io::Result<(Vec<FilePost>, usize)> {
             }
         };
 
-        let slug = match &front_matter.slug {
-            Some(explicit) => slugify(explicit),
-            None => slugify(stem),
+        let slug = match slug_for(&front_matter, stem) {
+            Ok(slug) => slug,
+            Err(reason) => {
+                eprintln!("blog sync: skipping {display} — {reason}");
+                skipped += 1;
+                continue;
+            }
         };
-        if slug.is_empty() {
-            eprintln!("blog sync: skipping {display} — filename produces an empty slug");
-            skipped += 1;
-            continue;
-        }
 
         // The same limits `create_post` enforces on the API. A file bypasses that handler, so
         // without this a 200k-character post would reach a column the rest of the app assumes
         // is bounded.
-        if front_matter.title.len() > MAX_BLOG_TITLE_LENGTH {
+        if exceeds_char_limit(&front_matter.title, MAX_BLOG_TITLE_LENGTH) {
             eprintln!(
                 "blog sync: skipping {display} — title exceeds {MAX_BLOG_TITLE_LENGTH} characters"
             );
             skipped += 1;
             continue;
         }
-        if body.trim().is_empty() {
+        if is_blank(&body) {
             eprintln!("blog sync: skipping {display} — body is empty");
             skipped += 1;
             continue;
         }
-        if body.len() > MAX_BLOG_BODY_LENGTH {
+        if exceeds_char_limit(&body, MAX_BLOG_BODY_LENGTH) {
             eprintln!(
                 "blog sync: skipping {display} — body exceeds {MAX_BLOG_BODY_LENGTH} characters"
             );
@@ -432,13 +574,18 @@ fn read_dir_posts(dir: &Path) -> std::io::Result<(Vec<FilePost>, usize)> {
         }
 
         posts.push(FilePost {
+            file_name: file_name.clone(),
             slug,
             front_matter,
             body,
         });
     }
 
-    Ok((posts, skipped))
+    Ok(DirScan {
+        posts,
+        skipped,
+        present,
+    })
 }
 
 /// Reconciles `blog_posts` with the markdown files on disk.
@@ -447,55 +594,67 @@ fn read_dir_posts(dir: &Path) -> std::io::Result<(Vec<FilePost>, usize)> {
 /// unreadable file, or a database with no admin account yet all return a report rather than an
 /// error, because the blog falling back to database-only posts should not stop the backend
 /// from serving the fridge app.
-pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
-    let dir = content_dir();
+pub async fn sync(pool: &SqlitePool) -> Result<SyncOutcome, sqlx::Error> {
+    sync_in(pool, &content_dir()).await
+}
 
-    let (file_posts, unparseable) = match read_dir_posts(&dir) {
-        Ok(result) => result,
+/// `sync` against an explicit directory.
+///
+/// A seam for tests, which need to point the sync at a scratch directory — `content_dir()`
+/// reads an environment variable, and mutating process env from a test races every other test
+/// in the binary. Behaviour is identical to `sync`.
+pub async fn sync_in(pool: &SqlitePool, dir: &Path) -> Result<SyncOutcome, sqlx::Error> {
+    let dir = dir.to_path_buf();
+
+    // The admin lookup comes first, before any directory read. `blog_posts.author_id` is
+    // NOT NULL REFERENCES users(id) and a file carries no author, so with no admin there is
+    // nothing this function can do — and returning early keeps the watcher's retry loop from
+    // re-reading the directory and re-logging every skipped file every few seconds.
+    let author_id: Option<String> =
+        // `ORDER BY created_at`, not `id`: ids are random UUIDs, so ordering by them picked an
+        // arbitrary admin while the docs promised the first-registered one — and which admin
+        // owned file posts could differ between posts. `id` breaks ties so the result stays
+        // deterministic when two accounts share a timestamp.
+        sqlx::query_scalar(
+            "SELECT id FROM users WHERE is_admin = 1 ORDER BY created_at ASC, id ASC LIMIT 1",
+        )
+            .fetch_optional(pool)
+            .await?;
+    let Some(author_id) = author_id else {
+        return Ok(SyncOutcome::Deferred(
+            "no admin account exists yet to own file-sourced posts — grant is_admin",
+        ));
+    };
+
+    let scan = match read_dir_posts(&dir) {
+        Ok(scan) => scan,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             println!(
                 "blog sync: no content directory at {} — database posts only",
                 dir.display()
             );
-            return Ok(SyncReport::default());
+            // Completed, not Deferred: there is genuinely nothing to reconcile, and a missing
+            // directory is a stable state. Deferring would spin the watcher forever.
+            return Ok(SyncOutcome::Completed(SyncReport::default()));
         }
         Err(err) => {
             eprintln!("blog sync: could not read {}: {err}", dir.display());
-            return Ok(SyncReport::default());
+            // A directory that exists but cannot be read is *not* evidence its posts are gone.
+            // Deferring leaves the change outstanding rather than sweeping on bad information.
+            return Ok(SyncOutcome::Deferred("content directory could not be read"));
         }
     };
 
-    // `blog_posts.author_id` is NOT NULL REFERENCES users(id) and a file carries no author.
-    // The first-registered admin is the honest answer: the file is in their repo, committed by
-    // them. On a fresh database there is no such row yet, and inserting would violate the
-    // foreign key — so skip the whole sync and say why, rather than panicking during boot.
-    let author_id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-            .fetch_optional(pool)
-            .await?;
-
-    // Files that failed to parse are already counted, even on the paths below that do no
-    // database work at all — they are a fact about the directory, not about the sync.
+    let file_posts = &scan.posts;
+    // Files that failed to parse are counted — they are a fact about the directory.
     let mut report = SyncReport {
-        skipped: unparseable,
+        skipped: scan.skipped,
         ..SyncReport::default()
-    };
-
-    let Some(author_id) = author_id else {
-        if !file_posts.is_empty() {
-            println!(
-                "blog sync: {} file(s) waiting in {}, but no admin account exists yet to own them \
-                 — grant is_admin and re-sync",
-                file_posts.len(),
-                dir.display()
-            );
-        }
-        return Ok(report);
     };
 
     let mut seen_slugs: HashSet<String> = HashSet::new();
 
-    for post in &file_posts {
+    for post in file_posts {
         // Two files resolving to the same slug: first wins, and the second is reported rather
         // than silently overwriting the first within a single run.
         if !seen_slugs.insert(post.slug.clone()) {
@@ -530,20 +689,26 @@ pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
                 // untouched directory doesn't rewrite every timestamp.
                 let changed = sqlx::query(
                     "UPDATE blog_posts \
-                     SET title = ?, body = ?, published = ?, created_at = ?, updated_at = ? \
+                     SET title = ?, body = ?, published = ?, created_at = ?, updated_at = ?, \
+                         source_path = ? \
                      WHERE id = ? \
-                       AND (title <> ? OR body <> ? OR published <> ? OR created_at <> ?)",
+                       AND (title <> ? OR body <> ? OR published <> ? OR created_at <> ? \
+                            OR source_path IS NOT ?)",
                 )
                 .bind(&post.front_matter.title)
                 .bind(&post.body)
                 .bind(post.front_matter.published)
                 .bind(post.front_matter.date)
                 .bind(Utc::now())
+                .bind(&post.file_name)
                 .bind(&id)
                 .bind(&post.front_matter.title)
                 .bind(&post.body)
                 .bind(post.front_matter.published)
                 .bind(post.front_matter.date)
+                // `IS NOT` rather than `<>` so a pre-0016 NULL counts as a difference and
+                // backfills on the next sync instead of staying unmatched forever.
+                .bind(&post.file_name)
                 .execute(pool)
                 .await?;
 
@@ -555,8 +720,9 @@ pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
                 let now = Utc::now();
                 sqlx::query(
                     "INSERT INTO blog_posts \
-                     (id, author_id, title, slug, body, published, created_at, updated_at, source) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, author_id, title, slug, body, published, created_at, updated_at, \
+                      source, source_path) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(Uuid::new_v4().to_string())
                 .bind(&author_id)
@@ -567,6 +733,7 @@ pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
                 .bind(post.front_matter.date)
                 .bind(now)
                 .bind(BLOG_SOURCE_FILE)
+                .bind(&post.file_name)
                 .execute(pool)
                 .await?;
 
@@ -577,14 +744,26 @@ pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
 
     // Mirror, not import: a file removed from the repo removes its post. Scoped to
     // `source = 'file'`, so a browser-authored post is never caught by this.
-    let existing_file_slugs: Vec<String> =
-        sqlx::query_scalar("SELECT slug FROM blog_posts WHERE source = ?")
+    //
+    // The test is **file presence, not parse success**. Matching on the slugs of successfully
+    // parsed files meant a frontmatter typo deleted a live post, because a file that failed to
+    // read looked identical to a file that was gone. `scan.present` holds every post file on
+    // disk regardless of whether it parsed.
+    let existing: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT slug, source_path FROM blog_posts WHERE source = ?")
             .bind(BLOG_SOURCE_FILE)
             .fetch_all(pool)
             .await?;
 
-    for slug in existing_file_slugs {
-        if seen_slugs.contains(&slug) {
+    for (slug, source_path) in existing {
+        let still_on_disk = match &source_path {
+            Some(name) => scan.present.contains(name),
+            // Written before migration 0016, so its provenance is unknown. Fall back to the
+            // old slug test, which is why upgrading deletes nothing; the update above
+            // backfills `source_path` on the way through.
+            None => seen_slugs.contains(&slug),
+        };
+        if still_on_disk {
             continue;
         }
 
@@ -598,7 +777,7 @@ pub async fn sync(pool: &SqlitePool) -> Result<SyncReport, sqlx::Error> {
         report.deleted += 1;
     }
 
-    Ok(report)
+    Ok(SyncOutcome::Completed(report))
 }
 
 #[cfg(test)]
@@ -699,6 +878,90 @@ mod tests {
         assert_eq!(parse_front_matter(empty).unwrap().0.slug, None);
     }
 
+    /// **J2.** A key given twice is a mistake, and must fail the file rather than quietly
+    /// keeping the last one.
+    ///
+    /// The parser already errors on an *unknown* key to catch typos. A repeated key is the
+    /// same class of mistake — a half-finished edit, a bad merge, a copied block — and
+    /// last-one-wins hides it completely: the file says `published: false` on one line and the
+    /// post is live anyway.
+    #[test]
+    fn a_repeated_frontmatter_key_is_an_error() {
+        let cases = [
+            (
+                "title",
+                "---\ntitle: A\ndate: 2026-08-19\ntitle: B\n---\nBody\n",
+            ),
+            (
+                "date",
+                "---\ntitle: A\ndate: 2026-08-19\ndate: 2026-08-20\n---\nBody\n",
+            ),
+            (
+                "published",
+                "---\ntitle: A\ndate: 2026-08-19\npublished: false\npublished: true\n---\nBody\n",
+            ),
+            (
+                "slug",
+                "---\ntitle: A\ndate: 2026-08-19\nslug: one\nslug: two\n---\nBody\n",
+            ),
+        ];
+
+        for (key, text) in cases {
+            let err =
+                parse_front_matter(text).expect_err(&format!("a repeated `{key}` must not parse"));
+            assert!(
+                err.contains(key) && err.contains("more than once"),
+                "the error should name the repeated key: {err}"
+            );
+        }
+    }
+
+    /// The `Option<bool>` that makes the check above possible must not change what an absent
+    /// `published` means.
+    #[test]
+    fn published_is_still_false_when_absent_and_honoured_when_present() {
+        let absent = "---\ntitle: A\ndate: 2026-08-19\n---\nBody\n";
+        assert!(!parse_front_matter(absent).unwrap().0.published);
+
+        let present = "---\ntitle: A\ndate: 2026-08-19\npublished: true\n---\nBody\n";
+        assert!(parse_front_matter(present).unwrap().0.published);
+
+        let explicit_false = "---\ntitle: A\ndate: 2026-08-19\npublished: false\n---\nBody\n";
+        assert!(!parse_front_matter(explicit_false).unwrap().0.published);
+    }
+
+    /// **J12.** An empty slug must blame whichever source actually produced it.
+    #[test]
+    fn an_empty_slug_names_the_source_that_caused_it() {
+        let front = |slug: Option<&str>| FrontMatter {
+            title: "T".to_string(),
+            date: parse_date("2026-08-19").unwrap(),
+            published: true,
+            slug: slug.map(str::to_string),
+        };
+
+        assert_eq!(slug_for(&front(None), "good-name").unwrap(), "good-name");
+        assert_eq!(
+            slug_for(&front(Some("Custom URL")), "ignored").unwrap(),
+            "custom-url"
+        );
+
+        let from_filename = slug_for(&front(None), "!!!").expect_err("empty slug must fail");
+        assert!(
+            from_filename.contains("filename") && !from_filename.contains("frontmatter"),
+            "a bad filename must blame the filename: {from_filename}"
+        );
+
+        // The regression: this used to say "filename produces an empty slug", sending the
+        // reader to rename a file that was perfectly fine.
+        let from_frontmatter = slug_for(&front(Some("!!!")), "perfectly-good-filename")
+            .expect_err("empty slug must fail");
+        assert!(
+            from_frontmatter.contains("frontmatter"),
+            "a bad frontmatter slug must blame the frontmatter, not the file: {from_frontmatter}"
+        );
+    }
+
     #[test]
     fn a_non_boolean_published_is_an_error() {
         let text = "---\ntitle: T\ndate: 2026-08-19\npublished: maybe\n---\nBody\n";
@@ -790,9 +1053,9 @@ mod tests {
         assert_eq!(names, vec!["real-post.md".to_string()]);
 
         // ...and that is the same set `read_dir_posts` will actually ingest.
-        let (posts, _) = read_dir_posts(&dir).unwrap();
-        assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].slug, "real-post");
+        let scan = read_dir_posts(&dir).unwrap();
+        assert_eq!(scan.posts.len(), 1);
+        assert_eq!(scan.posts[0].slug, "real-post");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -819,6 +1082,383 @@ mod tests {
         assert!(!is_post_file(Path::new("/x/README.md")));
         assert!(!is_post_file(Path::new("/x/readme.md")), "case-insensitive");
         assert!(!is_post_file(Path::new("/x/notes.txt")));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Stress-test findings — see docs/BLOG_STRESS_TEST_PLAN.md.
+    //
+    // These assert the behaviour the code SHOULD have. They are expected to fail until the
+    // underlying bugs are fixed, which is deliberate: they exist to prove the bug is real and
+    // to stay red until it isn't. Do not "fix" one by weakening its assertion.
+    // ---------------------------------------------------------------------------------
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    const ADMIN_ID: &str = "admin-uuid-1";
+
+    async fn bare_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply");
+        pool
+    }
+
+    async fn add_admin(pool: &SqlitePool, id: &str, email: &str, created_at: DateTime<Utc>) {
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, created_at, is_admin) \
+             VALUES (?, ?, NULL, ?, 1)",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("admin should insert");
+    }
+
+    async fn pool_with_admin() -> SqlitePool {
+        let pool = bare_pool().await;
+        add_admin(&pool, ADMIN_ID, "admin@example.com", Utc::now()).await;
+        pool
+    }
+
+    fn write_raw(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("test file is writable");
+    }
+
+    async fn count_posts(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM blog_posts")
+            .fetch_one(pool)
+            .await
+            .expect("count should run")
+    }
+
+    const VALID: &str =
+        "---\ntitle: Live Post\ndate: 2026-08-19\npublished: true\n---\n\nReal body.\n";
+    // Same file with one misspelled key — the classic typo `pubished`.
+    const TYPOED: &str =
+        "---\ntitle: Live Post\ndate: 2026-08-19\npubished: true\n---\n\nReal body.\n";
+
+    /// **H1.** A file that stops parsing must not take its published post down with it.
+    ///
+    /// `read_dir_posts` skips an unparseable file, so its slug never reaches `seen_slugs`, and
+    /// the mirror sweep then deletes every file-sourced row whose slug is absent from that set.
+    /// A typo in the frontmatter of a live post silently unpublishes it.
+    ///
+    /// This is the same shape as the "disappearance is not closure" trap written into
+    /// `docs/PLAN.md` § Phase 7: a *failure to read* is being treated as *evidence of absence*.
+    #[tokio::test]
+    async fn a_file_that_fails_to_parse_must_not_delete_its_published_post() {
+        let dir = temp_dir("h1-delete");
+        let pool = pool_with_admin().await;
+
+        write_raw(&dir, "live-post.md", VALID);
+        sync_in(&pool, &dir).await.unwrap();
+        assert_eq!(
+            count_posts(&pool).await,
+            1,
+            "precondition: the post published"
+        );
+
+        write_raw(&dir, "live-post.md", TYPOED);
+        let report = sync_in(&pool, &dir).await.unwrap().report();
+
+        assert_eq!(
+            report.skipped, 1,
+            "the broken file should be reported skipped"
+        );
+        assert_eq!(
+            count_posts(&pool).await,
+            1,
+            "a file that failed to PARSE is not a file that was DELETED — the already-published \
+             post must survive a typo in its frontmatter"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Paging over a tie-heavy ordering must not repeat or skip a post.
+    ///
+    /// File posts take `created_at` from a frontmatter *day*, so every one of them is midnight
+    /// and ties are the norm. `ORDER BY created_at` alone leaves their relative order
+    /// undefined, and SQLite is free to answer page 2 in a different order than page 1 — which
+    /// shows one post twice and silently drops another. The `id` tiebreaker is what makes the
+    /// ordering total.
+    #[tokio::test]
+    async fn paging_a_tie_heavy_ordering_covers_every_post_exactly_once() {
+        let dir = temp_dir("paging-ties");
+        let pool = pool_with_admin().await;
+
+        // Nine posts, all the same date: nothing but `id` can order them.
+        for i in 0..9 {
+            write_raw(
+                &dir,
+                &format!("post-{i}.md"),
+                "---\ntitle: Same Day\ndate: 2026-08-19\npublished: true\n---\n\nBody.\n",
+            );
+        }
+        sync_in(&pool, &dir).await.unwrap();
+        assert_eq!(count_posts(&pool).await, 9, "precondition");
+
+        let mut seen: Vec<String> = Vec::new();
+        for offset in [0, 4, 8] {
+            let page: Vec<String> = sqlx::query_scalar(
+                "SELECT slug FROM blog_posts ORDER BY created_at DESC, id ASC LIMIT 4 OFFSET ?",
+            )
+            .bind(offset)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            seen.extend(page);
+        }
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            (seen.len(), unique.len()),
+            (9, 9),
+            "three pages must cover all nine posts with no repeat and no gap; got {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H1c.** The case that made `source_path` necessary rather than merely tidy.
+    ///
+    /// When a file overrides its slug in frontmatter, a broken version of that file cannot be
+    /// matched back to its row by slug at all — the filename says `custom.md` and the row says
+    /// `a-custom-url`. Any slug-based protection misses this, so the sweep must key on the
+    /// file itself.
+    #[tokio::test]
+    async fn a_broken_file_with_a_frontmatter_slug_still_protects_its_post() {
+        let dir = temp_dir("h1-explicit-slug");
+        let pool = pool_with_admin().await;
+
+        let good = "---\ntitle: Custom\ndate: 2026-08-19\nslug: a-custom-url\npublished: true\n---\n\nBody.\n";
+        let broken = "---\ntitle: Custom\ndate: 2026-08-19\nslug: a-custom-url\npubished: true\n---\n\nBody.\n";
+
+        write_raw(&dir, "custom.md", good);
+        sync_in(&pool, &dir).await.unwrap();
+        let slug: String = sqlx::query_scalar("SELECT slug FROM blog_posts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            slug, "a-custom-url",
+            "precondition: frontmatter set the slug"
+        );
+
+        write_raw(&dir, "custom.md", broken);
+        sync_in(&pool, &dir).await.unwrap();
+
+        assert_eq!(
+            count_posts(&pool).await,
+            1,
+            "the file is still on disk, so its post stands — its slug is unreachable from a \
+             file that no longer parses, which is why the sweep keys on source_path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H1b.** And the post's identity must survive too.
+    ///
+    /// Even once the typo is repaired, a delete-then-reinsert gives the post a fresh UUID, so
+    /// anything holding the old id is silently pointing at nothing.
+    #[tokio::test]
+    async fn repairing_a_broken_file_must_not_change_the_posts_id() {
+        let dir = temp_dir("h1-identity");
+        let pool = pool_with_admin().await;
+
+        write_raw(&dir, "live-post.md", VALID);
+        sync_in(&pool, &dir).await.unwrap();
+        let before: String = sqlx::query_scalar("SELECT id FROM blog_posts WHERE slug = ?")
+            .bind("live-post")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        write_raw(&dir, "live-post.md", TYPOED);
+        sync_in(&pool, &dir).await.unwrap();
+        write_raw(&dir, "live-post.md", VALID);
+        sync_in(&pool, &dir).await.unwrap();
+
+        let after: Option<String> = sqlx::query_scalar("SELECT id FROM blog_posts WHERE slug = ?")
+            .bind("live-post")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            after.as_deref(),
+            Some(before.as_str()),
+            "a transient parse failure must not rotate the post's primary key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H2.** The watcher must not treat "I looked" as "I succeeded".
+    ///
+    /// `watch_tick` advances the stored fingerprint *before* calling the sync, so a tick where
+    /// the sync did nothing still consumes the change. The realistic trigger is a fresh
+    /// database: with no admin account, `sync` returns an empty report by design — and the
+    /// files dropped in beforehand are then never picked up, no matter how long the watcher
+    /// runs, until someone touches them again.
+    #[tokio::test]
+    async fn a_tick_whose_sync_did_nothing_must_not_consume_the_change() {
+        let dir = temp_dir("h2-fingerprint");
+        let pool = bare_pool().await; // deliberately no admin yet
+
+        let mut state = WatchState::new(fingerprint(&dir));
+        write_raw(&dir, "waiting.md", VALID);
+
+        watch_tick(&pool, &dir, &mut state).await;
+        assert_eq!(
+            count_posts(&pool).await,
+            0,
+            "precondition: with no admin, the sync correctly does nothing"
+        );
+
+        // The admin now exists. The directory has not changed, and never will again.
+        add_admin(&pool, ADMIN_ID, "admin@example.com", Utc::now()).await;
+        watch_tick(&pool, &dir, &mut state).await;
+
+        assert_eq!(
+            count_posts(&pool).await,
+            1,
+            "the file was never ingested, so the watcher must still consider it outstanding — \
+             advancing the fingerprint past a sync that accomplished nothing loses the change"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H3.** Length limits are documented in characters and enforced in bytes.
+    ///
+    /// `docs/BLOG.md` says 200 chars / 100,000 chars. `String::len()` is bytes, so a
+    /// 200-character non-ASCII title is 400–800 bytes and is rejected. The same comparison is
+    /// used by `create_post` and `update_post`.
+    #[tokio::test]
+    async fn a_title_at_the_character_limit_is_accepted_whatever_its_byte_length() {
+        let dir = temp_dir("h3-bytes");
+        let pool = pool_with_admin().await;
+
+        let title = "字".repeat(MAX_BLOG_TITLE_LENGTH);
+        assert_eq!(title.chars().count(), MAX_BLOG_TITLE_LENGTH);
+        assert!(
+            title.len() > MAX_BLOG_TITLE_LENGTH,
+            "premise: bytes exceed chars"
+        );
+
+        write_raw(
+            &dir,
+            "cjk.md",
+            &format!("---\ntitle: {title}\ndate: 2026-08-19\npublished: true\n---\n\nBody.\n"),
+        );
+        let report = sync_in(&pool, &dir).await.unwrap().report();
+
+        assert_eq!(
+            (report.created, report.skipped),
+            (1, 0),
+            "a title of exactly MAX_BLOG_TITLE_LENGTH characters is within the documented \
+             limit; measuring it in bytes rejects legitimate non-ASCII titles"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H4 — hypothesis REFUTED, kept as a regression guard.**
+    ///
+    /// `created_at` is TEXT, so `ORDER BY` is lexicographic. File posts render as
+    /// `2026-08-19T00:00:00+00:00` (whole seconds) and API posts as
+    /// `...T15:16:57.656421+00:00` (fractional) — the encodings genuinely differ, which is
+    /// what the hypothesis was about. But the ordering is still **correct**, because the
+    /// fractional part only appears after the seconds field, and `+` (0x2B) sorts before
+    /// `.` (0x2E), so a whole second precedes the same second plus a fraction.
+    ///
+    /// The latent trap this guards: a `Z`-suffixed timestamp would break it, since `Z` (0x5A)
+    /// sorts *after* `.`. Nothing in the app writes `Z` — but the Phase 6 checkpoint
+    /// backdated a row by hand with `'2026-08-01T00:00:00Z'`, so it is one careless
+    /// `sqlite3` invocation away from being real.
+    #[tokio::test]
+    async fn created_at_sorts_chronologically_across_both_post_kinds() {
+        let dir = temp_dir("h4-timestamps");
+        let pool = pool_with_admin().await;
+
+        write_raw(&dir, "from-file.md", VALID); // date: 2026-08-19, whole seconds
+        sync_in(&pool, &dir).await.unwrap();
+
+        // Same instant as the file post, plus a fraction — the adversarial pairing, since it
+        // is where the two encodings are compared character-by-character rather than diverging
+        // at the date.
+        let just_after: DateTime<Utc> = "2026-08-19T00:00:00.500000+00:00".parse().unwrap();
+        sqlx::query(
+            "INSERT INTO blog_posts \
+             (id, author_id, title, slug, body, published, created_at, updated_at, source) \
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, 'db')",
+        )
+        .bind("db-post-1")
+        .bind(ADMIN_ID)
+        .bind("From The Browser")
+        .bind("from-the-browser")
+        .bind("Body.")
+        .bind(just_after)
+        .bind(just_after)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let order: Vec<String> =
+            sqlx::query_scalar("SELECT slug FROM blog_posts ORDER BY created_at ASC")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            order,
+            vec!["from-file".to_string(), "from-the-browser".to_string()],
+            "lexicographic ORDER BY on TEXT timestamps must still be chronological when a \
+             whole-second (file) and a fractional-second (API) stamp share the same second"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **H7.** The author of a file post is documented as the first-registered admin, but the
+    /// query orders by `id` — a random UUID. Which admin owns file posts is therefore
+    /// arbitrary, and differs from what both the code comment and `docs/BLOG.md` promise.
+    #[tokio::test]
+    async fn file_posts_are_owned_by_the_first_registered_admin() {
+        let dir = temp_dir("h7-author");
+        let pool = bare_pool().await;
+
+        // UUIDs deliberately sort opposite to registration order.
+        let older = "ffffffff-0000-0000-0000-000000000000";
+        let newer = "00000000-0000-0000-0000-000000000000";
+        add_admin(
+            &pool,
+            older,
+            "first@example.com",
+            Utc::now() - chrono::Duration::days(30),
+        )
+        .await;
+        add_admin(&pool, newer, "second@example.com", Utc::now()).await;
+
+        write_raw(&dir, "owned.md", VALID);
+        sync_in(&pool, &dir).await.unwrap();
+
+        let author: String = sqlx::query_scalar("SELECT author_id FROM blog_posts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            author, older,
+            "ORDER BY id sorts UUIDs, not registration time — the account that registered \
+             first should own file posts, as the docs claim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CRLF line endings are what a file edited on Windows arrives with; the parser must not

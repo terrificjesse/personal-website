@@ -9,8 +9,10 @@ use uuid::Uuid;
 
 use crate::blog_files::{self, SyncReport};
 use crate::models::{
-    BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, CreateBlogPostRequest, ListPostsQuery,
-    MAX_BLOG_BODY_LENGTH, MAX_BLOG_TITLE_LENGTH, UpdateBlogPostRequest, slugify,
+    BLOG_SOURCE_DB, BLOG_SOURCE_FILE, BlogPost, BlogPostPage, CreateBlogPostRequest,
+    DEFAULT_BLOG_PAGE_SIZE, ListPostsQuery, MAX_BLOG_BODY_LENGTH, MAX_BLOG_PAGE_SIZE,
+    MAX_BLOG_TITLE_LENGTH, SortOrder, UpdateBlogPostRequest, decode_cursor, encode_cursor,
+    exceeds_char_limit, is_blank, slugify,
 };
 use crate::routes::auth::{MaybeUser, RequireAdmin};
 
@@ -59,8 +61,22 @@ pub async fn list_posts(
     State(pool): State<SqlitePool>,
     MaybeUser(user): MaybeUser,
     Query(params): Query<ListPostsQuery>,
-) -> Result<Json<Vec<BlogPost>>, StatusCode> {
+) -> Result<Json<BlogPostPage>, StatusCode> {
     let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
+
+    let limit = params.limit.unwrap_or(DEFAULT_BLOG_PAGE_SIZE);
+    // Refused rather than clamped. A caller who asks for 1000 and silently receives 100
+    // believes it now holds every post — the same looks-complete-but-isn't failure that makes
+    // an unrecognized `?sort=` a 400 instead of a quiet fallback.
+    if limit == 0 || limit > MAX_BLOG_PAGE_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // A cursor that cannot be read is a caller error, not an empty first page.
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(decode_cursor(raw).ok_or(StatusCode::BAD_REQUEST)?),
+    };
 
     // One statement over one table covers both post kinds. That is the entire reason
     // file-sourced posts are rows rather than a second store read at request time: search and
@@ -83,6 +99,39 @@ pub async fn list_posts(
         conditions.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')");
     }
 
+    // Everything above describes the whole result set; the cursor narrows it to one page. The
+    // count below therefore uses only what is above, so "showing 20 of 143" keeps saying 143
+    // as you advance rather than counting down what is left.
+    let count_where = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM blog_posts{count_where}");
+    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+    // The count reuses the same draft filter and search. Counting without the draft filter
+    // would tell a signed-out visitor exactly how many unpublished posts exist — the number
+    // leaks what the rows themselves are hidden to protect.
+    if let Some(pattern) = &search {
+        count_query = count_query.bind(pattern).bind(pattern);
+    }
+    let total = count_query
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // The cursor condition has to mirror the ORDER BY exactly, and the ORDER BY is mixed —
+    // `created_at` follows the sort direction while `id` is always ascending — so this cannot
+    // be written as a single row-value comparison. Getting it wrong does not error; it
+    // silently skips or repeats rows, which is the bug this replaced.
+    if cursor.is_some() {
+        conditions.push(match params.sort {
+            SortOrder::Newest => "(created_at < ? OR (created_at = ? AND id > ?))",
+            SortOrder::Oldest => "(created_at > ? OR (created_at = ? AND id > ?))",
+        });
+    }
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -92,24 +141,47 @@ pub async fn list_posts(
     // `sql_direction` returns a `&'static str` from a two-variant enum: `ORDER BY` can't take
     // a bind parameter, so this is the only user-influenced part of the statement that is
     // interpolated, and the enum is what keeps it from being user-*supplied*.
+    //
+    // `id` breaks ties, and paging is why it has to. File posts take `created_at` from a
+    // frontmatter *day*, so they are all midnight and ties are the norm rather than the
+    // exception; without a total order there is no single "next row" for a cursor to name.
     let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM blog_posts{where_clause} ORDER BY created_at {} ",
+        "SELECT {SELECT_COLUMNS} FROM blog_posts{where_clause} \
+         ORDER BY created_at {}, id ASC LIMIT ?",
         params.sort.sql_direction()
     );
 
     let mut query = sqlx::query_as::<_, BlogPost>(&sql);
-    // Bound twice, as two separate `?` placeholders, because sqlx binds positionally in call
-    // order — a numbered `?1` reused across both sides would not line up with one `.bind`.
+    // Bound in the order the conditions were pushed, because sqlx binds positionally: search
+    // first (twice, as two separate `?`), then the cursor's three.
     if let Some(pattern) = &search {
         query = query.bind(pattern).bind(pattern);
     }
+    if let Some((created_at, id)) = &cursor {
+        query = query.bind(created_at).bind(created_at).bind(id);
+    }
 
-    let posts = query
+    // One more than asked for: whether a further page exists is not answerable from a full
+    // page, and `total` cannot answer it either once a cursor is in play.
+    let mut posts = query
+        .bind(limit + 1)
         .fetch_all(&pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(posts))
+    let has_more = posts.len() > limit as usize;
+    posts.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| posts.last())
+        .flatten()
+        .map(|post| encode_cursor(post.created_at, &post.id));
+
+    Ok(Json(BlogPostPage {
+        posts,
+        total,
+        limit,
+        next_cursor,
+    }))
 }
 
 /// A single post by its slug. A draft 404s for a non-admin rather than answering with
@@ -137,27 +209,74 @@ pub async fn get_post(
     Ok(Json(post))
 }
 
-/// Appends `-2`, `-3`, ... until the slug is free. Collisions will be rare on a
-/// single-admin blog, but two posts sharing a title shouldn't 500.
-async fn unique_slug(pool: &SqlitePool, base: &str) -> Result<String, StatusCode> {
-    let mut candidate = base.to_string();
-    let mut suffix = 2;
+/// The most `-2`, `-3`, … suffixes to try before giving up.
+///
+/// A bound rather than an open loop: every retry here is driven by a database error, and if
+/// one ever arrives for a reason other than the slug — a corrupt index, say — an unbounded
+/// loop would spin against the database forever instead of failing.
+const MAX_SLUG_ATTEMPTS: u32 = 50;
 
-    loop {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blog_posts WHERE slug = ?)")
-                .bind(&candidate)
-                .fetch_one(pool)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+/// Inserts a post, letting the database pick the slug suffix.
+///
+/// This deliberately does **not** ask whether a slug is free first. It used to: a
+/// `SELECT EXISTS(...)` followed by an `INSERT`, with nothing holding between them. Two
+/// requests could both see the same slug free, and the loser hit the `UNIQUE` constraint and
+/// came back **500**. That is not a theoretical race — ten concurrent creates of the same
+/// title produced six 500s, and one double-clicked submit button is enough to reach it.
+///
+/// The constraint is the only thing that can decide atomically, so it decides. We attempt the
+/// insert and treat a unique violation as "someone took that one", trying the next suffix.
+/// Anything else is a real error.
+/// Everything a new post needs, bundled so the insert takes two arguments rather than eight.
+struct NewPost<'a> {
+    id: &'a str,
+    author_id: &'a str,
+    title: &'a str,
+    base_slug: &'a str,
+    body: &'a str,
+    published: bool,
+    now: chrono::DateTime<Utc>,
+}
 
-        if !exists {
-            return Ok(candidate);
+async fn insert_post_with_unique_slug(
+    pool: &SqlitePool,
+    post: &NewPost<'_>,
+) -> Result<String, StatusCode> {
+    for attempt in 1..=MAX_SLUG_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            post.base_slug.to_string()
+        } else {
+            format!("{}-{attempt}", post.base_slug)
+        };
+
+        let result = sqlx::query(
+            "INSERT INTO blog_posts \
+             (id, author_id, title, slug, body, published, created_at, updated_at, source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(post.id)
+        .bind(post.author_id)
+        .bind(post.title)
+        .bind(&candidate)
+        .bind(post.body)
+        .bind(post.published)
+        .bind(post.now)
+        .bind(post.now)
+        .bind(BLOG_SOURCE_DB)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => return Ok(candidate),
+            // Only a *slug* collision is retryable. `is_unique_violation` would also fire on
+            // the `id` primary key, but `id` is a fresh v4 UUID and is not re-rolled here, so a
+            // genuine id collision exhausts the attempts and 500s rather than looping.
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => continue,
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
-
-        candidate = format!("{base}-{suffix}");
-        suffix += 1;
     }
+
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Creates a post. Admin-only.
@@ -167,10 +286,10 @@ pub async fn create_post(
     Json(req): Json<CreateBlogPostRequest>,
 ) -> Result<(StatusCode, Json<BlogPost>), StatusCode> {
     let title = req.title.trim();
-    if title.is_empty() || title.len() > MAX_BLOG_TITLE_LENGTH {
+    if is_blank(title) || exceeds_char_limit(title, MAX_BLOG_TITLE_LENGTH) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if req.body.is_empty() || req.body.len() > MAX_BLOG_BODY_LENGTH {
+    if is_blank(&req.body) || exceeds_char_limit(&req.body, MAX_BLOG_BODY_LENGTH) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -178,28 +297,22 @@ pub async fn create_post(
     if base_slug.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let slug = unique_slug(&pool, &base_slug).await?;
-
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    sqlx::query(
-        "INSERT INTO blog_posts \
-         (id, author_id, title, slug, body, published, created_at, updated_at, source) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    let slug = insert_post_with_unique_slug(
+        &pool,
+        &NewPost {
+            id: &id,
+            author_id: &user.id,
+            title,
+            base_slug: &base_slug,
+            body: &req.body,
+            published: req.published,
+            now,
+        },
     )
-    .bind(&id)
-    .bind(&user.id)
-    .bind(title)
-    .bind(&slug)
-    .bind(&req.body)
-    .bind(req.published)
-    .bind(now)
-    .bind(now)
-    .bind(BLOG_SOURCE_DB)
-    .execute(&pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -239,13 +352,13 @@ pub async fn update_post(
 
     if let Some(title) = req.title {
         let title = title.trim().to_string();
-        if title.is_empty() || title.len() > MAX_BLOG_TITLE_LENGTH {
+        if is_blank(&title) || exceeds_char_limit(&title, MAX_BLOG_TITLE_LENGTH) {
             return Err(StatusCode::BAD_REQUEST);
         }
         post.title = title;
     }
     if let Some(body) = req.body {
-        if body.is_empty() || body.len() > MAX_BLOG_BODY_LENGTH {
+        if is_blank(&body) || exceeds_char_limit(&body, MAX_BLOG_BODY_LENGTH) {
             return Err(StatusCode::BAD_REQUEST);
         }
         post.body = body;
@@ -308,9 +421,12 @@ pub async fn sync_posts(
     State(pool): State<SqlitePool>,
     RequireAdmin(_user): RequireAdmin,
 ) -> Result<Json<SyncReport>, StatusCode> {
+    // `RequireAdmin` guarantees an admin exists, so the no-admin deferral is unreachable from
+    // this route; `report()` flattens any other deferral to zeros, which is what it did before.
     let report = blog_files::sync(&pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .report();
 
     Ok(Json(report))
 }
@@ -338,6 +454,96 @@ mod tests {
     fn the_escape_character_is_escaped_before_the_wildcards() {
         assert_eq!(like_pattern(r"\"), r"%\\%");
         assert_eq!(like_pattern(r"a\%b"), r"%a\\\%b%");
+    }
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn pool_with_author() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply");
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, created_at, is_admin) \
+             VALUES ('a1', 'a@example.com', NULL, ?, 1)",
+        )
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .expect("author should insert");
+        pool
+    }
+
+    async fn insert(pool: &SqlitePool, base: &str) -> Result<String, StatusCode> {
+        insert_post_with_unique_slug(
+            pool,
+            &NewPost {
+                id: &Uuid::new_v4().to_string(),
+                author_id: "a1",
+                title: "Race Me",
+                base_slug: base,
+                body: "Body",
+                published: true,
+                now: Utc::now(),
+            },
+        )
+        .await
+    }
+
+    /// **J1.** Posts sharing a title must each get their own slug, and none may fail.
+    ///
+    /// The old implementation asked `SELECT EXISTS(...)` and then inserted. Nothing held
+    /// between the two, so under concurrency the loser hit the UNIQUE constraint and returned
+    /// 500 — six times out of ten in a ten-way race. Letting the constraint arbitrate is what
+    /// makes the suffix assignment atomic.
+    #[tokio::test]
+    async fn posts_sharing_a_title_each_get_their_own_slug() {
+        let pool = pool_with_author().await;
+
+        let mut slugs = Vec::new();
+        for _ in 0..5 {
+            slugs.push(
+                insert(&pool, "race-me")
+                    .await
+                    .expect("no create may fail because another took the slug"),
+            );
+        }
+
+        assert_eq!(
+            slugs,
+            vec![
+                "race-me",
+                "race-me-2",
+                "race-me-3",
+                "race-me-4",
+                "race-me-5"
+            ],
+            "the suffix sequence is unchanged from the check-then-insert version"
+        );
+    }
+
+    /// A slug already taken by a *file*-sourced post is skipped over just the same — the
+    /// constraint does not care which kind of post holds it.
+    #[tokio::test]
+    async fn a_slug_held_by_a_file_post_is_stepped_over() {
+        let pool = pool_with_author().await;
+        sqlx::query(
+            "INSERT INTO blog_posts \
+             (id, author_id, title, slug, body, published, created_at, updated_at, source) \
+             VALUES ('f1', 'a1', 'From File', 'race-me', 'B', 1, ?, ?, 'file')",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(insert(&pool, "race-me").await.unwrap(), "race-me-2");
     }
 
     #[test]

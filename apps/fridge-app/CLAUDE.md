@@ -14,7 +14,8 @@ All six `[learn]` pieces — `nlp.rs`, `expiration.rs`, `recommend.rs`, `recomme
 writing them. Every phase was verified against real data, not just fixtures; the per-phase
 evidence lives in `docs/PLAN.md`'s checkpoints, not here.
 
-`cargo test`: **141 passed, 0 failed**, clippy clean.
+`cargo test`: **663 passed, 0 failed**, clippy clean. (Phase 6 alone was 141; the rest is
+Phase 7 work from a parallel session plus the blog stress-test suite.)
 
 **Still open, none blocking:** the deferred `[learn]` items in PLAN.md (small-sample rating
 statistics; weighting personal vs. global feedback in `rerank`); rate limiting on
@@ -150,8 +151,14 @@ Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migratio
   `fetch_visible_to` (own + public). **Picking the wrong one leaks a stranger's review into a
   personal view.**
 - `src/blog_files.rs` — `[gen]` markdown-file ingestion for the blog. Hand-rolled frontmatter
-  parser (no crate), `sync` (mirrors `content/blog/*.md` into `blog_posts`), and
+  parser (no crate — **an unknown key and a repeated key are both errors**, because the whole
+  point is catching a typo the author cannot otherwise see), `sync`/`sync_in` (mirrors
+  `content/blog/*.md` into `blog_posts`), and
   `spawn_watcher` (polls a `(name, mtime, size)` fingerprint every `BLOG_SYNC_INTERVAL_SECS`).
+  **Two invariants a 2026-08-30 stress test had to install — don't undo them:** the sweep
+  deletes on *file absence* (`source_path`, migration `0016`), never on parse failure; and
+  `watch_tick` advances its fingerprint only on `SyncOutcome::Completed`, never on `Deferred`.
+  Both bugs were the same mistake — treating "I looked" as "I succeeded".
   Read its module doc before changing it — the filename-not-title slug rule and the
   frontmatter-not-mtime date rule both look like details and are not.
   **`is_post_file` is deliberately shared** by the reader and the watcher; let those two drift
@@ -245,6 +252,16 @@ Deliberate choices worth not "fixing":
   those hosts differ the cookie isn't sent and the callback fails the state check. Keep
   `GOOGLE_REDIRECT_URI`, `FRONTEND_ORIGIN`, and the host you actually browse on identical.
   Register both variants in Google Cloud Console if you like; only `.env` has to be consistent.
+- **Never edit a migration that has already been applied.** sqlx stores a checksum of every
+  migration in `_sqlx_migrations` and refuses to start if the file no longer matches:
+  `migration 12 was previously applied but has been modified`. **A comment-only edit breaks it
+  just as thoroughly as a schema change** — this happened to `0012` on 2026-08-20, editing only
+  a comment block, and it took the backend (and so the whole site) down until the file was
+  restored byte-for-byte with `git checkout`. Once a migration has run *anywhere*, it is
+  immutable: corrections go in a new migration, or in a code comment. The failure surfaces as
+  "failed to fetch" in the browser, because the frontend's error is downstream of a backend
+  that never started.
+
 - **`BLOG_CONTENT_DIR`** overrides where the blog looks for `.md` files; the default is
   `content/blog` at the repo root, resolved off `CARGO_MANIFEST_DIR` rather than the working
   directory (the backend runs three levels below the root). A missing directory is logged and
@@ -289,7 +306,14 @@ land immediately.
 - `auth::require_admin` is implemented (by the user, in the `[learn]` file `src/auth.rs`) —
   `Ok(())` when `is_admin`, else `Err(AuthError::Forbidden)` → **403**. Its doc comment is
   **stale**, still calling itself an unimplemented placeholder; leave it for the user to fix.
-- **Phase 6 is done.** Markdown rendering (frontend `react-markdown`), `?sort=`, `?q=`, and
+- **Validation lives in `models.rs`, once.** `exceeds_char_limit` (limits are **characters**;
+  `str::len()` is bytes and silently punished non-ASCII) and `is_blank` (empty-or-whitespace,
+  used to validate only — bodies are stored verbatim). Both exist because the same rule was
+  written twice, in the API path and the file path, and the copies drifted. **Add a call, not
+  a fifth copy.**
+- **Phase 6 is done, and was stress-tested on 2026-08-30** — five real bugs, all fixed; see
+  `docs/BLOG.md` § "Adversarial stress test" for the list and the two refuted hypotheses.
+  Markdown rendering (frontend `react-markdown`), `?sort=`, `?q=`, and
   `content/blog/*.md` ingestion all landed 2026-08-19. Two rules worth not rediscovering:
   file-sourced posts answer `PATCH`/`DELETE` with **409** (the next sync would overwrite the
   edit), and **there is no branch on `source` in the read path** — `list_posts` is one query
@@ -312,6 +336,19 @@ land immediately.
   `fetch_visible_to` above.
 - `slug` is stored at creation and **never rewritten** on a title edit, so a published URL
   stays stable. `unique_slug` appends `-2`, `-3`, … on collision.
+- **Never re-introduce a check-then-insert for slugs.** `create_post` attempts the insert and
+  lets the `UNIQUE` constraint pick the suffix. The previous `SELECT EXISTS` + `INSERT` returned
+  **500 six times out of ten** under a ten-way race — a double-clicked submit button reaches it.
+  A prior SELECT can never be atomic with the INSERT after it.
+- **`GET /blog/posts` is paginated by keyset** (`limit`/`cursor`, default 20, max 100, envelope
+  `{posts,total,limit,next_cursor}`). It shipped with `offset` and that repeated rows under
+  concurrent publishing — **do not go back to offset.** Three more rules not to undo:
+  over-limit is a **400, not a clamp**;
+  `total` is counted **without the cursor** but **with** the draft filter, so it neither counts
+  down as you page nor leaks the draft count to a non-admin; and
+  **`ORDER BY created_at …, id ASC`** — file posts all share a midnight timestamp, so without
+  the `id` tiebreaker paging repeats one post and drops another. It is also a **coupled**
+  change: an old backend binary serving a bare array breaks the frontend outright.
 - **Verify authorization with `curl`, not the browser.** `proxy.ts` and the admin page's
   `is_admin` check are both optimistic UI; only `RequireAdmin` enforces, and only curl skips
   the other two.
@@ -389,7 +426,11 @@ Nothing blocking. In rough priority:
 
 1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
    unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
+2. **A third blog stress pass**, if wanted. Both passes are closed with every finding fixed;
+   what is left unexplored is frontmatter fuzzing beyond what was covered (symlinks,
+   megabyte single-line files) and the frontend beyond the first pass.
+   `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
+3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
    `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
    2026-08-19.
 

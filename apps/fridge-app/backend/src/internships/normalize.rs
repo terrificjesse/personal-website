@@ -118,7 +118,13 @@
 //!   handles 13-digit epochs.
 //! - *A magnitude heuristic is needed for pay* — confirmed and stronger than assumed. Greenhouse
 //!   has **no interval field**: hourly and annual share `min_cents` (§ A.1, § B fn 1). See
-//!   [`MIN_UNAMBIGUOUS_ANNUAL_USD`].
+//!   [`MIN_UNAMBIGUOUS_ANNUAL_USD`] and [`MAX_PLAUSIBLE_HOURLY_USD`].
+//!
+//!   **Corrected 2026-08-22.** The heuristic was one-sided: it could confirm "annual" above
+//!   $50,000 but never infer "hourly" below it, so it returned `None` for every rate Greenhouse
+//!   actually publishes for internships. Greenhouse contributed zero pay and no test failed,
+//!   because the vendored fixture holds only full-time salaries (135k–295k) — all above the
+//!   threshold. An hourly band now exists; the ambiguous middle is still left alone.
 //! - *Ashby is the only source with an unambiguous interval* (§ B fn 7, `"1 YEAR"` / `"1 MONTH"`
 //!   / `"NONE"`). An explicit period therefore always beats the magnitude heuristic, and that
 //!   ordering is pinned by test rather than left to reading order.
@@ -208,14 +214,49 @@ pub const MIN_MEANINGFUL_PAY: f64 = 0.0;
 /// live, since a monthly intern stipend and a low annual salary can land in the same band."
 /// So this threshold is set to clear the monthly band outright rather than to split it: the
 /// largest monthly intern figure the research records is Ramp's `{"interval":"1 MONTH",
-/// "minValue":11700}` (§ A.1, Ashby), and $50,000 is four times that. Nothing below this line
-/// is guessed — it returns `None` and keeps `pay_raw`, which is the doc's own instruction to
-/// "store the raw cents … and decide late; do not normalize to an annual figure at ingest."
+/// "minValue":11700}` (§ A.1, Ashby), and $50,000 is four times that.
+///
+/// **Amended 2026-08-22.** This used to say "nothing below this line is guessed — it returns
+/// `None`". That was the defect: returning `None` below the line discarded every hourly and
+/// monthly figure from the one source that most needs the heuristic. Below this threshold the
+/// band is now split by [`MAX_PLAUSIBLE_HOURLY_USD`] instead of abandoned. `pay_raw` is still
+/// retained either way, so the doc's "decide late" instruction still holds — the raw string
+/// remains the record.
 ///
 /// **An explicit period always wins over this.** Ashby is the only source with an unambiguous
 /// interval (§ B fn 7), and [`detect_period`] runs first precisely so that precision is never
 /// diluted to accommodate the sources that lack it.
 pub const MIN_UNAMBIGUOUS_ANNUAL_USD: f64 = 50_000.0;
+
+/// The top of the band a bare amount is read as an **hourly** rate.
+///
+/// Added 2026-08-22 to fix a defect that made Greenhouse pay structurally undiscoverable.
+/// Greenhouse has no interval field, so its adapter emits `"USD 45.00"` for a $45.00/hr
+/// internship — and this function used to return `None` for *every* bare amount below
+/// [`MIN_UNAMBIGUOUS_ANNUAL_USD`]. The heuristic could confirm "annual" and could never infer
+/// "hourly", so it discarded every internship rate Greenhouse publishes while accepting the
+/// full-time salaries that QC then filters out as not-internships. Net effect: the largest
+/// single source of boards contributed exactly zero pay, and nothing failed.
+///
+/// $200 sits in a genuinely empty band. Intern hourly rates run roughly $15–$120, with the
+/// highest quant rates near $150; monthly stipends start around $2,000 and the largest the
+/// research records is Ramp's $11,700 (§ A.1). So nothing plausible lives between $200 and
+/// $2,000, and the boundary is placed at the hourly end of that gap deliberately: reading a
+/// monthly figure as hourly would multiply a posting's apparent pay ~170x and float it to the
+/// top of every pay-sorted list, whereas the opposite error merely buries it. A sub-$200
+/// monthly stipend — which would be needed to trigger the loud error — is not a real thing.
+///
+/// **Only the hourly band was added.** The range between this constant and
+/// [`MIN_UNAMBIGUOUS_ANNUAL_USD`] still yields `None`: it is the band the research doc names
+/// as least reliable, and the likelier period flips inside it — $11,700 reads as a monthly
+/// stipend, $45,000 as a low annual salary. One guess cannot be right at both ends, so
+/// nothing is guessed there. Monthly stipends therefore remain unparsed when a source omits
+/// the interval; Ashby and Lever both state theirs, and Greenhouse internships are paid
+/// hourly, so the residue is small and visible in `pay_raw`.
+///
+/// **This is still a guess**, and it is confined to bare amounts. An explicit period always
+/// wins (`detect_period` runs first), so Ashby's and Lever's stated intervals are untouched.
+pub const MAX_PLAUSIBLE_HOURLY_USD: f64 = 200.0;
 
 /// How many years before `now` a stated term year may fall before the posting is stale.
 /// Boundary: with `now` in 2026, a `Summer 2025` posting is kept and `Summer 2024` is filtered.
@@ -649,6 +690,12 @@ pub fn is_software_role(text: &str) -> bool {
 ///
 /// This is **not** fuzzy matching, and must not become it. `"Google"` and `"Google Cloud"` key
 /// differently here, on purpose.
+/// **Expects text that has already been through [`non_empty`]**, which is where HTML
+/// character references are decoded (audit finding F3). Passing raw source text here yields a
+/// key built from the literal escape — `"Ben &amp; Jerry&#39;s"` becomes `"ben amp jerry 39 s"`.
+///
+/// Decoding here as well would mean decoding twice, turning `&amp;lt;` into `<`; the single
+/// pass is the point. `normalize` is the only production caller and it satisfies this.
 pub fn company_key(company: &str) -> String {
     let mut tokens: Vec<String> = phrase(company)
         .split_whitespace()
@@ -700,6 +747,21 @@ pub fn parse_pay(text: &str) -> Option<PayRange> {
     let currency = detect_currency(&lower)?;
 
     let start = first_amount_index(&chars);
+    // `first_amount_index` returns 0 when no currency symbol precedes the amount, so it is
+    // not necessarily the digit's index — `read_number` scans forward itself. The sign check
+    // needs the actual digit position, or `"-20/hr"` looks at index 0 and finds nothing.
+    let digit_start = chars[start..]
+        .iter()
+        .position(|c| c.is_ascii_digit())
+        .map(|offset| start + offset)?;
+    if is_negated(&chars, digit_start) {
+        // Audit finding F9. The sign used to be skipped along with the currency symbol, so
+        // `"$-20/hr"` parsed as a cheerful $20/hr. A negative wage is not a wage — it is a
+        // malformed field — and inventing a positive number from it is worse than declining
+        // to read it, because the invented figure feeds the highest-weighted ranking input.
+        // The raw text is still kept in `pay_raw`.
+        return None;
+    }
     let (min, after_min) = read_number(&chars, start)?;
     if min <= MIN_MEANINGFUL_PAY {
         return None;
@@ -716,13 +778,30 @@ pub fn parse_pay(text: &str) -> Option<PayRange> {
         PeriodSignal::Absent => {
             // Only the top of the range can settle it: "$40,000 - $80,000" is annual on the
             // strength of the 80, and keying on the bottom would throw the pair away.
-            if max.unwrap_or(min) >= MIN_UNAMBIGUOUS_ANNUAL_USD {
+            let deciding = max.unwrap_or(min);
+            if deciding >= MIN_UNAMBIGUOUS_ANNUAL_USD {
                 PayPeriod::Year
+            } else if deciding <= MAX_PLAUSIBLE_HOURLY_USD {
+                PayPeriod::Hour
             } else {
+                // Still `None` between the two bands, and deliberately so. This is the range
+                // the research doc calls least reliable — "a monthly intern stipend and a low
+                // annual salary can land in the same band" — and it flips partway through:
+                // $11,700 is a plausible monthly stipend and an implausible salary, while
+                // $45,000 is the reverse. Guessing one period for the whole range would be
+                // right at one end and badly wrong at the other, so the amount is kept in
+                // `pay_raw` and no period is invented.
                 return None;
             }
         }
     };
+
+    // Audit finding F10. Applied after the period is resolved, because "1,000,000" is
+    // nonsense per hour and unremarkable per year — the ceiling only means anything once the
+    // unit is known. Checked against the top of the range, since that is the largest claim.
+    if exceeds_credible_pay(max.unwrap_or(min), period, &currency) {
+        return None;
+    }
 
     Some(PayRange {
         min,
@@ -730,6 +809,58 @@ pub fn parse_pay(text: &str) -> Option<PayRange> {
         currency,
         period,
     })
+}
+
+/// Whether a `-` immediately precedes the amount, allowing one currency symbol between.
+///
+/// Deliberately does **not** skip whitespace: `"$45 - 55"` is a range whose separator must not
+/// be read as a sign. Only the first amount is inspected — a `-` before the *second* number is
+/// the range separator by construction, and `read_range_max` owns it.
+fn is_negated(chars: &[char], start: usize) -> bool {
+    let mut i = start;
+    // Step back over the digits' immediate neighbour, and one currency symbol if present.
+    for _ in 0..2 {
+        if i == 0 {
+            return false;
+        }
+        match chars[i - 1] {
+            '-' | '\u{2212}' => return true,
+            c if is_currency_symbol(c) => i -= 1,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether a figure is too large to be a real offer at this period.
+///
+/// These are **data-error detectors, not judgements about generosity** — set far above any
+/// real internship so that only unit confusion trips them. The failure they exist to catch is
+/// a raw source value reaching the parser unscaled: `min_cents` of 4,500,000 read as
+/// `$4,500,000/hr` rather than `$45,000.00`.
+///
+/// Note these sit well above [`MAX_PLAUSIBLE_HOURLY_USD`], which is a different question: that
+/// one decides whether a *bare* figure is hourly, this one decides whether a figure with a
+/// known period is believable at all. A stated `$300/hr` is unusual but real, and must survive.
+///
+/// Scoped to USD. The thresholds are USD-denominated and a corpus-wide currency does not make
+/// them universal — ¥5,000/hour is an ordinary Japanese wage and must not be refused by a
+/// dollar ceiling. Every source here quotes USD (§ B), so nothing currently reaches the
+/// permissive branch.
+pub const MAX_CREDIBLE_HOURLY_USD: f64 = 1_000.0;
+pub const MAX_CREDIBLE_MONTHLY_USD: f64 = 100_000.0;
+pub const MAX_CREDIBLE_ANNUAL_USD: f64 = 2_000_000.0;
+
+fn exceeds_credible_pay(amount: f64, period: PayPeriod, currency: &str) -> bool {
+    if !currency.eq_ignore_ascii_case("USD") {
+        return false;
+    }
+    let ceiling = match period {
+        PayPeriod::Hour => MAX_CREDIBLE_HOURLY_USD,
+        PayPeriod::Month => MAX_CREDIBLE_MONTHLY_USD,
+        PayPeriod::Year => MAX_CREDIBLE_ANNUAL_USD,
+    };
+    amount > ceiling
 }
 
 fn is_currency_symbol(c: char) -> bool {
@@ -1333,12 +1464,159 @@ fn collapse_whitespace(text: &str) -> String {
 }
 
 fn non_empty(text: &str) -> Option<String> {
-    let trimmed = collapse_whitespace(text);
+    let trimmed = collapse_whitespace(&decode_html_entities(text));
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     }
+}
+
+/// Named entities worth decoding, chosen for what actually appears in job feeds.
+///
+/// Deliberately not the full ~2,000-entry HTML5 table: that would be a dependency for a long
+/// tail this corpus does not contain, and anything missing here is still covered by the
+/// numeric forms below, which is what most encoders emit for accented characters anyway.
+const NAMED_ENTITIES: &[(&str, char)] = &[
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("nbsp", ' '),
+    ("ndash", '-'),
+    ("mdash", '-'),
+    ("lsquo", '\''),
+    ("rsquo", '\''),
+    ("ldquo", '"'),
+    ("rdquo", '"'),
+    ("hellip", '.'),
+    ("middot", '.'),
+    ("bull", '.'),
+    ("reg", ' '),
+    ("copy", ' '),
+    ("trade", ' '),
+    ("eacute", 'e'),
+    ("egrave", 'e'),
+    ("uuml", 'u'),
+    ("ouml", 'o'),
+    ("auml", 'a'),
+    ("ccedil", 'c'),
+    ("ntilde", 'n'),
+];
+
+/// Decode HTML character references in source text.
+///
+/// # Why this exists
+///
+/// Audit finding F3. Several feeds deliver HTML-escaped text, and nothing decoded it — so
+/// `"Ben &amp; Jerry&#39;s"` reached [`company_key`] as the literal characters and normalized
+/// to `"ben amp jerry 39 s"`, while the same company from a clean source normalized to
+/// `"ben jerry s"`. `company_key` is the identity that dedup's fallback key, `company_signals`
+/// and the prestige alias table all join on, so one company silently became two — with split
+/// postings, split prestige, and an alias table that could not match either.
+///
+/// # Placement
+///
+/// Called from [`non_empty`], the single funnel every text field passes through, so the
+/// decoded form is what identity, display, classification and every sub-parser all see. Doing
+/// it in `company_key` alone would have fixed the key and left `company_name` rendering as
+/// `Ben &amp; Jerry's` in the UI.
+///
+/// Note the ordering this relies on: `is_http_url` validates the URL **after** `non_empty`,
+/// so a reference is decoded before the scheme is checked rather than after. Decoding after
+/// validation would be the classic bypass.
+///
+/// # Single pass, deliberately
+///
+/// `&amp;lt;` decodes to `&lt;` and stops, not to `<`. Repeated decoding is how escaped markup
+/// becomes live markup; one pass is the standard defence. Nothing downstream renders this text
+/// as HTML today — the UI is React interpolation throughout — but that is a property of the
+/// current frontend, not something this function should depend on.
+///
+/// Unrecognized or malformed references are left exactly as written. `&notanentity;` stays
+/// literal, which is no worse than the previous behaviour for that input and is visible.
+pub fn decode_html_entities(text: &str) -> String {
+    // Overwhelmingly the common case; skip the work and the allocation entirely.
+    if !text.contains('&') {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'&' {
+            // Copy the character whole — indexing by byte would split a multi-byte char.
+            let ch = text[index..].chars().next().expect("index is a char boundary");
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        // A reference is `&…;` with a short body. The cap stops a stray `&` in prose from
+        // scanning the rest of the string looking for a semicolon that belongs to something
+        // else entirely.
+        const MAX_ENTITY_BODY: usize = 12;
+        // Walk the cap back to a character boundary before slicing.
+        //
+        // `index + 1 + MAX_ENTITY_BODY` is byte arithmetic, and there is no reason for the
+        // byte it lands on to begin a character — slicing a `&str` there panics. A real
+        // Simplify title did exactly that on 2026-08-30: an `&` in
+        // "Materials Planning & Logistics – Development Programs" put the cap at byte 41,
+        // which is inside the en-dash occupying 40..43. The panic killed the whole collection
+        // task: two sources never ran, the run never finished, and the manual trigger returned
+        // an empty body.
+        //
+        // Entity bodies are ASCII, so anything multi-byte inside the window is already proof
+        // this is not an entity. Shrinking the window can only ever cost a match that was
+        // never going to happen.
+        let mut limit = (index + 1 + MAX_ENTITY_BODY).min(bytes.len());
+        while limit > index + 1 && !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let semicolon = text[index + 1..limit].find(';').map(|at| index + 1 + at);
+
+        match semicolon.and_then(|end| decode_reference(&text[index + 1..end]).map(|ch| (ch, end)))
+        {
+            Some((decoded, end)) => {
+                out.push(decoded);
+                index = end + 1;
+            }
+            // Not a reference we recognize: emit the `&` and carry on from the next byte.
+            None => {
+                out.push('&');
+                index += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// The body of one reference, without the `&` or the `;`.
+fn decode_reference(body: &str) -> Option<char> {
+    if body.is_empty() {
+        return None;
+    }
+
+    if let Some(digits) = body.strip_prefix('#') {
+        let value = match digits.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => digits.parse::<u32>().ok()?,
+        };
+        // `from_u32` rejects surrogates and out-of-range values, so a hostile `&#xD800;`
+        // cannot produce an invalid `char`.
+        return char::from_u32(value);
+    }
+
+    // Named references are case-sensitive in HTML5; matching case-insensitively would decode
+    // `&AMP;`, which no encoder emits, so keep it exact.
+    NAMED_ENTITIES
+        .iter()
+        .find(|(name, _)| *name == body)
+        .map(|(_, ch)| *ch)
 }
 
 fn non_empty_opt(text: Option<&str>) -> Option<String> {
@@ -1353,6 +1631,41 @@ fn is_http_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact string that panicked a live collection on 2026-08-30.
+    ///
+    /// An `&` followed within twelve bytes by a multi-byte character: the entity-scan cap
+    /// lands mid-character and slicing there panics, taking the whole collection task with it.
+    /// Real data found this; no fixture had an en-dash near an ampersand.
+    #[test]
+    fn an_ampersand_near_a_multibyte_character_does_not_panic() {
+        let title = "Manager, Materials Planning & Logistics – Development Programs (R5252)";
+        assert_eq!(decode_html_entities(title), title);
+    }
+
+    /// The same shape at every offset, since which byte the cap lands on depends on where the
+    /// ampersand sits. One passing example proves only that one offset is safe.
+    #[test]
+    fn an_ampersand_at_any_distance_from_a_multibyte_character_is_safe() {
+        for gap in 0..16 {
+            let text = format!("A & {}– dash", "x".repeat(gap));
+            let decoded = decode_html_entities(&text);
+            assert!(decoded.contains('–'), "lost the dash at gap {gap}");
+        }
+        // And the same for characters wider than three bytes.
+        for gap in 0..16 {
+            let text = format!("A & {}🙂 emoji", "x".repeat(gap));
+            assert!(decode_html_entities(&text).contains('🙂'), "lost the emoji at gap {gap}");
+        }
+    }
+
+    /// The fix must not cost a real entity that happens to sit near one.
+    #[test]
+    fn a_real_entity_still_decodes_next_to_a_multibyte_character() {
+        assert_eq!(decode_html_entities("Ben &amp; Jerry — ice cream"), "Ben & Jerry — ice cream");
+        assert_eq!(decode_html_entities("&amp;–"), "&–");
+    }
+
 
     // --------------------------------------------------------------------------------------
     // Fixtures
@@ -1553,6 +1866,233 @@ mod tests {
         );
     }
 
+    // --- pay sanity bounds, added 2026-08-22 (audit findings F9, F10) ---
+
+    #[test]
+    fn a_negative_amount_is_refused_rather_than_made_positive() {
+        // The defect: the sign was skipped with the currency symbol, so this parsed as a
+        // cheerful $20/hr. Inventing a positive figure from a malformed field is worse than
+        // reading nothing, because pay is the highest-weighted ranking input.
+        assert_eq!(parse_pay("$-20/hr"), None);
+        assert_eq!(parse_pay("-$20/hr"), None);
+        assert_eq!(parse_pay("-20/hr"), None);
+    }
+
+    #[test]
+    fn a_range_separator_is_not_mistaken_for_a_minus_sign() {
+        // The reason `is_negated` refuses to skip whitespace. Breaking this would silently
+        // discard every hyphenated pay range in the corpus, which is most of them.
+        assert_eq!(
+            parse_pay("$45 - 55 per hour"),
+            Some(usd(45.0, Some(55.0), PayPeriod::Hour))
+        );
+        assert_eq!(
+            parse_pay("$45-55/hr"),
+            Some(usd(45.0, Some(55.0), PayPeriod::Hour))
+        );
+    }
+
+    #[test]
+    fn a_dash_before_the_amount_is_not_a_minus_sign() {
+        // The case `is_negated`'s refusal to skip whitespace actually protects, and the one a
+        // hyphen-separated title makes routine. Caught by mutation testing: without this, a
+        // version of `is_negated` that skipped whitespace passed every other test while
+        // silently discarding pay from any posting whose text put a dash before the figure.
+        assert_eq!(
+            parse_pay("Software Engineer Intern - $45/hr"),
+            Some(usd(45.0, None, PayPeriod::Hour))
+        );
+        assert_eq!(
+            parse_pay("Summer 2027 \u{2014} $45.00 per hour"),
+            Some(usd(45.0, None, PayPeriod::Hour))
+        );
+    }
+
+    #[test]
+    fn an_incredible_figure_is_refused_at_each_period() {
+        // Unit confusion, the failure these exist to catch: a raw source value arriving
+        // unscaled and being read at face value.
+        assert_eq!(parse_pay("$1,000,000/hr"), None);
+        assert_eq!(parse_pay("$5,000,000 per month"), None);
+        assert_eq!(parse_pay("$50,000,000 per year"), None);
+    }
+
+    #[test]
+    fn the_credible_ceilings_are_inclusive_at_their_boundary() {
+        // On the boundary itself. These sit far above `MAX_PLAUSIBLE_HOURLY_USD`, which
+        // answers a different question — whether a *bare* figure is hourly.
+        assert_eq!(
+            parse_pay(&format!("${MAX_CREDIBLE_HOURLY_USD:.0}/hr")),
+            Some(usd(MAX_CREDIBLE_HOURLY_USD, None, PayPeriod::Hour)),
+            "the ceiling itself must still be accepted"
+        );
+        assert_eq!(
+            parse_pay(&format!("${:.0}/hr", MAX_CREDIBLE_HOURLY_USD + 1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unusual_but_real_hourly_rate_still_survives() {
+        // The ceiling must not become a judgement about generosity. $300/hr is high and real;
+        // only unit confusion should trip this.
+        assert_eq!(
+            parse_pay("$300 per hour"),
+            Some(usd(300.0, None, PayPeriod::Hour))
+        );
+    }
+
+    #[test]
+    fn the_credible_ceiling_does_not_apply_to_other_currencies() {
+        // The thresholds are USD-denominated. 5,000 yen per hour is an ordinary wage and must
+        // not be refused by a dollar ceiling.
+        assert_eq!(
+            parse_pay("JPY 5000 per hour"),
+            Some(PayRange {
+                min: 5000.0,
+                max: None,
+                currency: "JPY".to_string(),
+                period: PayPeriod::Hour,
+            })
+        );
+    }
+
+    // --- HTML entity decoding, added 2026-08-22 (audit finding F3) ---
+
+    #[test]
+    fn an_entity_encoded_company_has_the_same_identity_as_a_plain_one() {
+        // The defect: `&amp;` normalized to the word "amp" and `&#39;` to "39", so one company
+        // arriving from two feeds became two companies with split postings and split prestige.
+        //
+        // Asserted through `normalize` rather than through `company_key` directly, because the
+        // decoding lives at the `non_empty` funnel — deliberately one site, so the text is
+        // decoded exactly once. See `company_key`'s own note on its precondition.
+        let identity = |company: &str| {
+            let mut raw = raw_posting("Software Engineer Intern");
+            raw.company = company.to_string();
+            let QcOutcome::Accepted(posting) = normalize(&raw, now()) else {
+                panic!("{company} should normalize cleanly");
+            };
+            (posting.company_key.clone(), posting.company_name.clone())
+        };
+
+        assert_eq!(identity("Ben &amp; Jerry&#39;s"), identity("Ben & Jerry's"));
+        assert_eq!(identity("Procter &amp; Gamble"), identity("Procter & Gamble"));
+
+        // And the display name is decoded too — fixing only the key would have left the UI
+        // rendering the literal text "Ben &amp; Jerry's".
+        assert_eq!(identity("Ben &amp; Jerry&#39;s").1, "Ben & Jerry's");
+    }
+
+    #[test]
+    fn numeric_and_hex_references_both_decode() {
+        assert_eq!(decode_html_entities("caf&#233;"), "café");
+        assert_eq!(decode_html_entities("caf&#xE9;"), "café");
+        assert_eq!(decode_html_entities("caf&#Xe9;"), "café");
+    }
+
+    #[test]
+    fn decoding_is_a_single_pass() {
+        // `&amp;lt;` must become `&lt;`, never `<`. Repeated decoding is how escaped markup
+        // turns back into live markup.
+        assert_eq!(decode_html_entities("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn a_reference_is_decoded_before_the_url_scheme_is_checked() {
+        // Ordering matters more than the decoding here: `non_empty` runs before `is_http_url`,
+        // so a reference cannot smuggle a scheme past validation by being decoded afterwards.
+        let mut raw = raw_posting("Software Engineer Intern");
+        raw.url = "&#106;avascript:alert(1)".to_string();
+        let (reason, _) = expect_rejected(normalize(&raw, now()));
+        assert_eq!(reason, REASON_INVALID_URL);
+    }
+
+    #[test]
+    fn malformed_references_are_left_alone_rather_than_panicking() {
+        for input in [
+            "&", "&;", "&#;", "&#x;", "&#xZZ;", "&#99999999999;", "&#xD800;", "&notreal;",
+            "a & b", "&amp", "&&amp;;", "100% &amp; rising", "&#", "&#x",
+        ] {
+            let _ = decode_html_entities(input);
+        }
+        // A bare ampersand in prose survives untouched.
+        assert_eq!(decode_html_entities("Ben & Jerry"), "Ben & Jerry");
+        // An unrecognized name stays literal rather than being silently eaten.
+        assert_eq!(decode_html_entities("&notreal;"), "&notreal;");
+        // A surrogate code point is not a `char`; it must not decode.
+        assert_eq!(decode_html_entities("&#xD800;"), "&#xD800;");
+    }
+
+    #[test]
+    fn multi_byte_text_around_a_reference_survives_intact() {
+        // The decoder walks bytes, so a multi-byte character adjacent to a reference is the
+        // case that would corrupt output or panic if the indexing were wrong.
+        assert_eq!(decode_html_entities("工程師 &amp; 実習"), "工程師 & 実習");
+        assert_eq!(decode_html_entities("🚀&amp;🚀"), "🚀&🚀");
+        assert_eq!(decode_html_entities("café&#39;s 🚀"), "café's 🚀");
+        // And with no reference at all, the fast path must be byte-exact.
+        assert_eq!(decode_html_entities("工程師實習生 🚀"), "工程師實習生 🚀");
+    }
+
+    #[test]
+    fn a_long_run_of_text_after_a_stray_ampersand_is_not_swallowed() {
+        // Without a length cap the scan would run to a distant semicolon and delete everything
+        // between, which is far worse than leaving the `&` alone.
+        let input = "R&D at Acme; we build things";
+        assert_eq!(decode_html_entities(input), input);
+    }
+
+    // --- pay: the hourly band, added 2026-08-22 (audit finding F1) ---
+
+    #[test]
+    fn a_bare_hourly_rate_is_read_as_hourly() {
+        // The defect: this returned `None`, so every Greenhouse internship rate was discarded.
+        assert_eq!(parse_pay("USD 45.00"), Some(usd(45.0, None, PayPeriod::Hour)));
+    }
+
+    #[test]
+    fn a_bare_hourly_range_is_read_as_hourly() {
+        // Greenhouse's exact output shape for a range: `"{currency} {min:.2} - {max:.2}"`.
+        assert_eq!(
+            parse_pay("USD 45.00 - 55.00"),
+            Some(usd(45.0, Some(55.0), PayPeriod::Hour))
+        );
+    }
+
+    #[test]
+    fn the_hourly_band_is_inclusive_at_its_own_boundary() {
+        // On the threshold, not either side of it — the repo has already lost a whole rating
+        // band to a `>` that should have been `>=`.
+        let at = format!("${MAX_PLAUSIBLE_HOURLY_USD:.0}");
+        assert_eq!(
+            parse_pay(&at),
+            Some(usd(MAX_PLAUSIBLE_HOURLY_USD, None, PayPeriod::Hour)),
+            "the boundary itself must be hourly"
+        );
+    }
+
+    #[test]
+    fn just_above_the_hourly_band_is_ambiguous_rather_than_guessed() {
+        // Not `Month`: this is the band where the likelier period flips, so nothing is
+        // inferred. Pinning it stops someone "completing" the heuristic without reading why.
+        let above = format!("${:.0}", MAX_PLAUSIBLE_HOURLY_USD + 1.0);
+        assert_eq!(parse_pay(&above), None);
+    }
+
+    #[test]
+    fn an_explicit_period_still_beats_the_hourly_band() {
+        // Ashby and Lever state their intervals; the new band must not override them.
+        assert_eq!(
+            parse_pay("USD 150.00 per year"),
+            Some(usd(150.0, None, PayPeriod::Year))
+        );
+        assert_eq!(
+            parse_pay("USD 150.00 per month"),
+            Some(usd(150.0, None, PayPeriod::Month))
+        );
+    }
+
     #[test]
     fn a_bare_amount_just_below_the_annual_threshold_has_no_discernible_period() {
         let below = format!("${:.0}", MIN_UNAMBIGUOUS_ANNUAL_USD - 1.0);
@@ -1581,9 +2121,14 @@ mod tests {
         // Ashby is the only source with an unambiguous interval (§ B fn 7). Its precision must
         // not be diluted to accommodate the sources that lack one, so a stated period wins
         // even where magnitude alone would have decided otherwise — in both directions.
+        // $60,000 rather than the $120,000 this used to use: any figure above
+        // `MIN_UNAMBIGUOUS_ANNUAL_USD` demonstrates the precedence, and $120,000 *per month*
+        // now trips `MAX_CREDIBLE_MONTHLY_USD` (audit finding F10) — a separate guard whose
+        // job is catching unit errors. Restoring the old value fails for that reason, not
+        // because period precedence broke.
         assert_eq!(
-            parse_pay("$120,000 per month"),
-            Some(usd(120_000.0, None, PayPeriod::Month)),
+            parse_pay("$60,000 per month"),
+            Some(usd(60_000.0, None, PayPeriod::Month)),
             "magnitude would have said annual; the source said monthly"
         );
         assert_eq!(

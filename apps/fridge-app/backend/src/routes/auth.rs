@@ -79,7 +79,38 @@ where
         let pool = SqlitePool::from_ref(state);
         let jar = CookieJar::from_headers(&parts.headers);
 
-        Ok(MaybeUser(user_from_jar(&pool, &jar).await?))
+        if let Some(user) = user_from_jar(&pool, &jar).await? {
+            return Ok(MaybeUser(Some(user)));
+        }
+
+        // Then a bearer token. The cookie is still the primary credential and is tried first;
+        // this exists because it cannot reach the Firefox extension — `SameSite=Lax` means a
+        // request from a `moz-extension://` page never carries it. See `hunt::tokens`.
+        //
+        // Adding it HERE rather than on the hunt routes is what keeps it one auth system: a
+        // route's signature still says `CurrentUser` and no route knows tokens exist. It also
+        // means the token is exactly as powerful as a session and no more, which is the
+        // property to preserve if it ever grows a scope.
+        Ok(MaybeUser(user_from_bearer(&pool, parts).await))
+    }
+}
+
+/// The user named by an `Authorization: Bearer` header, if there is a live token for it.
+///
+/// Returns `None` for every failure — malformed header, unknown token, revoked token, or a
+/// database error. A credential that does not check out is an anonymous request, not a 500,
+/// and the distinction between "no token" and "bad token" is not one we owe the caller.
+async fn user_from_bearer(pool: &SqlitePool, parts: &Parts) -> Option<User> {
+    let header = parts.headers.get(axum::http::header::AUTHORIZATION)?;
+    let value = header.to_str().ok()?;
+    let secret = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))?;
+
+    match crate::hunt::tokens::validate(pool, secret.trim(), Utc::now()).await {
+        Ok(user) => user,
+        Err(err) => {
+            eprintln!("auth: validating a hunt token failed: {err:?}");
+            None
+        }
     }
 }
 

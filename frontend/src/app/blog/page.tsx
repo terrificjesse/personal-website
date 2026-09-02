@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchPosts, type BlogPost, type BlogSortOrder } from "@/lib/blogApi";
+import { BLOG_PAGE_SIZE, fetchPosts, type BlogPost, type BlogSortOrder } from "@/lib/blogApi";
 import { fetchMe } from "@/lib/authApi";
 
 /** How long to wait after the last keystroke before searching. */
@@ -10,14 +10,29 @@ const SEARCH_DEBOUNCE_MS = 250;
 
 export default function BlogPage() {
   const [posts, setPosts] = useState<BlogPost[]>([]);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // What the last settled request was for. Loading is *derived* from comparing it to what the
+  // current controls ask for, rather than a `setLoading(true)` at the top of the effect —
+  // which is the `react-hooks/set-state-in-effect` pattern this codebase already has two
+  // outstanding errors for, and which would show no spinner on re-search anyway.
+  const [settledKey, setSettledKey] = useState<string | null>(null);
   const [sort, setSort] = useState<BlogSortOrder>("newest");
   // Two states rather than one: `query` is what's in the box and must update on every
   // keystroke, `debouncedQuery` is what's actually been asked for.
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  // What the *current* request should resume from. Cleared by the controls that change the
+  // question being asked, not by an effect reacting to them — resetting in an effect would
+  // fire a wasted request at the stale cursor first.
+  const [cursor, setCursor] = useState<string | null>(null);
+
+  // Identifies the request the current controls call for. Anything not yet settled at this
+  // key is in flight.
+  const requestKey = `${sort}\u0000${debouncedQuery.trim()}\u0000${cursor ?? ""}`;
+  const loading = settledKey !== requestKey;
 
   // Purely so an admin has a way *into* the editor — `/blog/admin` linked out to here but
   // nothing linked in, which left the editor reachable only by typing its URL. Optimistic in
@@ -49,31 +64,48 @@ export default function BlogPage() {
 
   useEffect(() => {
     let cancelled = false;
+    const key = requestKey;
 
     // Both controls feed one request. Sorting and searching compose in the backend's single
     // query, so there's nothing to merge or re-sort here — including across posts that came
     // from markdown files rather than the editor.
-    fetchPosts({ sort, q: debouncedQuery })
-      .then((data) => {
+    fetchPosts({ sort, q: debouncedQuery, limit: BLOG_PAGE_SIZE, cursor: cursor ?? undefined })
+      .then((page) => {
         // The cancelled flag matters more now than it did: typing fires overlapping requests,
         // and without it a slow early response could land after a newer one and win.
         if (cancelled) return;
-        setPosts(data);
+        // No cursor is a fresh question, so it replaces; a cursor is another page of the same
+        // question, so it appends.
+        setPosts((current) => (cursor === null ? page.posts : [...current, ...page.posts]));
+        setTotal(page.total);
+        setNextCursor(page.next_cursor);
         setError(null);
       })
       .catch(() => {
-        if (!cancelled) setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        if (cancelled) return;
+        setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        // Clear the list too. Leaving the previous query's results under an error banner
+        // presents stale content as though it answered the current search.
+        setPosts([]);
+        setTotal(0);
+        setNextCursor(null);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setSettledKey(key);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [sort, debouncedQuery]);
+    // `requestKey` is derived from the other two, so listing it changes nothing at runtime
+    // — it is here because the effect reads it, and a dependency array that lies is how the
+    // next person gets a stale closure.
+  }, [sort, debouncedQuery, cursor, requestKey]);
 
   const searching = debouncedQuery.trim().length > 0;
+  // Whether more exist is the server's answer, not arithmetic on `total` — under concurrent
+  // publishing those two disagree, and the server is the one that actually looked.
+  const hasMore = nextCursor !== null;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
@@ -93,7 +125,10 @@ export default function BlogPage() {
         <input
           type="search"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setCursor(null);
+          }}
           placeholder="Search posts…"
           aria-label="Search posts"
           className="min-w-0 flex-1 rounded border border-black/10 dark:border-white/10 bg-transparent px-3 py-2 text-sm"
@@ -103,7 +138,10 @@ export default function BlogPage() {
             <button
               key={option}
               type="button"
-              onClick={() => setSort(option)}
+              onClick={() => {
+                setSort(option);
+                setCursor(null);
+              }}
               aria-pressed={sort === option}
               className={
                 sort === option
@@ -119,7 +157,11 @@ export default function BlogPage() {
 
       {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
 
-      {loading ? (
+      {/* Only take over the page when there is nothing to show yet. While *appending* a
+          page, the list stays put and the Load more button carries the loading state — a
+          spinner that replaces results the reader is already looking at is a worse answer
+          than one that sits under them. */}
+      {loading && posts.length === 0 ? (
         <p className="mt-6 text-sm opacity-60">Loading…</p>
       ) : posts.length === 0 && !error ? (
         <p className="mt-6 text-sm opacity-60">
@@ -139,6 +181,24 @@ export default function BlogPage() {
             </li>
           ))}
         </ul>
+      )}
+
+      {posts.length > 0 && (
+        <div className="mt-6 flex items-center justify-between gap-4 text-xs opacity-60">
+          <span>
+            Showing {posts.length} of {total}
+          </span>
+          {hasMore && (
+            <button
+              type="button"
+              onClick={() => setCursor(nextCursor)}
+              disabled={loading}
+              className="rounded border border-black/20 dark:border-white/20 px-3 py-1.5 text-sm opacity-100 disabled:opacity-50"
+            >
+              {loading ? "Loading…" : "Load more"}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

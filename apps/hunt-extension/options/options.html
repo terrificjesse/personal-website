@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Internship Hunt — settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <h1>Internship Hunt</h1>
+
+    <form id="form">
+      <label>
+        Backend URL
+        <input id="backendUrl" type="url" required />
+        <small>
+          Must be an origin this extension has permission for — see
+          <code>host_permissions</code> in <code>manifest.json</code>.
+        </small>
+      </label>
+
+      <label>
+        Site URL
+        <input id="siteUrl" type="url" required />
+        <small>Only used for the “Open the site” link. Nothing is fetched from it.</small>
+      </label>
+
+      <label>
+        Access token
+        <input id="token" type="password" autocomplete="off" spellcheck="false" />
+        <small>
+          From the site: sign in, then generate one under <b>Extension access</b>. The session
+          cookie cannot reach an extension — Firefox will not send a <code>SameSite=Lax</code>
+          cookie from a <code>moz-extension://</code> page — so this is how the backend knows
+          who you are. Shown once when created; generate a new one if you lose it.
+        </small>
+      </label>
+
+      <label>
+        Check every
+        <input id="pollMinutes" type="number" min="1" max="1440" step="1" required />
+        <small>Minutes. Firefox will not run an alarm more often than once a minute.</small>
+      </label>
+
+      <label>
+        Notify individually, at most
+        <input id="maxNotificationsPerPoll" type="number" min="1" max="20" step="1" required />
+        <small>
+          Per check. Anything past this arrives as one summary notification — a first run over
+          an empty database can find hundreds at once.
+        </small>
+      </label>
+
+      <fieldset>
+        <legend>Alert me about</legend>
+        <label class="check">
+          <input id="kind-posting" type="checkbox" />
+          New postings from tier-1 and tier-2 companies
+        </label>
+        <label class="check">
+          <input id="kind-email" type="checkbox" />
+          Email — OA, interview and offer mail
+          <small>Nothing produces these yet; the inbox agent is a later phase.</small>
+        </label>
+      </fieldset>
+
+      <div class="actions">
+        <button type="submit">Save</button>
+        <button id="test" type="button">Test connection</button>
+      </div>
+    </form>
+
+    <p id="result" class="result"></p>
+
+    <script src="options.js"></script>
+  </body>
+</html>

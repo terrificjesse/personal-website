@@ -5,3 +5,7 @@
 # `*.db` alone doesn't match a suffixed filename.
 *.db.*
 .env
+# Hand-labelled mail for 8b's measurement (`labelset export`). Real subject lines and
+# snippets from the burner inbox — same reason `*.db` is above. Deliberately not `*.csv`,
+# which would also catch the vendored FoodKeeper snapshots in data/.
+/labelsets/
