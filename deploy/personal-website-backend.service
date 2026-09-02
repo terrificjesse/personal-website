@@ -1,5 +1,5 @@
 # Backend: Rust/axum, serving the fridge app, the blog, the internship tab and the hunt
-# alert channel. Install to /etc/systemd/system/hunt-backend.service.
+# alert channel. Install to /etc/systemd/system/personal-website-backend.service.
 #
 # The path below is deliberately NOT a dated release directory. `CompanyTiers::load()`
 # resolves its data file against `env!("CARGO_MANIFEST_DIR")` — the path the binary was BUILT
@@ -11,24 +11,24 @@
 
 [Unit]
 Description=Hunt backend (axum)
-Documentation=file:///srv/hunt/app/docs/DEPLOY.md
+Documentation=file:///opt/personal-website/docs/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=hunt
-Group=hunt
-WorkingDirectory=/srv/hunt/app/apps/fridge-app/backend
+User=personal-website
+Group=personal-website
+WorkingDirectory=/opt/personal-website/apps/fridge-app/backend
 
 # Secrets live outside every checkout, mode 600, owned by the service user.
-EnvironmentFile=/etc/hunt/backend.env
+EnvironmentFile=/etc/personal-website/backend.env
 
 # Refuse to start on a misconfiguration rather than booting into one. A non-zero exit here
 # fails the unit with the reason in the journal.
-ExecStartPre=/srv/hunt/app/deploy/preflight.sh /etc/hunt/backend.env
+ExecStartPre=/opt/personal-website/deploy/preflight.sh /etc/personal-website/backend.env
 
-ExecStart=/srv/hunt/app/apps/fridge-app/backend/target/release/fridge_backend
+ExecStart=/opt/personal-website/apps/fridge-app/backend/target/release/fridge_backend
 
 Restart=on-failure
 RestartSec=5s
@@ -38,12 +38,12 @@ StartLimitIntervalSec=60
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=hunt-backend
+SyslogIdentifier=personal-website-backend
 
 # The database is the record of a hunt in progress. It lives here, not in the checkout, and
 # this is the only path the service may write.
-StateDirectory=hunt
-ReadWritePaths=/var/lib/hunt
+StateDirectory=personal-website
+ReadWritePaths=/var/lib/personal-website
 
 NoNewPrivileges=true
 PrivateTmp=true

@@ -25,11 +25,15 @@ precisely because no cookie can reach a `moz-extension://` page.
 
 ## Host layout
 
+Adopted from `apps/fridge-app/backend/ops/` (Phase 10i) rather than invented here — the two
+tasks briefly had different answers, which is precisely how a backup ends up snapshotting a
+database nobody writes to.
+
 ```
-/srv/hunt/app/            the checkout, built in place — NOT a dated release directory
-/etc/hunt/backend.env     secrets, mode 600, owned by `hunt`
-/etc/hunt/frontend.env    optional, non-secret build/runtime knobs
-/var/lib/hunt/fridge.db   the database, outside every checkout
+/opt/personal-website/            the checkout, built in place — NOT a dated release directory
+/etc/personal-website/backend.env     secrets, mode 600, owned by `hunt`
+/etc/personal-website/frontend.env    optional, non-secret build/runtime knobs
+/var/lib/personal-website/fridge.db   the database, outside every checkout
 /var/log/caddy/hunt.log   access log; app logs go to the journal
 ```
 
@@ -46,7 +50,7 @@ only evidence is one log line at startup. So: **build in place at a stable path*
 line after every deploy:
 
 ```bash
-journalctl -u hunt-backend --since "5 min ago" | grep -i "company tier"
+journalctl -u personal-website-backend --since "5 min ago" | grep -i "company tier"
 ```
 
 Silence there is good; `no company tier file at …` means alerting is degraded. The durable fix
@@ -58,22 +62,22 @@ is a required change, listed below.
 
 Ordered. The two gates are marked and are not optional.
 
-1. **Gate — merge `phase-10-hardening`.** Login rate limiting is task 10j and lives on that
-   branch (`227a5fd`). A login endpoint with Argon2 and no throttle is a cheap denial of
-   service; do not put one on the internet.
+1. ~~**Gate — merge `phase-10-hardening`.**~~ **Done 2026-09-02.** 10g, 10i and 10j are in;
+   the combined suite is 758 passing, which is exactly the two branches' additions with nothing
+   lost, plus clippy at 36 and a clean `tsc`/`eslint`.
 2. **Gate — backups exist and a restore has been rehearsed** (task 10i). After this deploy the
    database on this host is the only copy of a hunt in progress.
 3. Create the user and directories:
    ```bash
-   sudo useradd --system --home /srv/hunt --shell /usr/sbin/nologin hunt
-   sudo install -d -o hunt -g hunt /srv/hunt /var/lib/hunt /etc/hunt
+   sudo useradd --system --home /opt/personal-website --shell /usr/sbin/nologin personal-website
+   sudo install -d -o personal-website -g personal-website /opt/personal-website /var/lib/personal-website /etc/personal-website
    ```
-4. Clone to `/srv/hunt/app` as `hunt`.
-5. `sudo install -m 600 -o hunt -g hunt deploy/env.production.example /etc/hunt/backend.env`,
+4. Clone to `/opt/personal-website` as `hunt`.
+5. `sudo install -m 600 -o personal-website -g personal-website deploy/env.production.example /etc/personal-website/backend.env`,
    then fill it in. Read the comments; each one names the failure that value causes when wrong.
 6. **Run the preflight before anything else starts:**
    ```bash
-   sudo -u hunt /srv/hunt/app/deploy/preflight.sh /etc/hunt/backend.env
+   sudo -u personal-website /opt/personal-website/deploy/preflight.sh /etc/personal-website/backend.env
    ```
    It refuses on: `COOKIE_SECURE` not on, a wildcard or still-localhost `ALLOWED_ORIGINS`, a
    relative `DATABASE_URL` or one inside a checkout, half-configured Google credentials, an
@@ -91,7 +95,7 @@ Ordered. The two gates are marked and are not optional.
    serve, and every call fails as a bare network error.
 8. Install the units and the proxy config from `deploy/`, then:
    ```bash
-   sudo systemctl enable --now hunt-backend hunt-frontend caddy
+   sudo systemctl enable --now personal-website-backend personal-website-frontend caddy
    ```
 9. Register both redirect URIs in Google Cloud Console — they must match **exactly**:
    `https://hunt.example.com/api/auth/google/callback` and
@@ -102,11 +106,11 @@ Ordered. The two gates are marked and are not optional.
 ## Redeploy
 
 ```bash
-sudo -u hunt git -C /srv/hunt/app pull
+sudo -u personal-website git -C /opt/personal-website pull
 ```
 Then rebuild both halves exactly as in step 7 — **the frontend must be rebuilt, not just
 restarted**, whenever `NEXT_PUBLIC_FRIDGE_API_URL` or any frontend code changes — re-run the
-preflight, and `sudo systemctl restart hunt-backend hunt-frontend`.
+preflight, and `sudo systemctl restart personal-website-backend personal-website-frontend`.
 
 Migrations run at boot inside `db::init_pool`. **An applied migration is immutable**: sqlx
 compares checksums and refuses to start with `migration N was previously applied but has been
@@ -115,7 +119,7 @@ modified`. If that appears after a pull, the fix is a new migration, never an ed
 ## Rollback
 
 ```bash
-sudo -u hunt git -C /srv/hunt/app checkout <previous-sha>
+sudo -u personal-website git -C /opt/personal-website checkout <previous-sha>
 ```
 then rebuild and restart. **Rolling back code does not roll back a migration**, and this
 project has no down-migrations. If the bad deploy added one, restore the database from the
@@ -123,7 +127,7 @@ backup taken before the deploy (gate 2) — which is why that gate exists.
 
 ## Where the database lives
 
-`/var/lib/hunt/fridge.db`, plus its WAL and shared-memory files. Never inside the checkout: a
+`/var/lib/personal-website/fridge.db`, plus its WAL and shared-memory files. Never inside the checkout: a
 relative `DATABASE_URL` resolves against `WorkingDirectory` and silently creates a second,
 empty database, which reads as "all my applications vanished".
 
@@ -143,7 +147,7 @@ works but hairpins through Caddy and fails outright under split-horizon DNS.
 Logs:
 
 ```bash
-journalctl -u hunt-backend -f
+journalctl -u personal-website-backend -f
 ```
 
 The inbox agent, from outside the extension — the popup's inbox line is one view of this, and
@@ -224,7 +228,7 @@ start without an explicit value, so this gets decided rather than inherited.
 
 ### The Gmail refresh token now lives on a machine you do not sit in front of
 
-`/etc/hunt/backend.env`, mode 600, owned by the service user, `ProtectHome` and
+`/etc/personal-website/backend.env`, mode 600, owned by the service user, `ProtectHome` and
 `ProtectSystem=strict` in the unit. It grants `gmail.modify` on the burner account.
 
 **Recommended:** keep it the burner, never a primary mailbox. If the host is ever suspected,
@@ -257,15 +261,15 @@ forwarded headers so (1) is a backend change alone.
 
 Nothing below can be done by an agent: it needs an account, a card, DNS, or a decision.
 
-1. **Gate — merge `phase-10-hardening`** so login rate limiting ships with the deploy (10j).
-2. **Gate — backups and a rehearsed restore** (10i). Not "a cron job exists": a restore you
-   have actually performed.
+1. ~~Gate — merge `phase-10-hardening`~~ — done.
+2. **Gate — drill the restore on the host** (10i). The scripts and a dev-machine drill exist;
+   what is still yours is one restore performed on the deployed host, with the backend stopped.
 3. Decide **`INBOX_APPLY_LABELS`** (task 10k). Recommended `false` for the first fortnight.
 4. Decide the **`moz-extension://`** posture: pin the UUID, or put the host behind a VPN.
 5. Buy/choose the host and point DNS at it. Caddy provisions the certificate on first start,
    which requires the DNS record to already resolve.
 6. Create the Google Cloud OAuth client and register **both** redirect URIs.
-7. Fill `/etc/hunt/backend.env` from `deploy/env.production.example` and run the preflight.
+7. Fill `/etc/personal-website/backend.env` from `deploy/env.production.example` and run the preflight.
 8. Deploy per **First deploy**, then confirm **Is it alive?** — including the company-tier line.
 9. Update the extension: the manifest's host permissions (a code change, listed above), its
    Settings backend URL (`https://hunt.example.com/api`), and re-grant via **Test connection**.

@@ -6,7 +6,7 @@
 # wrongly. Every check here corresponds to a failure this project has actually had, or to a
 # default that is safe on a laptop and wrong on a public host.
 #
-#   ./deploy/preflight.sh /etc/hunt/backend.env
+#   ./deploy/preflight.sh /etc/personal-website/backend.env
 #
 # Exits 0 when it is safe to start, 1 with one line per problem otherwise.
 
@@ -18,7 +18,7 @@ set -uo pipefail
 set -E
 trap 'echo "preflight: internal error at line $LINENO — refusing to vouch for this config" >&2; exit 1' ERR
 
-env_file="${1:-/etc/hunt/backend.env}"
+env_file="${1:-/etc/personal-website/backend.env}"
 problems=()
 
 if [[ ! -r "$env_file" ]]; then
@@ -76,7 +76,7 @@ else
     problems+=("DATABASE_URL is a relative path ('$db_path'); it must be absolute")
   else
     # Compare against THIS script's own checkout rather than a list of likely directory
-    # names: the list did not catch /srv/hunt/app, which is the layout this repo prescribes.
+    # names: the list did not catch the checkout path this repo's own runbook prescribes.
     checkout_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     case "$db_path" in
       "$checkout_root"/*)

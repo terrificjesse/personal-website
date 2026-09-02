@@ -1064,13 +1064,19 @@ tool running unattended on a host that stays up.
 | 10f ⬜ | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
 | 10g ✅ | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
 | 10h ◐ | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
-| 10i ⬜ | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
+| 10i ✅ | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
 | 10j ✅ | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
 | 10k ⬜ | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
 
-**Progress — 2026-09-02.** ✅ done · ◐ part done · ⬜ not started. Two branches, not yet merged
-into each other: `phase-10-spec` (Lane C/A) and `phase-10-hardening` (Codex). They merge
-cleanly as of this writing — verified with a throwaway `git merge --no-commit`, not assumed.
+**Progress — 2026-09-02.** ✅ done · ◐ part done · ⬜ not started. **`phase-10-hardening` is
+merged into `phase-10-spec`**, which was deploy gate 1. The combined suite is 758 passing —
+exactly both branches' additions with nothing lost — clippy 36, `tsc` and `eslint` clean.
+
+The merge is also what caught the two tasks having invented **different deployment contracts**:
+10h wrote `/srv/hunt/app` + user `hunt` + `/var/lib/hunt/fridge.db`, while 10i's backup scripts
+assumed `/opt/personal-website` + user `personal-website` + `/var/lib/personal-website`. An
+operator following both would have installed a backup timer pointed at a database nobody writes
+to, and found out at the first restore. Unified on 10i's naming.
 
 | Task | Where it stands |
 |---|---|
@@ -1081,7 +1087,8 @@ cleanly as of this writing — verified with a throwaway `git merge --no-commit`
 | 10g | `fed4813` (Codex). Sender and subject are now separate fields end to end |
 | 10j | `227a5fd` (Codex). Two-bucket sliding window, IP and account, login and reviews. **See the proxy interaction in `docs/DEPLOY.md` before deploying** |
 | 10h | **In progress.** Everything that is not a secret is in `deploy/` and `docs/DEPLOY.md`; the `[you]` half is listed at the end of that runbook |
-| 10d, 10f, 10i | Outstanding with Codex |
+| 10i | `790669c` (Codex). SQLite online-backup API, `integrity_check` and migration-ledger verification, atomic publish, a daily timer, and a drill performed against the dev database |
+| 10d, 10f | Outstanding with Codex |
 | 10k | Outstanding with the user, and 10h names it as a gate |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 10h, you ≈ 10h of deploy. Neither agent blocks the other:
