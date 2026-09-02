@@ -263,8 +263,14 @@ pub struct SourceContext {
     /// Ceiling on boards fetched per multi-board source in one run.
     ///
     /// Defaults to no cap. A cap makes the run finish sooner and makes the enumeration
-    /// incomplete, so a capped source reports [`SourceOutcome::Partial`] **forever** and can
-    /// never expire anything. That is the correct trade and it is not free; set it knowingly.
+    /// incomplete, so a capped source reports [`SourceOutcome::Partial`] **forever**.
+    ///
+    /// What that costs changed with migration 0026. For an unscoped source it is still total:
+    /// `Partial` advances no counters, so a capped Lever or Ashby can never expire anything.
+    /// For a **scoped** source it is now proportional — the boards inside the cap are genuinely
+    /// complete enumerations and do advance counters; the boards beyond it have no verdict and
+    /// are left alone. A capped Greenhouse therefore expires within the slice it polled, which
+    /// is correct, and is worth knowing before setting a cap and assuming nothing can move.
     pub max_boards_per_run: usize,
     /// Sources switched off by configuration. They still produce a `source_runs` row, with
     /// [`SourceOutcome::Skipped`] — a source that vanishes from the health panel looks like a
