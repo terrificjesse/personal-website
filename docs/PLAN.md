@@ -1060,7 +1060,7 @@ tool running unattended on a host that stays up.
 | 10b | `AGENTS.md` unification — **done 2026-09-02** | `[gen]` | C | — | — | — |
 | 10c ✅ | Write the `application_events` schema + emit contract into `docs/HUNT.md` **before any code** | `[gen]` | C | Claude Code | ✅ | 1–2h |
 | 10d ⬜ | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
-| 10e ◐ | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
+| 10e ✅ | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
 | 10f ⬜ | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
 | 10g ✅ | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
 | 10h ◐ | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
@@ -1083,12 +1083,12 @@ to, and found out at the first restore. Unified on 10i's naming.
 | 10a | `57137d8`. Six discrepancies beyond the four already recorded, incl. `HUNT.md`'s migration numbers contradicting its own prose twice |
 | 10b | `7dcc0fd`. `AGENTS.md` is a symlink; two more added where Codex had no rules file at all |
 | 10c | `87a6b08`. The spec is in `docs/HUNT.md`; 10d builds from it |
-| 10e | **Half.** `d0caf73` made all three status writers transactional (and fixed a live defect: `decide` discarded the application UPDATE's `Result`); `8cb4c10` added `routes::auth::Credential`. The `record()` calls wait on 10d |
+| 10e | **Done.** Part 1 (`d0caf73`, `8cb4c10`) made all three status writers transactional — fixing a live defect on the way, `decide` discarding the application UPDATE's `Result` — and added `routes::auth::Credential`. Part 2 (`5c161f9`) emits from all five call sites, including `create_application`, which had no transaction at all |
 | 10g | `fed4813` (Codex). Sender and subject are now separate fields end to end |
 | 10j | `227a5fd` (Codex). Two-bucket sliding window, IP and account, login and reviews. **See the proxy interaction in `docs/DEPLOY.md` before deploying** |
 | 10h | **In progress.** Everything that is not a secret is in `deploy/` and `docs/DEPLOY.md`; the `[you]` half is listed at the end of that runbook |
 | 10i | `790669c` (Codex). SQLite online-backup API, `integrity_check` and migration-ledger verification, atomic publish, a daily timer, and a drill performed against the dev database |
-| 10d, 10f | Outstanding with Codex |
+| 10d, 10f | `da0ed0a`, `e3f6c28` (Codex). The table, `record()`, the backfill and the fold verification |
 | 10k | Outstanding with the user, and 10h names it as a gate |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 10h, you ≈ 10h of deploy. Neither agent blocks the other:

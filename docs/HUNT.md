@@ -292,22 +292,41 @@ update, the proposal update and `record` in one transaction fixes all three at o
 the reason `record` takes a `&mut Transaction` rather than a pool. The same applies to
 `internships.rs:263` and `sync.rs:503`.
 
-### Three things 10e part 2 has to get right
+### Three things 10e part 2 had to get right — and did
 
-Found while writing part 1, and all three are decisions rather than mechanics:
+All three were predicted while writing part 1, and all three landed as predicted. Kept as a
+record because each is a decision a future writer can undo by accident.
 
-1. **`create_application` is not transactional yet.** It is a single INSERT today, so there is
-   no transaction for `record` to join. Wrapping it is part of adding the creation event, not a
-   separate cleanup — and the event must be inserted *after* the application row, because
-   `application_id` is a real enforced FK.
-2. **A rejected proposal that was never auto-applied changes no status, and must emit no
-   event.** `decide` already skips the UPDATE in that case; the log is a record of transitions
-   that happened, and an event for a rejection that moved nothing would make the fold disagree
-   with the column on the very first query.
-3. **A manual event has a NULL `cause_id`, and SQLite treats NULLs as distinct**, so the UNIQUE
-   key does not deduplicate them. That is correct — two manual edits are two events — but it
-   means the idempotency guarantee covers only email- and extension-caused writes. A handler
-   that retries its own manual write writes twice.
+1. **`create_application` had no transaction** — a single INSERT. It has one now, with the
+   event written *after* the application row, because `application_id` is a real enforced
+   foreign key. The 409 on a duplicate application rolls back rather than leaving an orphan
+   event behind.
+2. **A rejected proposal that was never auto-applied emits nothing.** It changes no status, so
+   there is no transition to record. Pinned by
+   `rejecting_a_proposal_that_never_applied_records_nothing`.
+3. **A manual event's NULL `cause_id` does not deduplicate**, and that is correct: two manual
+   edits are two events. The key's idempotency covers email- and extension-caused writes, which
+   is exactly where a producer can legitimately run twice.
+
+A fourth, found while doing it: **accepting a proposal that was already auto-applied writes no
+second event.** The email actor's row and the human's accept share
+`(application_id, cause_kind, cause_id, to_status)`, so `record` returns `AlreadyRecorded` — a
+normal outcome. The undo differs only in `to_status`, which is the whole reason that column is
+in the key.
+
+### Verified against the real database, 2026-09-02
+
+Against a **copy of the live `fridge.db`**, not fixtures — the first time the fold invariant has
+covered rows the application itself wrote rather than rows the backfill reconstructed:
+
+| | covered | exempt | mismatches |
+|---|---|---|---|
+| after `application-events backfill` | 2 | 0 | **0** |
+| after driving the real handlers | 3 | 0 | **0** |
+
+The events on the two touched applications came out `unknown` → `manual` → `extension`: the
+backfilled creation whose origin could not be proved, a live manual status move, and a new
+application created on a hunt-token credential. Three actors, in the order they happened.
 
 ### What is deliberately not in this table
 
