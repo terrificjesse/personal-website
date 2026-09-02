@@ -353,6 +353,47 @@ void (async () => {
 
 const trackButton = document.getElementById("track");
 const trackResultEl = document.getElementById("trackResult");
+const variantRow = document.getElementById("variantRow");
+const variantSelect = document.getElementById("resumeVariant");
+
+/**
+ * Offer the résumé variants, so attribution is recorded at the only moment anyone knows it.
+ *
+ * **Asked for here and nowhere else.** You know which résumé you just uploaded while the form
+ * is still open; a week later you are guessing, and an attribution built on recollection is
+ * worse than none because it looks like data. See `docs/HUNT.md` § Résumé variants.
+ *
+ * Failing to load them must never block tracking: the row stays hidden, the application is
+ * still recorded, and it is simply unattributed — which is a state the schema already expects
+ * and reports separately. Losing the tracker row instead would be the far worse trade.
+ *
+ * Archived variants are not offered. Retiring one means "no longer sending this", so listing it
+ * invites recording something that did not happen.
+ */
+async function offerVariants() {
+  const config = await settings();
+  const base = config.backendUrl.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/hunt/resume-variants`, {
+      credentials: "include",
+      headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
+    });
+    if (!res.ok) return;
+
+    const active = (await res.json()).filter((variant) => !variant.archived_at);
+    if (active.length === 0) return;
+
+    for (const variant of active) {
+      const option = document.createElement("option");
+      option.value = variant.id;
+      option.textContent = variant.label;
+      variantSelect.append(option);
+    }
+    variantRow.hidden = false;
+  } catch {
+    // Same posture as everywhere else here: a missing convenience, never a missing tracker row.
+  }
+}
 
 /** What the backend and the page each think this application is. */
 async function identifyPage(tabId) {
@@ -397,6 +438,8 @@ async function offerTracking(tabId) {
   trackButton.hidden = false;
   trackButton.textContent = `Track: ${known.company_name || page.company || "this role"}`;
   trackButton.dataset.postingId = known.posting_id;
+  // Only once there is something to track — no request when you are not tracking.
+  void offerVariants();
 }
 
 trackButton?.addEventListener("click", async () => {
@@ -414,7 +457,13 @@ trackButton?.addEventListener("click", async () => {
         "Content-Type": "application/json",
         ...(config.token ? { Authorization: `Bearer ${config.token}` } : {}),
       },
-      body: JSON.stringify({ posting_id: postingId }),
+      // `resume_variant_id` is the key `CreateApplicationRequest` deserializes; the empty
+      // option means "not recorded", and omitting it is how an application stays honestly
+      // unattributed rather than being assigned a guess.
+      body: JSON.stringify({
+        posting_id: postingId,
+        ...(variantSelect?.value ? { resume_variant_id: variantSelect.value } : {}),
+      }),
     });
     if (res.status === 409) {
       trackResultEl.textContent = "Already in your tracker.";
@@ -422,9 +471,13 @@ trackButton?.addEventListener("click", async () => {
       trackResultEl.textContent = `Could not track it (${res.status}).`;
       return;
     } else {
-      trackResultEl.textContent = "Added to your tracker as applied.";
+      const label = variantSelect?.selectedOptions?.[0]?.textContent;
+      trackResultEl.textContent = variantSelect?.value
+        ? `Added to your tracker as applied, with “${label}”.`
+        : "Added to your tracker as applied.";
     }
     trackButton.hidden = true;
+    variantRow.hidden = true;
   } catch (err) {
     trackResultEl.textContent = `Could not track it: ${err.message}`;
   }

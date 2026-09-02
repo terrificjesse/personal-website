@@ -838,6 +838,24 @@ recollection is worse than none — it looks like data.
 The rest of rule 10 is untouched: nothing new fires on page load, the content script's reach
 does not change, and the tracker row is still created only by an explicit click.
 
+### Built 2026-09-02, and the one gap it leaves
+
+Migration `0024`, `src/hunt/variants.rs`, four routes, and a variant picker on the popup's
+track offer. Verified through the real routes against a copy of the live database: a rename
+kept `application_count: 1`, and `DELETE` on a variant in use answered **409**.
+
+**There is no way to create a variant except the API.** The popup only *selects* among
+variants that already exist, because a popup is the wrong place to manage a list, and the site
+panel that would create them is frontend work this session did not own. Until it exists:
+
+```bash
+curl -X POST -H "Authorization: Bearer $HUNT_TOKEN" -H 'Content-Type: application/json'      -d '{"label":"one-page, systems"}' https://…/api/hunt/resume-variants
+```
+
+That is a real gap, not a deferral dressed up as one: with no variants defined, the picker
+never appears and every application stays unattributed — which is exactly what the feature
+looks like when it is switched off.
+
 ### The reporting half is deliberately not here
 
 **12f stores the attribution; the `by_variant` breakdown in `GET /hunt/analytics` is a separate

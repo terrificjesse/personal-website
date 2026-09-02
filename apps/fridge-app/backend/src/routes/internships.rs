@@ -1729,4 +1729,29 @@ mod handler_tests {
         .unwrap();
         assert_eq!(stored.as_deref(), Some(variant.id.as_str()));
     }
+
+    /// The seam between `popup.js` and this handler, pinned the way 8g's was.
+    ///
+    /// The extension and these routes meet in two languages with no compiler between them. A
+    /// renamed field here degrades to an application that is silently *unattributed* — which
+    /// is indistinguishable from one where the user chose "Not recorded", and would go
+    /// unnoticed until a report months later showed everything in the "no variant" bucket.
+    ///
+    /// So this deserializes the exact body the popup builds, rather than a struct literal.
+    #[test]
+    fn the_popup_body_deserializes_into_the_request_the_handler_expects() {
+        // Exactly what popup.js sends when a variant is chosen.
+        let with_variant: CreateApplicationRequest = serde_json::from_str(
+            r#"{"posting_id":"p1","resume_variant_id":"v1"}"#,
+        )
+        .expect("the popup's body must deserialize");
+        assert_eq!(with_variant.posting_id, "p1");
+        assert_eq!(with_variant.resume_variant_id.as_deref(), Some("v1"));
+
+        // And what it sends when the empty "Not recorded" option is selected: the key is
+        // omitted entirely rather than sent as "", which would be a variant id of "".
+        let without: CreateApplicationRequest =
+            serde_json::from_str(r#"{"posting_id":"p1"}"#).expect("still valid");
+        assert_eq!(without.resume_variant_id, None);
+    }
 }
