@@ -1166,8 +1166,33 @@ is thin, **11e and 11f are the two to move**, and 11a is written precisely so th
   that cannot be checked by hand is a dashboard nobody should believe.
 - A backdated application with no response produces **exactly one** nudge, and the next sweep
   produces none.
-- A real OA email with a real due date raises an alert ahead of that date, and the alert body
-  says which application it belongs to.
+- ~~A real OA email with a real due date raises an alert ahead of that date, and the alert body
+  says which application it belongs to.~~ **Unmeetable as written, corrected 2026-09-02** — the
+  second checkpoint clause in two phases to ask for something nothing can produce, and worth
+  noticing as a pattern rather than a coincidence: both were written before the subsystem
+  existed, and both were wrong about what it would be able to see.
+
+  **No email in the corpus carries an extractable date, and none can.** `gmail.rs` fetches
+  `format=metadata` on purpose — *"it is a burner account, but it is still someone's mail"* — so
+  the body is never transferred, and extraction sees the subject plus a snippet averaging **199
+  characters** (201 max). Measured over all **23** stored messages: **zero** extracted. The only
+  date-shaped text in the whole corpus is an event range in a subject (`Roblox Week @ CMU -
+  9/8-9/10`) and a forwarded `Date: Sun, Aug 30` header, both of which cue-anchoring refuses on
+  purpose.
+
+  The bar that replaces it, and it is a lower one — say so rather than letting it pass as the
+  same test:
+
+  - **The extraction → storage → alert path is verified end to end on a CONSTRUCTED message**
+    carrying real deadline wording, against a copy of the real database. That proves the
+    plumbing, not the recall.
+  - **The real-corpus recall is reported as its own number** — 0 of 23 — rather than folded into
+    a pass.
+
+  The original clause becomes meetable when either dated mail arrives or bodies are fetched.
+  **Fetching bodies reverses a recorded privacy decision and widens what untrusted text reaches
+  the classifier; it is the user's call, not an agent's**, and until it is taken this feature is
+  plumbing waiting for input.
 - Filters survive a page reload and a copied URL.
 
 ### Traps
