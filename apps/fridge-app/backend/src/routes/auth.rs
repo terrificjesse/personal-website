@@ -67,6 +67,79 @@ async fn user_from_jar(pool: &SqlitePool, jar: &CookieJar) -> Result<Option<User
     auth::validate_session(pool, cookie.value()).await
 }
 
+/// Which credential proved who the caller is.
+///
+/// Phase 10's `application_events` records `actor = 'extension'` for an application created
+/// from the popup, and that has to be decided **here** rather than from a field in the request
+/// body: a claim by the party being described is wrong exactly when someone is debugging why
+/// it is wrong. See `docs/HUNT.md` § `application_events`.
+///
+/// This is not authorization. A hunt token is exactly as powerful as a session and no more —
+/// the difference recorded here is provenance, and nothing may branch on it to decide what a
+/// caller is *allowed* to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The site's `fridge_session` cookie.
+    Session,
+    /// A `hunt_tokens` bearer — in practice, the Firefox extension.
+    HuntToken,
+    /// Nobody proved anything.
+    Anonymous,
+}
+
+impl Credential {
+    /// The `application_events.actor` value a write made on this credential is attributed to.
+    ///
+    /// Named in the events table's vocabulary rather than this one's, so the mapping lives in
+    /// exactly one place. `Anonymous` maps to `unknown` and not to `manual`: the provenance
+    /// rule is that a row whose origin cannot be proved says so — see `docs/HUNT.md`. It is
+    /// unreachable behind `CurrentUser` today, and the honest value is still the one to
+    /// return. This becomes a `From<Credential> for Actor` once 10d lands the enum.
+    pub fn actor(self) -> &'static str {
+        match self {
+            Credential::HuntToken => "extension",
+            Credential::Session => "manual",
+            Credential::Anonymous => "unknown",
+        }
+    }
+}
+
+/// One resolution per request, shared by every extractor that asks.
+///
+/// Without the cache, a handler taking both `CurrentUser` and `Credential` would validate the
+/// same credential twice — and, worse, could get two different answers if a session expired
+/// between the two extractors. Extractors run in declaration order, so the cache also makes
+/// the answer independent of how a handler happens to list its arguments.
+#[derive(Clone)]
+struct Resolved(Option<User>, Credential);
+
+async fn resolve(pool: &SqlitePool, parts: &mut Parts) -> Result<Resolved, AuthError> {
+    if let Some(cached) = parts.extensions.get::<Resolved>() {
+        return Ok(cached.clone());
+    }
+
+    let jar = CookieJar::from_headers(&parts.headers);
+    let resolved = if let Some(user) = user_from_jar(pool, &jar).await? {
+        Resolved(Some(user), Credential::Session)
+    } else {
+        // Then a bearer token. The cookie is still the primary credential and is tried first;
+        // this exists because it cannot reach the Firefox extension — `SameSite=Lax` means a
+        // request from a `moz-extension://` page never carries it. See `hunt::tokens`.
+        //
+        // Adding it HERE rather than on the hunt routes is what keeps it one auth system: a
+        // route's signature still says `CurrentUser` and no route knows tokens exist. It also
+        // means the token is exactly as powerful as a session and no more, which is the
+        // property to preserve if it ever grows a scope.
+        match user_from_bearer(pool, parts).await {
+            Some(user) => Resolved(Some(user), Credential::HuntToken),
+            None => Resolved(None, Credential::Anonymous),
+        }
+    };
+
+    parts.extensions.insert(resolved.clone());
+    Ok(resolved)
+}
+
 // Builds a user using header data in the cookie
 impl<S> FromRequestParts<S> for MaybeUser
 where
@@ -77,21 +150,23 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let pool = SqlitePool::from_ref(state);
-        let jar = CookieJar::from_headers(&parts.headers);
+        Ok(MaybeUser(resolve(&pool, parts).await?.0))
+    }
+}
 
-        if let Some(user) = user_from_jar(&pool, &jar).await? {
-            return Ok(MaybeUser(Some(user)));
-        }
+/// **Never rejects an authenticated request**, and never rejects an anonymous one either — a
+/// caller with no credential is `Anonymous`, which is a fact rather than an error. Pair it with
+/// `CurrentUser` when a route needs both identity and provenance.
+impl<S> FromRequestParts<S> for Credential
+where
+    SqlitePool: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
 
-        // Then a bearer token. The cookie is still the primary credential and is tried first;
-        // this exists because it cannot reach the Firefox extension — `SameSite=Lax` means a
-        // request from a `moz-extension://` page never carries it. See `hunt::tokens`.
-        //
-        // Adding it HERE rather than on the hunt routes is what keeps it one auth system: a
-        // route's signature still says `CurrentUser` and no route knows tokens exist. It also
-        // means the token is exactly as powerful as a session and no more, which is the
-        // property to preserve if it ever grows a scope.
-        Ok(MaybeUser(user_from_bearer(&pool, parts).await))
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let pool = SqlitePool::from_ref(state);
+        Ok(resolve(&pool, parts).await?.1)
     }
 }
 
@@ -673,5 +748,124 @@ mod tests {
 
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         assert_eq!(cookie.http_only(), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    //! Provenance, not authorization.
+    //!
+    //! Phase 10's `application_events` attributes a write to `extension` or `manual`, and the
+    //! decision is made from the credential that authenticated the request rather than from
+    //! anything the caller says about itself. These pin the mapping, and the one case a
+    //! header-sniffing implementation would get wrong.
+
+    use super::*;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("credential-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(format!("{id}@example.com"))
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn parts_with(headers: &[(&str, String)]) -> Parts {
+        let mut req = axum::http::Request::builder();
+        for (name, value) in headers {
+            req = req.header(*name, value);
+        }
+        req.body(()).unwrap().into_parts().0
+    }
+
+    async fn credential_for(pool: &SqlitePool, headers: &[(&str, String)]) -> Credential {
+        let mut parts = parts_with(headers);
+        Credential::from_request_parts(&mut parts, pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_resolves_to_session() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let session = crate::auth::issue_session(&pool, &user_id).await.unwrap();
+
+        let headers = [("cookie", format!("{SESSION_COOKIE_NAME}={}", session.token))];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::Session);
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_resolves_to_a_hunt_token() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+
+        let headers = [("authorization", format!("Bearer {}", minted.secret))];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::HuntToken);
+    }
+
+    #[tokio::test]
+    async fn no_credential_at_all_is_anonymous() {
+        let pool = pool().await;
+        assert_eq!(credential_for(&pool, &[]).await, Credential::Anonymous);
+    }
+
+    /// The case that decides this belongs in the extractor rather than in a header sniff.
+    ///
+    /// A dead cookie beside a live token is an ordinary state — the extension holds a token
+    /// while the browser still carries a signed-out session — and "which header is present"
+    /// answers `Session` for it, which is wrong in the direction that matters: the event log
+    /// would attribute an extension write to a person sitting at the site.
+    #[tokio::test]
+    async fn a_dead_cookie_beside_a_live_token_resolves_to_the_token() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+
+        let headers = [
+            ("cookie", format!("{SESSION_COOKIE_NAME}=expired-or-revoked")),
+            ("authorization", format!("Bearer {}", minted.secret)),
+        ];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::HuntToken);
+    }
+
+    /// One resolution per request, whatever order a handler lists its extractors in.
+    #[tokio::test]
+    async fn the_user_and_the_credential_come_from_one_resolution() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+        let mut parts = parts_with(&[("authorization", format!("Bearer {}", minted.secret))]);
+
+        let MaybeUser(found) = MaybeUser::from_request_parts(&mut parts, &pool).await.unwrap();
+        let credential = Credential::from_request_parts(&mut parts, &pool).await.unwrap();
+
+        assert_eq!(found.map(|u| u.id), Some(user_id));
+        assert_eq!(credential, Credential::HuntToken);
+    }
+
+    #[tokio::test]
+    async fn the_actor_names_are_the_events_tables_vocabulary() {
+        assert_eq!(Credential::HuntToken.actor(), "extension");
+        assert_eq!(Credential::Session.actor(), "manual");
+        // Never `manual`: the provenance rule is that an origin that cannot be proved says so.
+        assert_eq!(Credential::Anonymous.actor(), "unknown");
     }
 }

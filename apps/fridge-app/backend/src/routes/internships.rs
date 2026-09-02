@@ -60,7 +60,7 @@ use crate::internships::models::{
     Application, Season, ApplicationStatus, CreateApplicationRequest, MAX_APPLICATION_NOTES_LENGTH,
     UpdateApplicationRequest,
 };
-use crate::routes::auth::{CurrentUser, RequireAdmin};
+use crate::routes::auth::{Credential, CurrentUser, RequireAdmin};
 
 /// The application columns plus the one derived field.
 ///
@@ -118,6 +118,7 @@ pub async fn list_applications(
 pub async fn create_application(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
+    credential: Credential,
     Json(req): Json<CreateApplicationRequest>,
 ) -> Result<(StatusCode, Json<Application>), StatusCode> {
     let status = match req.status.as_deref() {
@@ -230,6 +231,17 @@ pub async fn create_application(
         eprintln!("internships: inserting application failed: {err:?}");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // Provenance, for Phase 10's `application_events`. An application tracked from the
+    // extension's "track this application" arrives on a hunt-token credential and one created
+    // on the site on a session cookie, and the events table wants to tell them apart. Logged
+    // rather than stored until `application_events::record` exists to receive it (10d), so the
+    // distinction is observable from today instead of from the day the table lands.
+    eprintln!(
+        "internships: application {id} created by {} ({})",
+        credential.actor(),
+        user.id
+    );
 
     let created = fetch_application(&pool, &user.id, &id).await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -1185,6 +1197,7 @@ mod handler_tests {
         let (status, Json(app)) = create_application(
             State(pool.clone()),
             me,
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
@@ -1217,6 +1230,7 @@ mod handler_tests {
         let _ = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
@@ -1251,6 +1265,7 @@ mod handler_tests {
         let _ = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
@@ -1277,6 +1292,7 @@ mod handler_tests {
         let (_, Json(app)) = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
@@ -1320,10 +1336,10 @@ mod handler_tests {
                 notes: None,
             })
         };
-        let _ = create_application(State(pool.clone()), me.clone(), req())
+        let _ = create_application(State(pool.clone()), me.clone(), Credential::Session, req())
             .await
             .unwrap();
-        let second = create_application(State(pool.clone()), me, req()).await;
+        let second = create_application(State(pool.clone()), me, Credential::Session, req()).await;
         assert_eq!(second.unwrap_err(), StatusCode::CONFLICT);
     }
 
@@ -1334,6 +1350,7 @@ mod handler_tests {
         let result = create_application(
             State(pool.clone()),
             me,
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "nope".into(),
                 status: None,
