@@ -86,6 +86,240 @@ it for everyone. Accepted deliberately for a single-user tool; per-user ack stat
 `hunt_event_acks (event_id, user_id)` join table, and the time to add it is when a second
 person actually uses this.
 
+## `application_events` — the Phase 10 spine (spec for migration `0021`)
+
+**Written 2026-09-02 as task 10c, before any code exists.** This is the contract task 10d builds
+the migration from and task 10e wires every writer into. It is written to be buildable by an
+agent that has read this section and the rules file and nothing else.
+
+### Why the table exists
+
+`internship_applications.status` is a mutable column, and the history of how it got there is
+spread across `status_proposals`, `email_verdicts` and `hunt_events` — which is to say nowhere.
+Every feature Phases 11–12 want (response rates, time-to-response, per-source conversion,
+resume-variant attribution) is a query over transitions the app currently throws away. This
+table keeps them.
+
+### Columns
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | TEXT PK | no | UUID v4 text, as every table here |
+| `application_id` | TEXT | no | `REFERENCES internship_applications (id)` — a real, enforced FK (see below) |
+| `at` | TEXT | no | **When the transition happened**, RFC3339 UTC. From the causing email's `received_at`, the proposal's `created_at`, or `Utc::now()` for a live edit |
+| `created_at` | TEXT | no | **When the row was written.** Differs from `at` for every backfilled row, and that difference is how you tell reconstructed history from observed history |
+| `from_status` | TEXT | **yes** | NULL means *not known*, which is the honest value for the creation event and for backfilled rows whose prior state cannot be proved. Never invent it |
+| `to_status` | TEXT | no | `CHECK (to_status IN ('applied','oa','interview','offer','rejected'))` — the same five as `internship_applications.status`, spelled the same way |
+| `actor` | TEXT | no | `CHECK (actor IN ('email','extension','manual','sweep','unknown'))` |
+| `cause_kind` | TEXT | yes | `'status_proposal'` \| `'email_verdict'` \| `'hunt_event'`, or NULL |
+| `cause_id` | TEXT | yes | The id in that table. **Loose reference, no `REFERENCES` clause** — see below |
+| `note` | TEXT | yes | Free text for a human-entered reason. Never parsed |
+
+**Indexes, and only these two:**
+
+```sql
+CREATE INDEX idx_application_events_app ON application_events (application_id, at);
+CREATE INDEX idx_application_events_at  ON application_events (at);
+```
+
+The first serves the fold and the per-application timeline; the second serves Phase 11's
+date-windowed analytics. **No index on `actor`** — five values over a small table, and every
+query that filters on it also filters a window, so it would be read past.
+
+**Idempotency is structural, as it is for `hunt_events`:**
+
+```sql
+UNIQUE (application_id, cause_kind, cause_id, to_status)
+```
+
+`to_status` is in the key for one non-obvious reason: **rejecting a previously auto-applied
+proposal writes a second event with the same cause** — the undo. Accept-then-undo is
+`(app, 'status_proposal', p1, 'oa')` and `(app, 'status_proposal', p1, 'applied')`, which are
+distinct, while replaying the same accept twice is not. Without `to_status` the undo silently
+fails to record and the fold diverges from the column. NULL `cause_id` values are distinct to
+SQLite, which is the behaviour we want: two manual edits are two events.
+
+### `actor`, and exactly which code path produces each
+
+| Actor | Produced by | Where |
+|---|---|---|
+| `email` | The auto-apply path — the classifier's verdict changing status with no human in the loop | `src/inbox/sync.rs:503` |
+| `manual` | A human accepting or rejecting a proposal, and a status edit from the internships tab | `src/routes/inbox.rs:383`, `:407`; `src/routes/internships.rs:263` |
+| `extension` | "Track this application" from the popup, which creates the application | `src/routes/internships.rs:191` |
+| `sweep` | **No producer today.** Reserved for Phase 11's dead-application detection, which is the first thing that will change a status with no human and no email | — |
+| `unknown` | The 10d backfill only. Never written by live code | — |
+
+**Accepting a proposal is `manual`, not `email`.** The cause is an email and `cause_id` records
+it; the *actor* is the person who clicked. Collapsing the two would make "how often do I accept
+what the classifier proposes" — the number 13e needs to set a confidence threshold — impossible
+to ask.
+
+**`extension` is decided by the credential, not by a field in the request body.** The extension
+authenticates with a `hunt_tokens` bearer and the site with a session cookie, and which one
+arrived is already known inside `MaybeUser` (`src/routes/auth.rs:71`). 10e adds one field there
+carrying it through to `CurrentUser`. The alternative — the client asserting `source:
+"extension"` — is a claim by the party being described, and it is wrong exactly when someone is
+debugging why it is wrong. **If 10e lands before that field exists, the creation event records
+`unknown`**, never a guess.
+
+### `cause_id` is a loose reference, deliberately
+
+It points into one of three tables depending on `cause_kind`, so no single `REFERENCES` clause
+can express it — the same polymorphism `hunt_events.subject_id` already has, for the same
+reason, and the reader resolves it by `cause_kind`.
+
+This matters more here than it looks, because **foreign keys in this database really are
+enforced**: `sqlx` turns `PRAGMA foreign_keys` on per connection, which was proved the hard way
+by an insert-ordering bug in `internships::collector` that failed with `FOREIGN KEY constraint
+failed`. Two consequences for 10d and 10e:
+
+- `application_id` **is** a real FK and the event must be inserted *after* the application row
+  exists. Writing events first is the collector's bug, one subsystem over.
+- The `sqlite3` CLI does **not** enable the pragma, so a row hand-deleted at the prompt leaves
+  a dangling `cause_id`. Readers must treat an unresolvable `cause_id` like a NULL one —
+  `LEFT JOIN`, never `INNER` — which is the rule `routes/internships.rs` already documents for
+  `posting_id`.
+
+### The invariant: `status` stays, and the fold must agree with it
+
+`internship_applications.status` is **not** dropped. It stays as a cache, because every existing
+read path uses it and a derived-on-read status would put a fold in front of the tracker's
+hottest query. The log is the truth; the column is a denormalization of it, and 10f pins them
+together:
+
+> **fold(events) — for one application, order its events by `at` ASC, then `created_at` ASC,
+> then `id` ASC; the fold is the `to_status` of the last one. An application with no events
+> folds to NULL and is exempt** (nothing has been recorded for it yet, which is only legal
+> before the backfill has run).
+
+Last-event-wins is correct here and does not contradict rule 3. Rule 3 governs what an email may
+*propose*: `advance` refuses a backwards transition, so a late autoresponder never produces an
+event at all. The log therefore contains only transitions that actually happened, and the latest
+one is the current state.
+
+The tie-breaks exist to make the fold **deterministic**, not to make it right — a tie on `at`
+should not occur, because the backfill draws its timestamps from distinct sources. 10f's test
+asserts determinism; it does not assert that a tie means anything.
+
+**A mismatch is a writer that forgot to emit, and it should fail loudly.** That is the whole
+value of keeping both.
+
+### The backfill (10d), and the provenance rule
+
+Three sources, in decreasing order of how much they can prove:
+
+1. **`status_proposals` that were accepted or auto-applied** — fully provable. `at` =
+   `created_at`, `from_status` / `to_status` from the row, `cause_kind = 'status_proposal'`,
+   `cause_id` = the proposal id, `actor` = `email` when `applied_automatically = 1`, else
+   `manual`. A rejected proposal that had been auto-applied also gets its undo event, at
+   `reviewed_at`.
+2. **`internship_applications.applied_at`** — the creation event for every application:
+   `to_status = 'applied'`, `from_status = NULL`, `at = applied_at`, `actor = 'unknown'`. Two
+   code paths create applications and neither left a record of which one ran.
+3. **`internship_applications.status_changed_at`** — for an application whose current `status`
+   is not explained by any event from (1) or (2), one event at `status_changed_at` with
+   `to_status` = the current status, `from_status = NULL`, `actor = 'unknown'`.
+
+**The provenance rule: a row whose origin cannot be proved is `unknown`, never `manual`.**
+`manual` is a claim about a person having done something, and every chart in Phase 11 will
+believe it. `unknown` is a fact about the record. There is no third option and no default.
+
+Run order matters: (1) before (3), or (3) manufactures duplicates for transitions (1) already
+explains. And the whole backfill runs in one transaction — a half-backfilled table fails the
+10f invariant for reasons that have nothing to do with a writer.
+
+### The insert helper — one function, called by every writer
+
+```rust
+// src/internships/application_events.rs
+
+pub enum Actor { Email, Extension, Manual, Sweep, Unknown }
+
+pub enum Cause<'a> {
+    StatusProposal(&'a str),
+    EmailVerdict(&'a str),
+    HuntEvent(&'a str),
+}
+
+/// Everything a writer has to state. No `Default` impl: every field is a decision, and a
+/// defaulted `actor` is the one mistake this table cannot survive.
+pub struct NewApplicationEvent<'a> {
+    pub application_id: &'a str,
+    pub from_status: Option<ApplicationStatus>,
+    pub to_status: ApplicationStatus,
+    pub actor: Actor,
+    pub cause: Option<Cause<'a>>,
+    pub at: DateTime<Utc>,
+    pub note: Option<&'a str>,
+}
+
+pub enum Recorded { Written, AlreadyRecorded }
+
+/// Records a transition. `INSERT … ON CONFLICT DO NOTHING`; `AlreadyRecorded` is a normal
+/// outcome, not an error — same contract as `hunt::events::emit`.
+///
+/// **Takes a transaction, not a pool, on purpose.** The status UPDATE and this INSERT must
+/// land together or not at all: a committed status change with no event breaks the fold
+/// invariant, and a committed event with no status change is a lie about the tracker.
+pub async fn record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: NewApplicationEvent<'_>,
+) -> anyhow::Result<Recorded>;
+```
+
+### What 10e has to fix on the way in — the accept/reject path is not atomic today
+
+Reading the writers to write this spec turned up a defect that matters more once events exist.
+`routes::inbox::decide` (`src/routes/inbox.rs:376`) issues its `UPDATE internship_applications`
+and its `UPDATE status_proposals` as **two separate statements outside any transaction**, and
+the first is written `let _ = sqlx::query(…).execute(pool).await;` — the `Result` is discarded.
+So a failed status update today leaves the proposal marked reviewed and accepted while the
+tracker never moved, and nothing anywhere records that the two disagree.
+
+With `application_events` in place the same failure also breaks the fold invariant, which is
+how it would finally become visible — but 10e should not rely on that. **Wrapping the status
+update, the proposal update and `record` in one transaction fixes all three at once**, and it is
+the reason `record` takes a `&mut Transaction` rather than a pool. The same applies to
+`internships.rs:263` and `sync.rs:503`.
+
+### What is deliberately not in this table
+
+- **No `user_id`.** Ownership lives on `internship_applications`, every read scopes through it,
+  and Phase 11's analytics join that table anyway for company, source and tier. A second copy of
+  ownership is a second thing that can disagree — the instinct behind `VISIBLE_TO_VIEWER` being
+  written once.
+- **No email text, subject or snippet.** That is `email_messages`, reachable through
+  `cause_id`. Copying it makes two places to redact and grows the hot table with facts nobody
+  queries.
+- **No confidence score.** It belongs to the verdict and is reachable the same way. Storing it
+  here invites ranking events by a number that means nothing outside its verdict.
+- **No `days_in_previous_status`.** Two timestamps subtract; a stored copy is a second thing
+  that can disagree with them, and it would have to be rewritten by every later event.
+- **No soft-delete, and no UPDATE path.** The table is append-only. A wrong event is corrected
+  by a compensating event, which is what an audit trail *is*; an editable audit trail answers
+  no question its own history cannot be doubted on.
+
+### Two things 10d must not do
+
+1. **Do not edit migration `0021` after it has run anywhere.** sqlx compares checksums and
+   refuses to start with `migration 21 was previously applied but has been modified`. A
+   correction is a new migration or a comment in the code — this is recorded in
+   `routes/internships.rs:31`, which is where migration `0012`'s note had to move to.
+2. **Do not take `0022`.** Lane A owns `0021–0029`; `0021` is this table and the rest are
+   unassigned. Announce a number before using it.
+
+### Handoff — ready for 10d
+
+The migration, the backfill and the helper above are fully specified; nothing in 10d needs a
+decision this section does not make. Two things are **not** decided here, both on purpose:
+
+- **Which writers exist is 10e's problem, not 10d's.** The actor table above lists the five call
+  sites found on 2026-09-02 (`sync.rs:503`, `inbox.rs:383`/`:407`, `internships.rs:191`/`:263`).
+  If 10e finds a sixth, it emits from it and adds a row here.
+- **The `CurrentUser` credential field** that distinguishes `extension` from `manual` is 10e's
+  change, in `routes/auth.rs`. 10d does not need it: the backfill has no live credential to read
+  and records `unknown` for every creation event regardless.
+
 ## Backend
 
 ### `src/hunt/events.rs` *(new — `[gen]`)*
