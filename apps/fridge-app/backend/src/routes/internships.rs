@@ -252,6 +252,16 @@ pub async fn update_application(
 
     let now = Utc::now();
 
+    // **One transaction for the whole edit.** A request can carry both a status and a note,
+    // and landing one without the other leaves the tracker in a state the caller never asked
+    // for and gets no error about. It is also the transaction the Phase 10 event record hangs
+    // on: the status change and the row that describes it have to commit together or not at
+    // all — see `docs/HUNT.md` § `application_events`.
+    let mut tx = pool.begin().await.map_err(|err| {
+        eprintln!("internships: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     if let Some(raw) = req.status.as_deref() {
         let status = ApplicationStatus::parse(raw).ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -271,7 +281,7 @@ pub async fn update_application(
         .bind(now)
         .bind(&id)
         .bind(&user.id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| {
             eprintln!("internships: updating application status failed: {err:?}");
@@ -289,13 +299,18 @@ pub async fn update_application(
         .bind(now)
         .bind(&id)
         .bind(&user.id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| {
             eprintln!("internships: updating application notes failed: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
+
+    tx.commit().await.map_err(|err| {
+        eprintln!("internships: committing an application edit failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(fetch_application(&pool, &user.id, &id).await?))
 }

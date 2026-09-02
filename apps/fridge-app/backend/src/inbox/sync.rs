@@ -479,6 +479,12 @@ async fn propose_status(
 
     let auto = advance::may_auto_apply(to_status, verdict.confidence, threshold);
 
+    // **The proposal and the change it describes commit together.** `applied_automatically`
+    // is a claim that the tracker already moved: the panel renders it as *"already applied —
+    // rejecting undoes it"*, and reject then restores a status the application was never at.
+    // Two statements outside a transaction make that claim survivable on its own.
+    let mut tx = pool.begin().await?;
+
     sqlx::query(
         "INSERT INTO status_proposals
              (id, application_id, verdict_id, from_status, to_status,
@@ -492,14 +498,14 @@ async fn propose_status(
     .bind(to_status.as_str())
     .bind(i64::from(auto))
     .bind(now.to_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if auto {
         // Only ever a forward, non-terminal move above the threshold — `may_auto_apply`
         // guarantees all three. `status_changed_at` moves with it, because Phase 7 made that
         // column mean "how long have I been at this stage".
-        sqlx::query(
+        let moved = sqlx::query(
             "UPDATE internship_applications
                 SET status = ?1, status_changed_at = ?2, updated_at = ?2
               WHERE id = ?3 AND user_id = ?4",
@@ -508,9 +514,21 @@ async fn propose_status(
         .bind(now.to_rfc3339())
         .bind(application_id)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+
+        // The status was read out of this same row moments ago, so zero here means it moved
+        // or vanished underneath us. Rolling back is the only outcome that leaves the
+        // proposal and the tracker agreeing.
+        if moved.rows_affected() != 1 {
+            anyhow::bail!(
+                "auto-applying to application {application_id} matched {} rows, expected 1",
+                moved.rows_affected()
+            );
+        }
     }
+
+    tx.commit().await?;
 
     Ok(true)
 }
