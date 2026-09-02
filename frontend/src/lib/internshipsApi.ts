@@ -201,6 +201,63 @@ export async function listInternshipSources(): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Hunt analytics (Phase 11)
+// ---------------------------------------------------------------------------------------
+
+/** The common count shape used at the top level and for every breakdown. */
+export type HuntAnalyticsTotals = {
+  applications: number;
+  responded: number;
+  no_response_live: number;
+  no_response_dead: number;
+  reached_oa: number;
+  reached_interview: number;
+  offers: number;
+  /** An explicit rejection is also included in `responded`; it is never no-response. */
+  rejected: number;
+};
+
+export type HuntAnalyticsBreakdown = {
+  key: string;
+  totals: HuntAnalyticsTotals;
+};
+
+export type HuntAnalyticsResponse = {
+  window: { from: string; to: string; dead_after_days: number };
+  totals: HuntAnalyticsTotals;
+  time_to_first_response_days: {
+    /** `null` when `n` is zero; zero would falsely claim an immediate response. */
+    median: number | null;
+    p90: number | null;
+    n: number;
+  };
+  by_source: HuntAnalyticsBreakdown[];
+  by_tier: HuntAnalyticsBreakdown[];
+  by_month: HuntAnalyticsBreakdown[];
+};
+
+export async function getHuntAnalytics(input: {
+  from: string;
+  to: string;
+  dead_after_days?: number;
+}): Promise<HuntAnalyticsResponse> {
+  const params = new URLSearchParams({ from: input.from, to: input.to });
+  if (input.dead_after_days !== undefined) {
+    params.set("dead_after_days", String(input.dead_after_days));
+  }
+
+  const res = await apiFetch(`/hunt/analytics?${params.toString()}`);
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "That analytics window isn't valid — check both dates and the dead-after threshold."
+        : `Could not load hunt analytics (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------------------
 // Applied tracker
 // ---------------------------------------------------------------------------------------
 

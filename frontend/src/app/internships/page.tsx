@@ -8,6 +8,7 @@ import { AnswerLibrary } from "./AnswerLibrary";
 import { InboxPanel } from "./InboxPanel";
 import { CvProfileEditor } from "./CvProfileEditor";
 import { ExtensionAccess } from "./ExtensionAccess";
+import { AnalyticsPanel } from "./AnalyticsPanel";
 import { useApiError } from "@/lib/useApiError";
 import {
   createApplication,
@@ -277,6 +278,7 @@ export default function InternshipsPage() {
       <CollectionStatus onUpdate={refresh} />
 
       <div className="mt-4 space-y-3">
+        <AnalyticsPanel />
         <InboxPanel />
         <ExtensionAccess />
         <CvProfileEditor />
