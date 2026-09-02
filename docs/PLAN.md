@@ -1657,6 +1657,39 @@ immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. 
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
 
+### 12j, commit 2 — migration `0027`, and every reference checked rather than assumed
+
+The four immortal rows from 12c finding 3, deleted. All four are `co:` fallback-key postings
+vacated by 0025, created 2026-08-21, duplicates of rows that are still live and still visible in
+the ranked list:
+
+```
+Nightwing Intelligence Solutions — Software / Hardware Engineering Intern
+Nightwing                        — Software / Hardware Engineering Intern
+Tower Research Capital           — Quantitative Developer Intern
+Tower Research                   — Quantitative Developer Intern
+```
+
+**What points at a posting, enumerated rather than recalled.** Two declared foreign keys —
+`posting_sightings.posting_id` and `internship_applications.posting_id` — and **one soft
+reference that is not a foreign key at all**: `hunt_events.subject_id`, for the 64 rows with
+`kind = 'posting'`. `PRAGMA foreign_keys` would not have caught that one, and a posting deleted
+out from under an alert leaves a notification whose link 404s. All three are excluded. A scan of
+every column in the schema whose name mentions a posting, a subject or a job turned up nothing
+else; `company_signals.live_postings` and `total_postings_seen` are aggregates recomputed by a
+full SELECT at the end of every run, so they self-correct rather than drift.
+
+**Why the date cutoff is in the predicate.** Without it this becomes a standing rule that
+deletes any posting with no sightings — which is exactly the row `expiry::sweep`'s zero-sighting
+guard exists to protect, a posting created moments ago whose sightings failed to write. The
+cutoff is the start of the first uncapped run, and it makes this a cleanup of a known historical
+mess rather than a policy. `a_newborn_posting_with_no_sightings_yet_is_never_touched` pins it.
+
+**Verified**: 1,845 → 1,841 against a copy, both by `sqlite3` and end-to-end through `sqlx` on
+boot; a second application changes nothing. What was explicitly **not** done is teaching the
+sweep to expire sighting-less rows past some age — that reopens the hazard the guard was written
+for and is a change to the one function that decides what "closed" means.
+
 ### 0025 verified against a real collection run, 2026-09-02
 
 The migration was argued for on a claim about `upsert_posting`, verified against copies and
