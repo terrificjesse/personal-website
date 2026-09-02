@@ -267,6 +267,10 @@ pub enum Recorded { Written, AlreadyRecorded }
 /// **Takes a transaction, not a pool, on purpose.** The status UPDATE and this INSERT must
 /// land together or not at all: a committed status change with no event breaks the fold
 /// invariant, and a committed event with no status change is a lie about the tracker.
+///
+/// Callers open that transaction with `db::begin_write` (`BEGIN IMMEDIATE`), never
+/// `pool.begin()` — a deferred transaction that upgrades read→write fails instantly under a
+/// competing writer instead of waiting. See `src/db.rs`.
 pub async fn record(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: NewApplicationEvent<'_>,
@@ -287,6 +291,23 @@ how it would finally become visible — but 10e should not rely on that. **Wrapp
 update, the proposal update and `record` in one transaction fixes all three at once**, and it is
 the reason `record` takes a `&mut Transaction` rather than a pool. The same applies to
 `internships.rs:263` and `sync.rs:503`.
+
+### Three things 10e part 2 has to get right
+
+Found while writing part 1, and all three are decisions rather than mechanics:
+
+1. **`create_application` is not transactional yet.** It is a single INSERT today, so there is
+   no transaction for `record` to join. Wrapping it is part of adding the creation event, not a
+   separate cleanup — and the event must be inserted *after* the application row, because
+   `application_id` is a real enforced FK.
+2. **A rejected proposal that was never auto-applied changes no status, and must emit no
+   event.** `decide` already skips the UPDATE in that case; the log is a record of transitions
+   that happened, and an event for a rejection that moved nothing would make the fold disagree
+   with the column on the very first query.
+3. **A manual event has a NULL `cause_id`, and SQLite treats NULLs as distinct**, so the UNIQUE
+   key does not deduplicate them. That is correct — two manual edits are two events — but it
+   means the idempotency guarantee covers only email- and extension-caused writes. A handler
+   that retries its own manual write writes twice.
 
 ### What is deliberately not in this table
 
