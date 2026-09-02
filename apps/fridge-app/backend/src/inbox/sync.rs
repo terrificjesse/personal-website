@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::hunt::events::{self, EventKind, NewHuntEvent};
 
+use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 
 use super::classify::{self, Category};
@@ -485,13 +486,17 @@ async fn propose_status(
     // Two statements outside a transaction make that claim survivable on its own.
     let mut tx = crate::db::begin_write(pool).await?;
 
+    // Captured rather than generated inline: an auto-applied proposal is the `cause_id` of the
+    // event written below, and that link is what makes the change reversible — rule 2.
+    let proposal_id = Uuid::new_v4().to_string();
+
     sqlx::query(
         "INSERT INTO status_proposals
              (id, application_id, verdict_id, from_status, to_status,
               applied_automatically, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&proposal_id)
     .bind(application_id)
     .bind(&verdict_id)
     .bind(from_status.as_str())
@@ -526,6 +531,24 @@ async fn propose_status(
                 moved.rows_affected()
             );
         }
+
+        // Actor `email`: this transition had no human in it. `at` is `now`, which is also the
+        // proposal's `created_at` — the same instant the backfill uses for a proposal-derived
+        // event, so a live row and a reconstructed one mean the same thing when Phase 11
+        // buckets them by month.
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id,
+                from_status: Some(from_status),
+                to_status,
+                actor: Actor::Email,
+                cause: Some(Cause::StatusProposal(&proposal_id)),
+                at: now,
+                note: None,
+            },
+        )
+        .await?;
     }
 
     tx.commit().await?;

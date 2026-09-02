@@ -88,19 +88,22 @@ pub enum Credential {
     Anonymous,
 }
 
-impl Credential {
-    /// The `application_events.actor` value a write made on this credential is attributed to.
-    ///
-    /// Named in the events table's vocabulary rather than this one's, so the mapping lives in
-    /// exactly one place. `Anonymous` maps to `unknown` and not to `manual`: the provenance
-    /// rule is that a row whose origin cannot be proved says so — see `docs/HUNT.md`. It is
-    /// unreachable behind `CurrentUser` today, and the honest value is still the one to
-    /// return. This becomes a `From<Credential> for Actor` once 10d lands the enum.
-    pub fn actor(self) -> &'static str {
-        match self {
-            Credential::HuntToken => "extension",
-            Credential::Session => "manual",
-            Credential::Anonymous => "unknown",
+/// Who an `application_events` row written on this credential is attributed to.
+///
+/// The mapping lives in exactly one place, and it is this one. `Anonymous` maps to `Unknown`
+/// and never to `Manual`: the provenance rule is that a row whose origin cannot be proved says
+/// so — see `docs/HUNT.md`. It is unreachable behind `CurrentUser` today, and the honest value
+/// is still the one to return.
+///
+/// This replaced a `Credential::actor() -> &'static str` placeholder that existed only while
+/// the `Actor` enum did not.
+impl From<Credential> for crate::internships::application_events::Actor {
+    fn from(credential: Credential) -> Self {
+        use crate::internships::application_events::Actor;
+        match credential {
+            Credential::HuntToken => Actor::Extension,
+            Credential::Session => Actor::Manual,
+            Credential::Anonymous => Actor::Unknown,
         }
     }
 }
@@ -926,11 +929,12 @@ mod credential_tests {
     }
 
     #[tokio::test]
-    async fn the_actor_names_are_the_events_tables_vocabulary() {
-        assert_eq!(Credential::HuntToken.actor(), "extension");
-        assert_eq!(Credential::Session.actor(), "manual");
-        // Never `manual`: the provenance rule is that an origin that cannot be proved says so.
-        assert_eq!(Credential::Anonymous.actor(), "unknown");
+    async fn a_credential_maps_to_the_actor_that_wrote_the_event() {
+        use crate::internships::application_events::Actor;
+        assert_eq!(Actor::from(Credential::HuntToken), Actor::Extension);
+        assert_eq!(Actor::from(Credential::Session), Actor::Manual);
+        // Never `Manual`: the provenance rule is that an origin that cannot be proved says so.
+        assert_eq!(Actor::from(Credential::Anonymous), Actor::Unknown);
     }
 
     // ---- the merge seam: rate-limited login (10j) meeting credential provenance (10e) ----

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::GoogleOAuthConfig;
 use crate::inbox::{oauth, sync};
+use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 use crate::routes::auth::CurrentUser;
 
@@ -478,18 +479,21 @@ async fn decide(
     // pressing accept twice is safe. Rejecting undoes it, but only if it was auto-applied:
     // otherwise "reject" would only mean "stop showing me this", and the tracker would keep
     // the change the user just said was wrong.
+    // `(where it ends up, where it came from)` — the second is what the event records as
+    // `from_status`. Accepting moves it to the proposal's `to_status`; undoing puts it back,
+    // so the pair is reversed.
     let next = if accept {
         if ApplicationStatus::parse(&to_status).is_none() {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-        Some(to_status)
+        Some((to_status, from_status))
     } else if was_auto == 1 {
-        Some(from_status)
+        Some((from_status, to_status))
     } else {
         None
     };
 
-    if let Some(next) = next {
+    if let Some((next, previous)) = next {
         let moved = sqlx::query(
             "UPDATE internship_applications
                 SET status = ?1, status_changed_at = ?2, updated_at = ?2
@@ -516,6 +520,45 @@ async fn decide(
             );
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+
+        // Parsed *after* the write, deliberately. The applications table's CHECK has just
+        // accepted this value, so it is in the enum by construction — but "cannot fail" is a
+        // claim about a constraint in another file, and the undo path reaches here with a
+        // status this code never validated. A 500 rolls the whole decision back; an `unwrap`
+        // would take the process with it.
+        let (Some(to_status), from_status) = (
+            ApplicationStatus::parse(&next),
+            ApplicationStatus::parse(&previous),
+        ) else {
+            eprintln!("inbox: proposal {id} applied status {next:?}, which does not parse");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
+        // Actor `manual`, not `email`: the cause is an email and `cause_id` records it, but a
+        // person clicked. Collapsing the two would make "how often do I accept what the
+        // classifier proposes" unanswerable, which is the number 13e needs.
+        //
+        // Accepting a proposal that was ALREADY auto-applied hits the same
+        // (application, cause, to_status) key the email actor wrote and returns
+        // `AlreadyRecorded` — a normal outcome, and the reason `to_status` is in that key is
+        // the undo below, which differs from it.
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id: &application_id,
+                from_status,
+                to_status,
+                actor: Actor::Manual,
+                cause: Some(Cause::StatusProposal(id)),
+                at: now,
+                note: None,
+            },
+        )
+        .await
+        .map_err(|err| {
+            eprintln!("inbox: recording a reviewed proposal failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     }
 
     sqlx::query("UPDATE status_proposals SET reviewed_at = ?1, accepted = ?2 WHERE id = ?3")

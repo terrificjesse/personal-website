@@ -60,6 +60,7 @@ use crate::internships::models::{
     Application, Season, ApplicationStatus, CreateApplicationRequest, MAX_APPLICATION_NOTES_LENGTH,
     UpdateApplicationRequest,
 };
+use crate::internships::application_events::{self, Actor, NewApplicationEvent};
 use crate::routes::auth::{Credential, CurrentUser, RequireAdmin};
 
 /// The application columns plus the one derived field.
@@ -188,6 +189,14 @@ pub async fn create_application(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // One transaction: the application row and the event that records its creation. The event
+    // is inserted *after* the row because `application_events.application_id` is a real
+    // enforced foreign key — sqlx turns `PRAGMA foreign_keys` on per connection.
+    let mut tx = crate::db::begin_write(&pool).await.map_err(|err| {
+        eprintln!("internships: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let result = sqlx::query(
         "INSERT INTO internship_applications
             (id, user_id, posting_id,
@@ -216,7 +225,7 @@ pub async fn create_application(
     .bind(now)
     .bind(status.as_str())
     .bind(&notes)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await;
 
     if let Err(err) = result {
@@ -232,16 +241,35 @@ pub async fn create_application(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Provenance, for Phase 10's `application_events`. An application tracked from the
-    // extension's "track this application" arrives on a hunt-token credential and one created
-    // on the site on a session cookie, and the events table wants to tell them apart. Logged
-    // rather than stored until `application_events::record` exists to receive it (10d), so the
-    // distinction is observable from today instead of from the day the table lands.
-    eprintln!(
-        "internships: application {id} created by {} ({})",
-        credential.actor(),
-        user.id
-    );
+    // The creation event. `from_status` is NULL because there was no previous state — not
+    // because it is unknown — and `to_status` is what was actually created, which the request
+    // may set to something other than `applied`.
+    //
+    // The actor comes from the credential, not from anything the caller said about itself: an
+    // application tracked from the extension's "track this application" arrives on a hunt-token
+    // bearer, one created on the site on a session cookie.
+    application_events::record(
+        &mut tx,
+        NewApplicationEvent {
+            application_id: &id,
+            from_status: None,
+            to_status: status,
+            actor: credential.into(),
+            cause: None,
+            at: now,
+            note: None,
+        },
+    )
+    .await
+    .map_err(|err| {
+        eprintln!("internships: recording the creation event failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|err| {
+        eprintln!("internships: committing a new application failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let created = fetch_application(&pool, &user.id, &id).await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -299,6 +327,32 @@ pub async fn update_application(
             eprintln!("internships: updating application status failed: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+        // Only when it actually moved. The log records transitions that happened; a no-op
+        // write is not one, and the same `changed` flag already gates `status_changed_at`.
+        //
+        // `cause_id` is NULL here, and SQLite treats NULLs as distinct in a UNIQUE index — so
+        // two manual edits are two events, which is correct. The idempotency the key provides
+        // covers email- and extension-caused writes only.
+        if changed {
+            application_events::record(
+                &mut tx,
+                NewApplicationEvent {
+                    application_id: &id,
+                    from_status: ApplicationStatus::parse(&existing.status),
+                    to_status: status,
+                    actor: Actor::Manual,
+                    cause: None,
+                    at: now,
+                    note: None,
+                },
+            )
+            .await
+            .map_err(|err| {
+                eprintln!("internships: recording a manual status change failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
     }
 
     if let Some(raw) = req.notes.as_deref() {
