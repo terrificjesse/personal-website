@@ -934,7 +934,311 @@ Not the Gmail label writes. Those are 8c's remaining half and stay held until 8b
 corpus — write access to a mailbox on the strength of a classifier measured against ten
 messages is exactly what the build order exists to prevent.
 
+### Status — the code landed in `c001445`, the checkpoint was never written (recorded 2026-09-02)
+
+All three scope items above shipped **in the same commit that added this section**, which is
+why none of them is ticked:
+
+- The interval worker — `inbox::sync::spawn`, `INBOX_SYNC_INTERVAL_SECS`, called from
+  `main.rs:93`, spawned rather than awaited so a slow Gmail cannot delay startup.
+- The proposals panel — `frontend/src/app/internships/InboxPanel.tsx` (200 lines) against
+  `GET /hunt/proposals` and `POST /hunt/proposals/{id}/{accept,reject}`.
+- The extension's inbox line — `popup.js:597`, reporting *no account* / *no sync yet* /
+  *reconnected* / *failed with reason* as four distinct states, per rule 5.
+
+**What is missing is the checkpoint.** None of it has run unattended against real mail for
+long enough to prove it works, because nothing has been running unattended at all. Phase 10
+closes that rather than leaving a phase quietly half-open.
+
+**And "What this phase is not", directly above, is now false.** It says the Gmail label writes
+stay held until 8b has met a real corpus. They shipped in `f911f46`, and `labelling_enabled()`
+(`inbox/sync.rs:354`) is **on by default** — `INBOX_APPLY_LABELS=false` opts out. The code's
+reasoning is recorded and is not unreasonable: a wrong label is visible and removable in Gmail,
+and the granted scope withholds delete and send, so the one irreversible-feeling thing is not
+irreversible. But the plan said *held*, the code says *on*, and nobody reconciled the two —
+which is worth noticing now rather than after the agent has been labelling a real mailbox
+unattended for a week. **10k makes it an explicit decision.**
+
+One defect found while reconciling: `InboxPanel.tsx:172` renders the email **subject** under
+the label `from:`. Cosmetic in isolation — but the panel exists so you can check a proposal
+against the mail that caused it, and a reviewer who believes they are reading the sender is
+checking a field nobody showed them. Fixed in 10g.
+
+---
+
+## Phases 10–13 — The hunt pipeline: four weeks, two agents
+
+**Planned 2026-09-02.** Phases 7–9 built a scraper, an alert channel, an autofill extension and
+a Gmail agent. They are driven by a human who remembers to drive them, and nothing yet tells
+you whether any of it *works* — which source converts, which resume gets replies, whether the
+classifier is right. **The goal of this month is a hunt that runs itself, tells you something
+you did not know, and can prove it.**
+
+Worked by **two agents against two separate weekly credit budgets** (Claude Code and Codex).
+The lane rules, the migration-number reservation, and the swappability requirement are binding
+and live in the root `CLAUDE.md` → *Working with two coding agents*. This plan is where the
+assignments live.
+
+### Legend additions for these four phases
+
+- **Lane** — A (backend), B (client), C (docs). Per the rules file, A and B run in parallel
+  worktrees and never share a file; C is written by whoever finishes first.
+- **Primary** — who does it by default. Not a reservation.
+- **Swap** — ✅ means the other agent can pick it up cold from the named spec and files, so a
+  spent weekly budget never stalls the week. ⛔ means it genuinely cannot move, and the reason
+  is always given; almost every ⛔ is `[you]`.
+- **Est.** — elapsed hours *including the user's review time*. Agent runtime is not the
+  constraint here; reading the diff is.
+
+### Two scheduling facts that determine the whole order
+
+1. **8b's checkpoint is calendar-gated, not effort-gated.** It needs a hand-labelled fortnight
+   of real burner mail; the current corpus is 14 messages over two days, contains no
+   newsletters or digests at all, and is entirely spent. No amount of agent throughput
+   produces that faster. **So the deploy is in week 1, not week 4** — the clock on the corpus
+   starts the day the sync runs without a laptop being open, and week 4 exists to spend what
+   weeks 1–3 accumulated.
+2. **`application_events` has to come before anything that reads history.** Every feature this
+   month — response rates, time-to-response, resume attribution, nudges — is a query over the
+   transitions the app is currently throwing away. Retrofitting the log in week 3 means
+   rewriting week 2 on top of it, which is the lesson `0006_add_review_ownership.sql` already
+   taught this repo once.
+
+---
+
+## Phase 10 — Week 1 (2026-09-02 → 09-08): the spine and the clock
+
+**Goal:** an append-only `application_events` log that every writer emits into, and the whole
+tool running unattended on a host that stays up.
+
+| # | Task | Tag | Lane | Primary | Swap | Est. |
+|---|---|---|---|---|---|---|
+| 10a | Reconcile `PLAN.md` + `HUNT.md` with what actually shipped in `c001445`, `f911f46`, `f17d983` | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 10b | `AGENTS.md` unification — **done 2026-09-02** | `[gen]` | C | — | — | — |
+| 10c | Write the `application_events` schema + emit contract into `docs/HUNT.md` **before any code** | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 10d | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
+| 10e | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
+| 10f | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
+| 10g | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
+| 10h | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
+| 10i | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
+| 10j | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
+| 10k | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
+
+**Load:** Claude Code ≈ 8h, Codex ≈ 10h, you ≈ 10h of deploy. Neither agent blocks the other:
+10c is the only ordering constraint, and it is a doc.
+
+### Checkpoint 10 — against the real thing, not fixtures
+
+- The backend has run **48 unattended hours** on the deployed host with the laptop closed, and
+  `inbox_runs` shows successful incremental passes with an advancing `historyId` watermark.
+- `application_events` contains rows from **all four actors** — `email`, `extension`, `manual`,
+  `sweep` — and `status == fold(events)` holds for every application in a copy of the live DB.
+- The restore drill produced a working database from a backup **before** it was needed.
+- A cookie issued by the deployed backend carries `Secure`.
+- The login limiter refuses the eleventh attempt and the log says so.
+
+### Traps
+
+1. **The backfill must not invent transitions it cannot prove.** Rows whose provenance is
+   unknown get `actor = 'unknown'`, never `'manual'`. A backfilled row that claims to know who
+   did it is worse than no row, and it will be believed by every chart in Phase 11.
+2. **Keep `status` as a column and add the fold test.** A mismatch means a writer forgot to
+   emit — that is exactly the failure you want loud rather than a reason to abandon the
+   invariant.
+3. **`COOKIE_SECURE=1` is not optional once you are on HTTPS**, and if the frontend and backend
+   end up on genuinely different hosts you need `SameSite=None; Secure`. The extension is
+   unaffected: it authenticates with a `hunt_tokens` bearer, which is 8e's cookie discovery
+   still paying rent.
+4. **The Gmail refresh token now lives on a host you do not sit in front of.** `.env` mode 600,
+   no secrets in the service unit, and remember the 7-day expiry makes the extension's inbox
+   line load-bearing rather than decorative.
+5. **Still no fetching from a request handler.** The interval worker stays the only Gmail
+   caller; the root cache rule applies to Gmail exactly as it does to a job board.
+6. **Back up before Phase 12's uncapped run**, which is the first run that can expire anything.
+
+---
+
+## Phase 11 — Week 2 (2026-09-09 → 09-15): the feedback loop
+
+**Goal:** the tool tells you something you did not know, and warns you before a deadline
+lapses. Everything here reads `application_events`; nothing here adds a new writer.
+
+| # | Task | Tag | Lane | Primary | Swap | Est. |
+|---|---|---|---|---|---|---|
+| 11a | Analytics contract into `docs/HUNT.md`: endpoint shapes, and the definitions of *response*, *dead*, *converted* | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 11b | `GET /hunt/analytics?from=&to=` — funnel by source, by company tier, by month | `[gen]` | A | Codex | ✅ | 4–5h |
+| 11c | Analytics panel on the internships tab — **no new npm dependency**, plain SVG/CSS bars | `[gen]` | B | Claude Code | ✅ | 3–4h |
+| 11d | Time-to-first-response, per-source conversion, dead-application detection | `[gen]` | A | Codex | ✅ | 2–3h |
+| 11e | Follow-up nudges: no response in N days → a `hunt_events` row through the channel 8e built | `[gen]` | A | Claude Code | ✅ after 11a | 4–5h |
+| 11f | Deadline extraction from classified mail (OA due dates, interview times) → alert before it lapses | `[gen]` | A | Claude Code | ✅ after 11a | 4–6h |
+| 11g | URL-sync the internship filters, so a filtered view is bookmarkable | `[gen]` | B | Codex | ✅ | 2h |
+
+**Load:** Claude Code ≈ 15h, Codex ≈ 11h. This is the most lopsided week — if the Claude budget
+is thin, **11e and 11f are the two to move**, and 11a is written precisely so they can be.
+
+### Checkpoint 11
+
+- The funnel numbers **reconcile with a hand count in SQL** over the same window. A dashboard
+  that cannot be checked by hand is a dashboard nobody should believe.
+- A backdated application with no response produces **exactly one** nudge, and the next sweep
+  produces none.
+- A real OA email with a real due date raises an alert ahead of that date, and the alert body
+  says which application it belongs to.
+- Filters survive a page reload and a copied URL.
+
+### Traps
+
+1. **Nudge dedup fights `UNIQUE (kind, subject_id)`.** That constraint is what makes alert
+   dedup structural rather than a caller remembering — but a second nudge for the same
+   application at a *different* threshold is a legitimately different event. Decide the key in
+   11a and write it down: `subject_id = "{application_id}:{threshold_days}"` is the cheap
+   answer. Get it wrong in the obvious direction and you get one nudge ever; wrong in the other
+   and you get one every sweep, which is how a channel gets muted and takes the OA alerts with it.
+2. **"No response" is not "rejected."** A silent application is its own state; collapsing the
+   two makes the funnel lie about your rejection rate in the flattering direction.
+3. **Deadlines are parsed from untrusted mail — rule 1 still holds.** Extraction is a pure
+   function over text, it fetches no URL, and it writes to no calendar. It raises a
+   notification; that is the entire blast radius.
+4. **Store UTC, render local.** An OA deadline off by a day is the single bug that costs the
+   thing this whole tool exists to protect.
+5. **A posting expiring is not an application ending.** Analytics must drop expired *postings*
+   from supply metrics without dropping *applications* made to them.
+6. **No new npm package for charts without asking** — root rule, and it applies to a chart
+   library exactly as it applied to `@tailwindcss/typography`, which was declined for less.
+
+---
+
+## Phase 12 — Week 3 (2026-09-16 → 09-22): coverage and attribution
+
+**Goal:** the two known measurement gaps in Phase 7 closed, and the first attribution signal
+that is actually about *you* rather than about the market.
+
+| # | Task | Tag | Lane | Primary | Swap | Est. |
+|---|---|---|---|---|---|---|
+| 12a | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
+| 12b | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
+| 12c | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
+| 12d | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
+| 12e | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
+| 12f | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
+| 12g | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
+| 12h | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
+
+**Load:** Claude Code ≈ 13h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
+the call at the start of the week so it never becomes the reason a week ended short.
+
+### The decision in 12d, stated plainly so it can be made in one sitting
+
+`dedup::FuzzyMatcher` is an unimplemented seam, and `KLA` / `KLA Corporation` are two rows
+because of it. Fuzzy company matching is NLP-shaped, and the root rules say: prefer reusing the
+existing `[learn]` `src/nlp.rs`, and **ask** before writing a second matcher — Phase 7's `[gen]`
+exception was granted for the ranking, not for NLP. Three outcomes, all legitimate:
+
+- **Reuse `nlp.rs` as a caller.** `[gen]`, either agent, and the file itself is never edited —
+  including to fix a compile error it throws.
+- **Write a new matcher yourself.** `[learn]`, yours, agents review and write tests only.
+- **Leave it.** Under-merging is the safer failure, `INTERNSHIP_SCRAPING.md` § C says so, and
+  12a may move coverage enough that this stops mattering this month.
+
+### Traps
+
+1. **Over-merging is the dangerous direction.** Both dedup bugs the Phase 7 real run caught were
+   over-merges — two distinct jobs collapsing into one row. A new ATS key changes identities for
+   rows that already exist, so **12b runs before 12a ships**, over a copy, and reports merges as
+   well as splits.
+2. **Workday is in § C's own table and was never implemented; Workable and Rippling are not in
+   § C at all.** Whatever you learn about their URL shapes goes into `INTERNSHIP_SCRAPING.md` in
+   the same commit — that file is the reason this is a 5-hour task and not a re-investigation.
+3. **A capped run can never expire anything**, so 12c is the first run where the disappearance
+   counters do real work. Back up first (10i), and expect the first uncapped run to be slow and
+   to surface source failures the capped runs never reached.
+4. **Resume variants cross the backend↔client seam**, so the contract goes into `docs/HUNT.md`
+   before either half is written, and one lane writes both halves. This is rule 4 in the rules
+   file, and `f17d983` is what ignoring it costs.
+5. **12g is the only verification neither agent can do alone**, and it is the one that has been
+   deferred twice. Two real forms, nothing submitted on either.
+
+---
+
+## Phase 13 — Week 4 (2026-09-23 → 09-29): measurement week
+
+**Goal:** 8b's checkpoint, met honestly — or reported honestly as still unmeetable, with the
+reason. This week is the point of the other three.
+
+| # | Task | Tag | Lane | Primary | Swap | Est. |
+|---|---|---|---|---|---|---|
+| 13a | `cargo run --release -- labelset export` over everything the month accumulated | `[you]` | A | You | ⛔ | 30m |
+| 13b | Hand-label the sheet | `[you]` | — | You | ⛔ **by construction** — labels from the author of the rules measure the tuning, not the classifier | 3–4h |
+| 13c | `labelset score`; report both failure modes against **separate denominators** | `[gen]` | A | Codex | ✅ | 1h |
+| 13d | Diagnose and fix; pin every real string as a test | `[gen]` | A | Claude Code | ✅ | 4–6h |
+| 13e | Set `INBOX_AUTO_APPLY_CONFIDENCE` from the measured numbers | `[you]` | — | You | ⛔ it is a risk threshold, not a parameter | 1h |
+| 13f | Regression gate: `labelset score` in CI over the sealed sets, failing on a regression | `[gen]` | A | Codex | ✅ | 3–4h |
+| 13g | Write the phase up: what the real corpus caught that the tests could not | `[gen]` | C | Claude Code | ✅ | 2h |
+
+**Load:** Claude Code ≈ 8h, Codex ≈ 5h, you ≈ 5h. The lightest week for the agents and the
+heaviest for you, which is correct — the scarce input this week is your judgment, not code.
+
+### Checkpoint 13 — this is 8b's original checkpoint, finally reachable
+
+Against a hand-labelled set of **real burner-inbox mail across a whole two-week window**, not
+50 curated job emails:
+
+- Junk leaking into `Hunt/Outreach` and **real mail getting disregarded**, measured separately.
+- The second number is the one that costs an interview; it gets its own denominator and its own
+  sentence.
+- The relevance gate is only measured if digests, newsletters and staffing blasts actually
+  turned up. **If they did not, say so and leave the gate unmeasured** — that is what happened
+  on 2026-08-31 and recording it was worth more than a number.
+
+### Traps
+
+1. **A set can only be measured once.** Fixing against the graded set makes it in-sample; the
+   ledger beside the labels file records the rules fingerprint each grading ran under, and it
+   exists precisely so a spent set cannot quietly pass as fresh.
+2. **No single accuracy figure.** The harness deliberately refuses to print one, because it
+   would be quoted instead of the two numbers that matter.
+3. **Auto-apply stays forward-only and never applies `offer` or `rejected`**, whatever the
+   measured confidence turns out to be. 13e sets a threshold, not a policy.
+
+---
+
+## If the month slips — the cut list, decided in advance
+
+Cut in this order, and cut whole tasks rather than the verification half of a task:
+
+1. **12f** resume-variant attribution — the most self-contained, and it means more with a
+   bigger corpus anyway.
+2. **11f** deadline extraction — real value, but nudges (11e) already cover the "you forgot
+   about this" failure mode.
+3. **12e** fuzzy dedup — under-merging is the safe failure and `INTERNSHIP_SCRAPING.md` says so.
+4. **11d** the second analytics slice.
+
+**Never cut:** 10c–10f (the spine — everything later is a query over it), 10h (the deploy, which
+starts the corpus clock and is therefore load-bearing for week 4), and 13a–13e (the measurement,
+which is the entire reason this is a month and not a weekend).
+
+## Picking up a task cold — the protocol that makes ✅ real
+
+Swappability is a claim this plan makes, and it is only true if a task can be handed to the
+other agent with three things and nothing else:
+
+1. **The row above** — the task, its lane, its tag.
+2. **The named spec section** in `docs/HUNT.md` or `docs/INTERNSHIPS.md`, written *before* the
+   work started (10a, 10c, 11a and 12f's contract exist for exactly this reason).
+3. **The rules file for that lane** — root `CLAUDE.md`, plus `apps/hunt-extension/CLAUDE.md` for
+   anything touching the extension or the inbox agent.
+
+If a task cannot be picked up from those three, the spec is incomplete and **that** is the bug —
+not the agent. Fix the spec; the next handoff is free.
+
+---
+
 ## After Phase 5
+
+**Superseded in part by Phases 10–13 (planned 2026-09-02):** deployment is now 10h, and the
+three hardening items below are 10h and 10j. What remains genuinely unplanned is additional
+site tabs and the SQLite→Postgres question.
 
 Not planned in detail yet: additional site tabs beyond the fridge app, deployment
 (Vercel for `frontend/`, a small VPS or fly.io for the Rust backend + DB are reasonable

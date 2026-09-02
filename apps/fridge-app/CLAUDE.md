@@ -1,6 +1,8 @@
-# fridge-app — status & notes
+# fridge-app — status & notes (CLAUDE.md = AGENTS.md)
 
-Repo-wide rules (Learning Mode, phase discipline) live in the root `CLAUDE.md`. This file
+Repo-wide rules (Learning Mode, phase discipline, and the two-agent lane rules) live in the
+root `CLAUDE.md`, which `AGENTS.md` symlinks to. **`apps/fridge-app/AGENTS.md` symlinks to
+this file** — one file, two names, never two copies. This file
 tracks fridge-app-specific state so a new session doesn't have to rediscover it.
 
 Trimmed 2026-08-19. Decisions are recorded here as *rules*; the reasoning behind them is in

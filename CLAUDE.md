@@ -1,12 +1,22 @@
-# Personal Website — CLAUDE.md
+# Personal Website — CLAUDE.md (= AGENTS.md)
 
 This repo is a personal project website. It is a small multi-tab Next.js app; each tab is
 a self-contained mini-project. The first tab being built is the **Fridge App**.
 
-This file governs how Claude Code should work in this repo. Read it before making changes.
-If a subproject has its own `CLAUDE.md` (e.g. `apps/fridge-app/CLAUDE.md`), that file's
-rules take precedence for work inside that folder, but the "Learning Mode" rules below
-always apply repo-wide.
+This file governs how **any coding agent** — Claude Code, Codex, or whatever comes next —
+should work in this repo. Read it before making changes. If a subproject has its own rules
+file (e.g. `apps/fridge-app/CLAUDE.md`), that file's rules take precedence for work inside
+that folder, but the "Learning Mode" rules below always apply repo-wide.
+
+**`AGENTS.md` is a symlink to this file, not a copy.** It was a copy until 2026-09-02, and it
+had already drifted a whole phase behind: no `apps/hunt-extension/` in its repo map, no
+`docs/HUNT.md`, no Phase 8 `[gen]` exception, and no pointer to the twelve binding rules that
+govern autofill — so the agent reading it was working from a repo that stopped existing in
+August. Two hand-maintained copies of one rules file diverge; a symlink cannot. **If you find
+yourself editing `AGENTS.md`, you are editing this file — that is the point. Never replace it
+with a copy.** (`frontend/` is the one exception: `next dev` generates and re-adds
+`frontend/AGENTS.md` on its own, so there `frontend/CLAUDE.md` imports it with `@AGENTS.md`
+and the direction is reversed. Leave that pair alone.)
 
 ## Repo layout
 
@@ -162,3 +172,53 @@ are not defaults to be re-weighed per source.
 - Ask before adding new dependencies (crates or npm packages) beyond what's already
   agreed in `docs/PLAN.md`.
 - When in doubt about whether something falls under "Learning Mode," ask rather than assume.
+
+## Working with two coding agents (added 2026-09-02)
+
+From Phase 10 the repo is worked by **two agents — Claude Code and Codex — against two
+separate weekly credit budgets**. That is a throughput decision, and it introduces failure
+modes a single agent does not have. These rules are binding on both.
+
+**1. One rules file, symlinked.** See the top of this file. A rule that lives in only one
+agent's copy is a rule the other agent will violate while being helpful.
+
+**2. Lanes, and a worktree each.** Never run both agents on the same working tree.
+
+| Lane | Owns | Typical work |
+|---|---|---|
+| **A — backend** | `apps/fridge-app/backend/src/**`, `migrations/` | Rust, SQL, sources, the inbox agent |
+| **B — client** | `frontend/src/**`, `apps/hunt-extension/**` | React, the extension, anything in a browser |
+| **C — docs** | `docs/**`, the rules files | Reconciliation, phase write-ups, specs |
+
+Lane C is written by whoever finishes first; it is never a *concurrent* lane, because two
+agents appending to `docs/PLAN.md` at once conflict on every line of it.
+
+**3. Migration numbers are reserved, not discovered.** Lane A owns `0021–0029`. An agent that
+picks the next free number by looking at the directory will pick the same one as the agent in
+the other worktree, and the conflict surfaces at `sqlx migrate run`, not at merge.
+
+**4. Cross-seam work is contract-first.** The backend↔client seam is in two languages and
+invisible to both compilers — it is what `f17d983` spent a whole commit closing by hand. A
+feature crossing it gets its request and response shapes written into `docs/HUNT.md` *before*
+either lane starts, and the crossing itself is one lane's job, not two halves that meet.
+
+**5. Every decision lands in `docs/` in the same commit that acts on it.** A decision that
+exists only in one agent's transcript is invisible to the other agent permanently, and to the
+user by next week. This is not documentation hygiene; it is the only shared memory the two
+agents have.
+
+**6. No task may be bottlenecked on one specific agent.** Every `[gen]` task in `docs/PLAN.md`
+names a **primary** agent and is marked **swappable** unless something genuinely makes it otherwise.
+Swappable means: the spec in `docs/` is complete enough that the *other* agent can pick the
+task up cold, having read nothing but the named files. When one budget runs out mid-week, the
+other takes the queue — so write the spec before starting, not after. The genuinely
+non-swappable work is named in each phase and is almost always `[you]`: labelling mail,
+loading the extension in Firefox, holding the deploy secrets, and the `[learn]` boundary calls.
+
+**7. The agent that wrote a diff does not review it.** Hand it to the other one. This repo's
+history is a catalogue of defects that hundreds of green tests did not catch; two models miss
+different things, and a review pass costs a fraction of an implementation pass.
+
+**8. Review capacity is the real budget.** Two agents double the code produced and do not
+double the hours the user has to read it. The "small, reviewable commits" convention above
+gets *stricter* here, not looser.

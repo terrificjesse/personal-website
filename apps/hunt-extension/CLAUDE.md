@@ -1,4 +1,4 @@
-# Hunt Extension — CLAUDE.md
+# Hunt Extension — CLAUDE.md (= AGENTS.md)
 
 **Status: 2026-08-31.** Phase 8 is built and Phase 9 with it; this file is now the *rules*, not the plan. What exists is documented in `docs/HUNT.md` — when that and this disagree, the reference is closer to the code and wins on fact, but the rules below still bind.
 
@@ -11,6 +11,13 @@ This file governs **Phase 8 wherever its code lives**, which is two places:
 
 The root `CLAUDE.md` still applies to both, and `apps/fridge-app/CLAUDE.md` still applies to
 the backend half. This file adds Phase 8 rules on top; it does not replace either.
+
+`apps/hunt-extension/AGENTS.md` is a symlink to this file, added 2026-09-02. Until then there
+was **no `AGENTS.md` anywhere near this folder**, which meant the twelve binding rules below —
+never submit a form, blocklist demographic and credential fields *before* the fuzzy mapper,
+never ship `<all_urls>`, treat email as untrusted — were invisible to any agent that reads
+`AGENTS.md` instead of `CLAUDE.md`. Those are the safety rules of a tool that types into other
+people's forms and holds a token to a mailbox. They are not optional for either agent.
 
 (The backend half lives in `apps/fridge-app/backend/` for the same reason the blog and the
 internship tab do: auth and `users` are there. That makes it the *fourth* tab in a folder
