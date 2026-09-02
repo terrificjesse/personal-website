@@ -90,19 +90,30 @@ pub async fn stale(pool: &SqlitePool, threshold: i64, now: DateTime<Utc>) -> Res
 
     Ok(rows
         .into_iter()
-        .map(|(id, user_id, company_name, title, url, applied_at)| {
-            let days = DateTime::parse_from_rfc3339(&applied_at)
-                .map(|applied| (now - applied.with_timezone(&Utc)).num_days())
-                .unwrap_or(threshold);
-            Stale {
+        .filter_map(|(id, user_id, company_name, title, url, applied_at)| {
+            // An unparseable `applied_at` used to fall back to the threshold, which put a
+            // number in the notification that looked measured and was not: a real 40-day
+            // silence was announced as "14 days" because the timestamp had been written by
+            // something other than this app. Skip and say so instead — a nudge whose age
+            // cannot be computed is a nudge that cannot be justified, and the row is broken
+            // in a way worth seeing.
+            let Ok(applied) = DateTime::parse_from_rfc3339(&applied_at) else {
+                eprintln!(
+                    "hunt: application {id} has an unparseable applied_at ({applied_at:?}) — \
+                     skipped rather than nudged with a guessed age"
+                );
+                return None;
+            };
+
+            Some(Stale {
                 application_id: id,
                 user_id,
                 company_name,
                 title,
                 url,
-                days,
+                days: (now - applied.with_timezone(&Utc)).num_days(),
                 threshold,
-            }
+            })
         })
         .collect())
 }
@@ -398,6 +409,30 @@ mod tests {
         assert_eq!(sweep(&pool, Utc::now()).await.unwrap().found, 0);
     }
 
+    /// Found by running the sweep against a real database rather than a fixture.
+    ///
+    /// Every test above writes `applied_at` as RFC3339 because the app does. A row written by
+    /// anything else — a hand `UPDATE`, an import, SQLite's own `datetime()` — used to fall
+    /// back to the threshold, so a 40-day silence was announced as "14 days": a number that
+    /// reads as measured and is not.
+    #[tokio::test]
+    async fn an_unparseable_applied_at_is_skipped_rather_than_guessed() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app = application(&pool, &user_id, "applied", 40).await;
+        // SQLite's own format: space-separated, no offset. Not RFC3339.
+        sqlx::query("UPDATE internship_applications SET applied_at = '2026-07-24 18:27:00' WHERE id = ?")
+            .bind(&app)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let report = sweep(&pool, Utc::now()).await.unwrap();
+
+        assert_eq!(report.found, 0, "a nudge with a guessed age is worse than no nudge");
+        assert_eq!(report.raised, 0);
+    }
+
     /// A nudge is private. A posting alert with a NULL user_id is visible to everyone signed
     /// in, and this must never be written that way.
     #[tokio::test]
@@ -418,5 +453,6 @@ mod tests {
         assert_eq!(event.kind, EventKind::Nudge);
         assert!(event.title.contains("Roblox") && event.title.contains("21"));
     }
+
 
 }
