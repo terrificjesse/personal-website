@@ -34,8 +34,12 @@ async fn main() -> anyhow::Result<()> {
     // that exports and grades a labelling sheet has no business spawning a blog watcher or a
     // collector run. See `inbox::labelset` — it is 8b's measurement, not part of the pipeline.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("labelset") {
-        return inbox::labelset::main(&pool, &args[1..]).await;
+    match args.first().map(String::as_str) {
+        Some("labelset") => return inbox::labelset::main(&pool, &args[1..]).await,
+        Some("application-events") => {
+            return internships::application_events::main(&pool, &args[1..]).await;
+        }
+        _ => {}
     }
 
     // Checks for expired sessions in the session table and purges them
