@@ -1149,13 +1149,13 @@ lapses. Everything here reads `application_events`; nothing here adds a new writ
 
 | # | Task | Tag | Lane | Primary | Swap | Est. |
 |---|---|---|---|---|---|---|
-| 11a | Analytics contract into `docs/HUNT.md`: endpoint shapes, and the definitions of *response*, *dead*, *converted* | `[gen]` | C | Claude Code | ✅ | 1–2h |
-| 11b | `GET /hunt/analytics?from=&to=` — funnel by source, by company tier, by month | `[gen]` | A | Codex | ✅ | 4–5h |
-| 11c | Analytics panel on the internships tab — **no new npm dependency**, plain SVG/CSS bars | `[gen]` | B | Claude Code | ✅ | 3–4h |
-| 11d | Time-to-first-response, per-source conversion, dead-application detection | `[gen]` | A | Codex | ✅ | 2–3h |
-| 11e | Follow-up nudges: no response in N days → a `hunt_events` row through the channel 8e built | `[gen]` | A | Claude Code | ✅ after 11a | 4–5h |
-| 11f | Deadline extraction from classified mail (OA due dates, interview times) → alert before it lapses | `[gen]` | A | Claude Code | ✅ after 11a | 4–6h |
-| 11g | URL-sync the internship filters, so a filtered view is bookmarkable | `[gen]` | B | Codex | ✅ | 2h |
+| 11a ✅ | Analytics contract into `docs/HUNT.md`: endpoint shapes, and the definitions of *response*, *dead*, *converted* | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 11b ✅ | `GET /hunt/analytics?from=&to=` — funnel by source, by company tier, by month | `[gen]` | A | Codex | ✅ | 4–5h |
+| 11c ✅ | Analytics panel on the internships tab — **no new npm dependency**, plain SVG/CSS bars | `[gen]` | B | Claude Code | ✅ | 3–4h |
+| 11d ✅ | Time-to-first-response, per-source conversion, dead-application detection | `[gen]` | A | Codex | ✅ | 2–3h |
+| 11e ✅ | Follow-up nudges: no response in N days → a `hunt_events` row through the channel 8e built | `[gen]` | A | Claude Code | ✅ after 11a | 4–5h |
+| 11f ✅ | Deadline extraction from classified mail (OA due dates, interview times) → alert before it lapses | `[gen]` | A | Claude Code | ✅ after 11a | 4–6h |
+| 11g ✅ | URL-sync the internship filters, so a filtered view is bookmarkable | `[gen]` | B | Codex | ✅ | 2h |
 
 **Load:** Claude Code ≈ 15h, Codex ≈ 11h. This is the most lopsided week — if the Claude budget
 is thin, **11e and 11f are the two to move**, and 11a is written precisely so they can be.
@@ -1164,8 +1164,10 @@ is thin, **11e and 11f are the two to move**, and 11a is written precisely so th
 
 - The funnel numbers **reconcile with a hand count in SQL** over the same window. A dashboard
   that cannot be checked by hand is a dashboard nobody should believe.
-- A backdated application with no response produces **exactly one** nudge, and the next sweep
-  produces none.
+- A backdated application with no response produces **exactly one nudge per threshold**, and
+  the next sweep produces none. (Written as "exactly one" before 11e chose two thresholds,
+  14 and 30 days; a 40-day silence therefore earns two, one from each. The property being
+  checked — that silence is announced once and not repeated — is unchanged.)
 - ~~A real OA email with a real due date raises an alert ahead of that date, and the alert body
   says which application it belongs to.~~ **Unmeetable as written, corrected 2026-09-02** — the
   second checkpoint clause in two phases to ask for something nothing can produce, and worth
@@ -1194,6 +1196,67 @@ is thin, **11e and 11f are the two to move**, and 11a is written precisely so th
   the classifier; it is the user's call, not an agent's**, and until it is taken this feature is
   plumbing waiting for input.
 - Filters survive a page reload and a copied URL.
+
+### Checkpoint 11 — met 2026-09-02
+
+Verified against a **copy of the live `fridge.db`**, driven over HTTP through the real server
+and the real background workers rather than through fixtures. A session was minted directly in
+the copy rather than registering an account.
+
+- **The funnel reconciles with a hand count.** `GET /hunt/analytics` returned
+  `applications 2, responded 1, reached_oa 1`; an independent SQL count over the same window
+  returned 2, 1, 1. `by_tier` put Roblox in tier **2** and zip in **unknown** — not tier 3,
+  which is the rule `None` has carried since 8e. ✅
+- **One nudge per threshold, and no repeat.** A 40-day silent application produced exactly two
+  nudges (`…:14`, `…:30`) on the first tick and **none** on the second, through the real
+  worker at a 60-second cadence. ✅
+- **The deadline path, on a constructed message.** Both leads fired (`dl-cp11:24`,
+  `dl-cp11:72`) and the alert named the application: *"Roblox · due in 19h"*. **Real-corpus
+  recall is 0 of 23**, reported as its own number per the corrected clause. ✅
+- **Filters survive a copied URL and a reload.** `?remote=true&sort=posted&company=Roblox&pay_min=40`
+  hydrated every control, and reloading kept all four. ✅
+
+### What the real run caught that 818 tests could not
+
+**1. The analytics endpoint reports confident zeroes on a database whose backfill has not run** —
+and this is the one with a deploy consequence. Before `application-events backfill`:
+
+```
+applications: 2, responded: 0, reached_oa: 0
+```
+
+After it: `responded: 1, reached_oa: 1`. `applications` is counted from
+`internship_applications` while every conversion number comes from `application_events`, so an
+un-backfilled database renders a **populated-looking dashboard that is wrong** rather than an
+obviously empty one, and nothing in the response says the log is empty. Recorded in
+`docs/DEPLOY.md` as a required first-deploy step; the durable fix would be for the endpoint to
+report how many applications have no events at all, which is a change in Codex's file.
+
+**2. A nudge announced a guessed age as a measured one.** *"No reply from zip · 14 days"* for an
+application silent 40 days: `applied_at` was parsed with a fallback to the threshold, so any row
+not written in RFC3339 reported the threshold as its age. Every test wrote RFC3339 because the
+app does; the row that broke it had been through SQLite's own `datetime()`. Fixed in `a20364a` —
+skip and log, because a nudge whose age cannot be computed is a nudge that cannot be justified.
+
+### Known gaps, recorded rather than fixed
+
+- **An application created directly in a terminal status is counted as `no_response_dead`.**
+  `metrics_for` derives everything from events *after* the creation event, so an application
+  whose only event is a creation with `to_status = 'rejected'` has no response, is not counted
+  in `rejected`, and becomes "dead" once older than the threshold. The contract says a closed
+  application is never dead. Reachable through `POST /internships/applications` with
+  `status: "rejected"`. The fix needs `a.status` in the analytics query plus two guards — it is
+  in `src/routes/analytics.rs`, so it goes back to the agent that wrote it rather than being
+  patched across a lane boundary.
+- **The analytics window is filtered in Rust, not in SQL.** Every one of a user's applications
+  is loaded and then filtered by `applied_at`. Correct, and fine at two applications; it is a
+  full scan at two thousand.
+- **`record_deadline` — the sync-time write — has no end-to-end coverage.** `extract` has 15
+  tests and the sweep has 5, but the function joining them runs only inside a Gmail sync. It is
+  the last unexercised seam in the deadline path.
+- **A collection run started on its own** when the backend booted against the copy, because
+  collection runs at startup when the data is stale. Harmless — the sources are polite by
+  design — but worth knowing that booting a copy fetches from live job boards.
 
 ### Traps
 
