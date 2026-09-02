@@ -230,6 +230,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/hunt/answers/{id}/revisions", get(hunt::answer_revisions))
         .route("/hunt/answers/{id}/used", post(hunt::use_answer))
+        .route(
+            "/hunt/resume-variants",
+            get(hunt::list_variants).post(hunt::create_variant),
+        )
+        .route(
+            "/hunt/resume-variants/{id}",
+            patch(hunt::edit_variant).delete(hunt::delete_variant),
+        )
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

@@ -1,6 +1,10 @@
 /target
 *.db
 *.db-journal
+# WAL sidecars, which appeared when `db::init_pool` started setting journal_mode=WAL in
+# Phase 10. `*.db` does not match them, and `-wal` holds recent writes — real user data.
+*.db-wal
+*.db-shm
 # Manual copies of the database (e.g. fridge.db.pre-phase5-backup) — real user data, and
 # `*.db` alone doesn't match a suffixed filename.
 *.db.*
