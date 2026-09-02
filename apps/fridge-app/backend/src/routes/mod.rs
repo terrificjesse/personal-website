@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod auth;
 pub mod blog;
 pub mod health;
@@ -198,6 +199,7 @@ pub fn build_router(state: AppState) -> Router {
             "/internships/applications",
             get(internships::list_applications).post(internships::create_application),
         )
+        .route("/hunt/analytics", get(analytics::analytics))
         .route("/hunt/events", get(hunt::list_events))
         .route("/hunt/events/{id}/ack", post(hunt::ack_event))
         .route(

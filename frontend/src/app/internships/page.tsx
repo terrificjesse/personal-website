@@ -1,16 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { PostingCard } from "./PostingCard";
 import { CollectionStatus } from "./CollectionStatus";
 import { AnswerLibrary } from "./AnswerLibrary";
 import { InboxPanel } from "./InboxPanel";
 import { CvProfileEditor } from "./CvProfileEditor";
 import { ExtensionAccess } from "./ExtensionAccess";
+import { AnalyticsPanel } from "./AnalyticsPanel";
 import { useApiError } from "@/lib/useApiError";
 import {
   createApplication,
+  internshipFiltersFromSearchParams,
+  internshipFiltersToSearchParams,
   listInternshipSources,
   listInternships,
   type InternshipFilters,
@@ -41,19 +45,46 @@ const STUDY_YEARS = ["freshman", "sophomore", "junior", "senior"];
  *    (`docs/INTERNSHIP_SCRAPING.md` § B), so those two switches change the result set more
  *    than any other control here. Defaulting them on would hide most of the corpus; hiding
  *    them entirely would make the pay filter look broken when unpriced postings came back.
+ * 3. **The URL is the filter state.** Every backend-supported filter is parsed even when this
+ *    page has no control for it yet, so a shared link reproduces the exact request. Controls
+ *    replace only known filter keys and preserve unrelated query parameters; back/forward
+ *    navigation therefore restores the view without a second state copy drifting from it.
  */
 export default function InternshipsPage() {
-  const handleApiError = useApiError();
+  return (
+    <Suspense fallback={<InternshipsPageFallback />}>
+      <InternshipsPageContent />
+    </Suspense>
+  );
+}
 
-  const [filters, setFilters] = useState<InternshipFilters>({
-    sort: "composite",
-  });
+function InternshipsPageFallback() {
+  return (
+    <main className="mx-auto max-w-4xl px-4 py-8">
+      <h1 className="text-2xl font-semibold">Internships</h1>
+      <p className="mt-6 text-sm text-black/60 dark:text-white/60">Loading…</p>
+    </main>
+  );
+}
+
+function InternshipsPageContent() {
+  const handleApiError = useApiError();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const filterQuery = searchParams.toString();
+  const filters = useMemo(
+    () =>
+      internshipFiltersFromSearchParams(new URLSearchParams(filterQuery)),
+    [filterQuery],
+  );
   const [data, setData] = useState<ListInternshipsResponse | null>(null);
   const [sources, setSources] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [trackingId, setTrackingId] = useState<string | null>(null);
   const [trackedIds, setTrackedIds] = useState<Set<string>>(new Set());
+  const [refreshVersion, setRefreshVersion] = useState(0);
 
   // The fetch lives inside the effect rather than in a `useCallback` the effect calls, so no
   // state is set synchronously when the effect runs.
@@ -89,7 +120,7 @@ export default function InternshipsPage() {
     return () => {
       cancelled = true;
     };
-  }, [filters, handleApiError]);
+  }, [filters, handleApiError, refreshVersion]);
 
   useEffect(() => {
     listInternshipSources()
@@ -100,15 +131,17 @@ export default function InternshipsPage() {
   }, []);
 
   // Identity-stable so `CollectionStatus`'s poll effect isn't torn down and restarted on
-  // every render. Re-setting the filters object re-runs the fetch effect without changing
-  // what is being asked for.
-  const refresh = useCallback(
-    () => setFilters((current) => ({ ...current })),
-    [],
-  );
+  // every render. The counter re-runs the request without changing the bookmarkable filters.
+  const refresh = useCallback(() => setRefreshVersion((version) => version + 1), []);
 
-  const update = (patch: Partial<InternshipFilters>) =>
-    setFilters((current) => ({ ...current, ...patch }));
+  const update = (patch: Partial<InternshipFilters>) => {
+    const next = internshipFiltersToSearchParams(
+      { ...filters, ...patch },
+      new URLSearchParams(filterQuery),
+    );
+    const query = next.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  };
 
   const track = async (postingId: string) => {
     setTrackingId(postingId);
@@ -277,6 +310,7 @@ export default function InternshipsPage() {
       <CollectionStatus onUpdate={refresh} />
 
       <div className="mt-4 space-y-3">
+        <AnalyticsPanel />
         <InboxPanel />
         <ExtensionAccess />
         <CvProfileEditor />
