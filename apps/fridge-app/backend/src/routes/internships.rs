@@ -1492,4 +1492,121 @@ mod handler_tests {
             .unwrap();
         assert!(health.in_progress.is_none());
     }
+
+    // ---- 10e part 2: provenance and manual transitions ----
+
+    async fn actors_for(pool: &SqlitePool, application_id: &str) -> Vec<(String, Option<String>)> {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT actor, cause_id FROM application_events
+              WHERE application_id = ? ORDER BY at ASC, created_at ASC, id ASC",
+        )
+        .bind(application_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The credential decides the actor, not a field in the request body.
+    #[tokio::test]
+    async fn an_application_created_through_the_extension_is_recorded_as_such() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        posting(&pool, "p2").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let (_, Json(from_extension)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Credential::HuntToken,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(from_site)) = create_application(
+            State(pool.clone()),
+            me,
+            Credential::Session,
+            Json(CreateApplicationRequest {
+                posting_id: "p2".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actors_for(&pool, &from_extension.id).await,
+            vec![("extension".to_string(), None)]
+        );
+        assert_eq!(
+            actors_for(&pool, &from_site.id).await,
+            vec![("manual".to_string(), None)]
+        );
+    }
+
+    /// Manual edits carry a NULL cause, and SQLite treats NULLs as distinct in a UNIQUE index —
+    /// so two edits are two events. That is correct: the key's idempotency covers email- and
+    /// extension-caused writes, and two deliberate edits are two things that happened.
+    #[tokio::test]
+    async fn two_manual_status_edits_are_two_events_and_a_no_op_edit_is_none() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let (_, Json(app)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Credential::Session,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        for status in ["oa", "interview"] {
+            let _moved = update_application(
+                State(pool.clone()),
+                me.clone(),
+                Path(app.id.clone()),
+                Json(UpdateApplicationRequest {
+                    status: Some(status.into()),
+                    notes: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Re-sending the status it already has moves nothing, so it records nothing.
+        let _unchanged = update_application(
+            State(pool.clone()),
+            me.clone(),
+            Path(app.id.clone()),
+            Json(UpdateApplicationRequest {
+                status: Some("interview".into()),
+                notes: Some("still nothing to record".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let events = actors_for(&pool, &app.id).await;
+        assert_eq!(
+            events,
+            vec![
+                ("manual".to_string(), None), // creation
+                ("manual".to_string(), None), // applied -> oa
+                ("manual".to_string(), None), // oa -> interview
+            ],
+            "three transitions happened; the fourth request changed nothing"
+        );
+    }
 }

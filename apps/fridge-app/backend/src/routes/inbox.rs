@@ -821,4 +821,146 @@ mod decide_tests {
             assert_eq!(status_of(&pool, &app_id).await, "oa");
         }
     }
+
+    // ---- 10e part 2: what each decision records ----
+
+    #[derive(Debug, sqlx::FromRow, PartialEq, Eq)]
+    struct EventRow {
+        from_status: Option<String>,
+        to_status: String,
+        actor: String,
+        cause_kind: Option<String>,
+        cause_id: Option<String>,
+    }
+
+    async fn events_for(pool: &SqlitePool, application_id: &str) -> Vec<EventRow> {
+        sqlx::query_as::<_, EventRow>(
+            "SELECT from_status, to_status, actor, cause_kind, cause_id
+               FROM application_events WHERE application_id = ?
+              ORDER BY at ASC, created_at ASC, id ASC",
+        )
+        .bind(application_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The email actor's row, written the way `propose_status` writes it when it auto-applies.
+    async fn record_auto_apply(
+        pool: &SqlitePool,
+        application_id: &str,
+        proposal_id: &str,
+        from: ApplicationStatus,
+        to: ApplicationStatus,
+    ) {
+        let mut tx = crate::db::begin_write(pool).await.unwrap();
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id,
+                from_status: Some(from),
+                to_status: to,
+                actor: Actor::Email,
+                cause: Some(Cause::StatusProposal(proposal_id)),
+                at: Utc::now(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepting_a_proposal_records_one_manual_event() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        decide(&pool, &user_id, &proposal_id, true).await.unwrap();
+
+        assert_eq!(
+            events_for(&pool, &app_id).await,
+            vec![EventRow {
+                from_status: Some("applied".into()),
+                to_status: "oa".into(),
+                // The cause is an email; the actor is the person who clicked.
+                actor: "manual".into(),
+                cause_kind: Some("status_proposal".into()),
+                cause_id: Some(proposal_id),
+            }]
+        );
+    }
+
+    /// Where the UNIQUE key earns its place.
+    ///
+    /// The email actor already recorded (application, status_proposal, p, oa) when it
+    /// auto-applied. A human accepting the same proposal afterwards produces the identical
+    /// key, and `record` returns `AlreadyRecorded` — which is a normal outcome, not an error.
+    /// Asserting the COUNT is the point: asserting the call succeeded would pass either way.
+    #[tokio::test]
+    async fn accepting_an_already_auto_applied_proposal_records_no_second_event() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+        record_auto_apply(
+            &pool,
+            &app_id,
+            &proposal_id,
+            ApplicationStatus::Applied,
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        decide(&pool, &user_id, &proposal_id, true).await.unwrap();
+
+        let events = events_for(&pool, &app_id).await;
+        assert_eq!(events.len(), 1, "the email actor's row, and nothing on top of it");
+        assert_eq!(events[0].actor, "email");
+    }
+
+    /// Rejecting something that was never applied changes no status, so there is no transition
+    /// to record. An event here would make the fold disagree with the column immediately.
+    #[tokio::test]
+    async fn rejecting_a_proposal_that_never_applied_records_nothing() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        decide(&pool, &user_id, &proposal_id, false).await.unwrap();
+
+        assert!(events_for(&pool, &app_id).await.is_empty());
+        assert_eq!(status_of(&pool, &app_id).await, "applied");
+    }
+
+    /// The undo shares its cause with the event that applied it and differs only in
+    /// `to_status` — which is exactly why `to_status` is in the UNIQUE key.
+    #[tokio::test]
+    async fn undoing_an_auto_applied_proposal_records_the_reverse_transition() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+        record_auto_apply(
+            &pool,
+            &app_id,
+            &proposal_id,
+            ApplicationStatus::Applied,
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        decide(&pool, &user_id, &proposal_id, false).await.unwrap();
+
+        let events = events_for(&pool, &app_id).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].to_status, "applied", "back where it came from");
+        assert_eq!(events[1].from_status.as_deref(), Some("oa"));
+        assert_eq!(events[1].actor, "manual");
+        assert_eq!(events[1].cause_id.as_deref(), Some(proposal_id.as_str()));
+        assert_eq!(status_of(&pool, &app_id).await, "applied");
+    }
 }
