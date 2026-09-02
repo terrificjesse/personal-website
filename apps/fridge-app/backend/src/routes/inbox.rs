@@ -359,7 +359,7 @@ async fn decide(
     // at the old stage, and nothing anywhere records that the two disagree. Rule 2 says an
     // email-driven change must stay reversible, which it cannot be if the audit row and the
     // change it describes can come apart.
-    let mut tx = pool.begin().await.map_err(|err| {
+    let mut tx = crate::db::begin_write(pool).await.map_err(|err| {
         eprintln!("inbox: opening a transaction failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -635,5 +635,62 @@ mod decide_tests {
             Err(StatusCode::NOT_FOUND)
         );
         assert_eq!(status_of(&pool, &app_id).await, "oa");
+    }
+
+    /// The pool settings the transactions above depend on.
+    ///
+    /// Holding a write transaction across two statements is only safe because SQLite is in WAL
+    /// mode with a busy timeout — readers do not block, and a competing writer waits instead of
+    /// failing instantly with SQLITE_BUSY. Both are sqlx defaults rather than anything this
+    /// project sets, which is exactly why they are worth pinning: a future `init_pool` that
+    /// builds `SqliteConnectOptions` by hand could drop either one, and the symptom would be
+    /// intermittent 500s under concurrency rather than a compile error.
+    #[tokio::test]
+    async fn the_pool_is_wal_with_a_busy_timeout() {
+        let pool = pool().await;
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(timeout > 0, "a zero busy timeout fails instantly under contention");
+    }
+
+    /// Eight decisions at once, on one pool, all of which now open write transactions.
+    #[tokio::test]
+    async fn concurrent_decisions_do_not_collide() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+
+        let mut proposals = Vec::new();
+        for _ in 0..8 {
+            let app_id = application(&pool, &user_id, "applied").await;
+            proposals.push((
+                proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await,
+                app_id,
+            ));
+        }
+
+        let mut handles = Vec::new();
+        for (proposal_id, app_id) in proposals {
+            let pool = pool.clone();
+            let user_id = user_id.clone();
+            handles.push(tokio::spawn(async move {
+                let outcome = decide(&pool, &user_id, &proposal_id, true).await;
+                (outcome, app_id)
+            }));
+        }
+
+        for handle in handles {
+            let (outcome, app_id) = handle.await.unwrap();
+            assert_eq!(outcome, Ok(StatusCode::NO_CONTENT));
+            assert_eq!(status_of(&pool, &app_id).await, "oa");
+        }
     }
 }

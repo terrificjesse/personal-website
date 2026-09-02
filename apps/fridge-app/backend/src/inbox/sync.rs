@@ -483,7 +483,7 @@ async fn propose_status(
     // is a claim that the tracker already moved: the panel renders it as *"already applied —
     // rejecting undoes it"*, and reject then restores a status the application was never at.
     // Two statements outside a transaction make that claim survivable on its own.
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO status_proposals

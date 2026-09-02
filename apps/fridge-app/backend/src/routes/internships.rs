@@ -269,7 +269,7 @@ pub async fn update_application(
     // for and gets no error about. It is also the transaction the Phase 10 event record hangs
     // on: the status change and the row that describes it have to commit together or not at
     // all — see `docs/HUNT.md` § `application_events`.
-    let mut tx = pool.begin().await.map_err(|err| {
+    let mut tx = crate::db::begin_write(&pool).await.map_err(|err| {
         eprintln!("internships: opening a transaction failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
