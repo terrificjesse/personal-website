@@ -654,8 +654,10 @@ export async function answerRevisions(id: string): Promise<AnswerRevision[]> {
  *
  * **Nothing here is applied silently.** Rule 2: a misclassification must never rewrite the
  * tracker, so every email-driven change is a proposal carrying the email that caused it —
- * and that link is what makes a wrong call reversible. `subject` and `evidence` are shown
- * beside the change for exactly that reason: an audit trail nobody can read is not one.
+ * and that link is what makes a wrong call reversible. `from_address`, `subject`, and
+ * `evidence` are separate nullable fields shown beside the change for exactly that reason:
+ * an audit trail nobody can read is not one, and a subject must never be presented as a
+ * sender.
  */
 export type StatusProposal = {
   id: string;
@@ -666,6 +668,7 @@ export type StatusProposal = {
   to_status: string;
   /** True only if the confidence threshold was configured AND the move was forward and non-terminal. */
   applied_automatically: boolean;
+  from_address: string | null;
   subject: string | null;
   evidence: string | null;
   confidence: number | null;

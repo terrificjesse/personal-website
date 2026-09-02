@@ -51,7 +51,6 @@ export default function RecipesPage() {
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
 
     fetchRecommendedRecipes({ cuisine: cuisine || undefined, mealType: mealType || undefined })
       .then((data) => {
@@ -104,8 +103,14 @@ export default function RecipesPage() {
           mealTypes={mealTypes}
           cuisine={cuisine}
           mealType={mealType}
-          onCuisineChange={setCuisine}
-          onMealTypeChange={setMealType}
+          onCuisineChange={(value) => {
+            setLoading(true);
+            setCuisine(value);
+          }}
+          onMealTypeChange={(value) => {
+            setLoading(true);
+            setMealType(value);
+          }}
         />
       </div>
 

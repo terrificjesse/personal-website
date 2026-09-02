@@ -14,6 +14,8 @@
  *
  * Every proposal shows the email that caused it. Rule 2's audit trail is what makes a
  * misclassification reversible, and an audit trail you can only read with SQL is not one.
+ * Sender and subject are rendered as separate fields: either may be absent, and the subject
+ * must never stand in for the sender.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -169,7 +171,8 @@ export function InboxPanel() {
               {/* The email that caused it. Without this the panel asks you to approve a change
                   you have no way to check. */}
               <div className="mt-1 text-xs text-neutral-500">
-                {proposal.subject && <div>from: {proposal.subject}</div>}
+                {proposal.from_address && <div>from: {proposal.from_address}</div>}
+                {proposal.subject && <div>subject: {proposal.subject}</div>}
                 {proposal.evidence && <div>matched: {proposal.evidence}</div>}
               </div>
 

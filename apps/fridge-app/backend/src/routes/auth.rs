@@ -15,6 +15,7 @@ use crate::auth::{
     MIN_PASSWORD_LENGTH, SESSION_COOKIE_NAME, SESSION_DURATION_DAYS,
 };
 use crate::models::{LoginRequest, RegisterRequest, User, normalize_email};
+use crate::rate_limit::{ClientIp, RateLimits};
 
 /// Cookie needed for Google authentication. 10 minutes is plenty of time for a
 /// user to sign in using Google auth.
@@ -455,16 +456,32 @@ async fn claim_unowned_rows(
 /// password on record. Finally issues a session when the verification is complete.
 pub async fn login(
     State(pool): State<SqlitePool>,
+    State(rate_limits): State<RateLimits>,
+    ClientIp(ip): ClientIp,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
-) -> Result<(CookieJar, Json<AuthenticatedUser>), AuthError> {
+) -> Response {
     let email = normalize_email(&req.email);
+    if let Err(retry) = rate_limits.check_login(ip, &email) {
+        return retry.response("POST /auth/login", ip, &email);
+    }
 
+    login_after_rate_limit(&pool, jar, req, email)
+        .await
+        .into_response()
+}
+
+async fn login_after_rate_limit(
+    pool: &SqlitePool,
+    jar: CookieJar,
+    req: LoginRequest,
+    email: String,
+) -> Result<(CookieJar, Json<AuthenticatedUser>), AuthError> {
     let user: Option<User> = sqlx::query_as::<_, User>(
         "SELECT id, email, password_hash, created_at, is_admin FROM users WHERE email = ?",
     )
     .bind(&email)
-    .fetch_optional(&pool)
+    .fetch_optional(pool)
     .await?;
 
     let user = user.ok_or(AuthError::InvalidCredentials)?;
@@ -477,7 +494,7 @@ pub async fn login(
         return Err(AuthError::InvalidCredentials);
     }
 
-    let session = auth::issue_session(&pool, &user.id).await?;
+    let session = auth::issue_session(pool, &user.id).await?;
 
     Ok((
         jar.add(session_cookie(session.token)),
@@ -666,6 +683,8 @@ async fn link_google_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::net::IpAddr;
 
     #[test]
     fn a_short_password_is_rejected() {
@@ -748,6 +767,47 @@ mod tests {
 
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         assert_eq!(cookie.http_only(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn the_login_route_refuses_the_eleventh_normalized_account_attempt() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        let rate_limits = RateLimits::default();
+        let ip = IpAddr::from([192, 0, 2, 1]);
+
+        for attempt in 0..=10 {
+            let email = if attempt % 2 == 0 {
+                "Person@Example.com"
+            } else {
+                " person@example.com "
+            };
+            let response = login(
+                State(pool.clone()),
+                State(rate_limits.clone()),
+                ClientIp(ip),
+                CookieJar::new(),
+                Json(LoginRequest {
+                    email: email.to_string(),
+                    password: "not-the-password".to_string(),
+                }),
+            )
+            .await;
+
+            let expected = if attempt < 10 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(response.status(), expected, "attempt {}", attempt + 1);
+        }
     }
 }
 
