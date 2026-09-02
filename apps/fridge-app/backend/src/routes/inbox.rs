@@ -6,6 +6,12 @@
 //! the network to someone else's service, so it runs on an explicit trigger, never inline in a
 //! read. `GET /hunt/inbox/status` reports what the last run recorded and makes no network call
 //! at all.
+//!
+//! # Proposal audit contract
+//!
+//! `GET /hunt/proposals` returns the triggering email's `from_address` and `subject` as
+//! separate nullable fields. The reviewer needs both to check a proposed status change; the
+//! subject is evidence about what happened, but it is never a substitute for who sent it.
 
 use axum::{
     Json,
@@ -250,6 +256,7 @@ pub async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     /// The bug this file shipped with, pinned as behaviour rather than as a comment.
     ///
@@ -281,6 +288,78 @@ mod tests {
         assert_ne!(GMAIL_STATE_COOKIE, "fridge_session");
         assert_ne!(GMAIL_STATE_COOKIE, "oauth_state");
     }
+
+    #[tokio::test]
+    async fn proposals_keep_the_sender_and_subject_separate() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+
+        sqlx::query(
+            "INSERT INTO users (id, email, created_at)
+             VALUES ('user-1', 'reviewer@example.com', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("user");
+        sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, company_name, title, url, snapshot_json, snapshot_at, status,
+                 applied_at, status_changed_at, created_at, updated_at)
+             VALUES
+                ('application-1', 'user-1', 'Example Co', 'Engineer', 'https://example.com/job',
+                 '{}', '2026-09-02T00:00:00Z', 'applied', '2026-09-02T00:00:00Z',
+                 '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("application");
+        sqlx::query(
+            "INSERT INTO email_messages
+                (id, user_id, gmail_message_id, from_address, subject, created_at)
+             VALUES
+                ('message-1', 'user-1', 'gmail-1', 'recruiter@example.com',
+                 'Your interview', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("message");
+        sqlx::query(
+            "INSERT INTO email_verdicts
+                (id, message_id, category, confidence, matched_application_id, classifier,
+                 evidence, created_at)
+             VALUES
+                ('verdict-1', 'message-1', 'interview', 0.9, 'application-1', 'rules',
+                 'interview', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("verdict");
+        sqlx::query(
+            "INSERT INTO status_proposals
+                (id, application_id, verdict_id, from_status, to_status, created_at)
+             VALUES
+                ('proposal-1', 'application-1', 'verdict-1', 'applied', 'interview',
+                 '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("proposal");
+
+        let proposals = fetch_proposals(&pool, "user-1")
+            .await
+            .expect("proposal query");
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].from_address.as_deref(), Some("recruiter@example.com"));
+        assert_eq!(proposals[0].subject.as_deref(), Some("Your interview"));
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -297,6 +376,7 @@ pub struct Proposal {
     pub to_status: String,
     pub applied_automatically: bool,
     /// The email that caused it. **This link is what makes a bad call reversible** — rule 2.
+    pub from_address: Option<String>,
     pub subject: Option<String>,
     pub evidence: Option<String>,
     pub confidence: Option<f64>,
@@ -308,10 +388,20 @@ pub async fn proposals(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<Proposal>>, StatusCode> {
+    fetch_proposals(&pool, &user.id)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("inbox: listing proposals failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn fetch_proposals(pool: &SqlitePool, user_id: &str) -> Result<Vec<Proposal>, sqlx::Error> {
     sqlx::query_as::<_, Proposal>(
         "SELECT p.id, p.application_id, a.company_name, a.title,
                 p.from_status, p.to_status, p.applied_automatically,
-                m.subject, v.evidence, v.confidence, p.created_at
+                m.from_address, m.subject, v.evidence, v.confidence, p.created_at
            FROM status_proposals p
            JOIN internship_applications a ON a.id = p.application_id
            JOIN email_verdicts v ON v.id = p.verdict_id
@@ -319,14 +409,9 @@ pub async fn proposals(
           WHERE a.user_id = ? AND p.reviewed_at IS NULL
           ORDER BY p.created_at DESC",
     )
-    .bind(&user.id)
-    .fetch_all(&pool)
+    .bind(user_id)
+    .fetch_all(pool)
     .await
-    .map(Json)
-    .map_err(|err| {
-        eprintln!("inbox: listing proposals failed: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
 }
 
 /// Accept a proposal: apply the status change and mark it reviewed.
