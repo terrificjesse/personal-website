@@ -164,23 +164,92 @@ export type ListInternshipsResponse = {
   collection: RunProgress | null;
 };
 
-function toQuery(filters: InternshipFilters): string {
-  const params = new URLSearchParams();
+const INTERNSHIP_FILTER_KEYS: (keyof InternshipFilters)[] = [
+  "sort",
+  "term_season",
+  "term_year",
+  "term_unknown",
+  "remote",
+  "location",
+  "location_unknown",
+  "class_year",
+  "class_year_unknown",
+  "pay_min",
+  "pay_max",
+  "pay_unknown",
+  "company",
+  "source",
+];
+
+/**
+ * Serialize the filter contract once for both API requests and browser URLs.
+ *
+ * `seed` lets the page retain unrelated query parameters while replacing all known filter
+ * keys. API calls omit it so nothing outside the backend contract is forwarded.
+ */
+export function internshipFiltersToSearchParams(
+  filters: InternshipFilters,
+  seed?: URLSearchParams,
+): URLSearchParams {
+  const params = new URLSearchParams(seed);
+  for (const key of INTERNSHIP_FILTER_KEYS) params.delete(key);
   for (const [key, value] of Object.entries(filters)) {
     // `false` is a meaningful value for `remote`, so test for null/undefined rather than
     // truthiness — `if (value)` would silently drop `remote=false` and turn "onsite only"
     // into "no location filter at all".
     if (value === undefined || value === null || value === "") continue;
+    // Composite is the default. Leaving it out makes the unfiltered URL canonical without
+    // changing what the backend receives.
+    if (key === "sort" && value === "composite") continue;
     params.set(key, String(value));
   }
-  const query = params.toString();
-  return query ? `?${query}` : "";
+  return params;
+}
+
+/** Read every backend-supported filter from a bookmarkable URL. */
+export function internshipFiltersFromSearchParams(
+  params: Pick<URLSearchParams, "get">,
+): InternshipFilters {
+  const text = (key: keyof InternshipFilters) => params.get(key) || undefined;
+  const number = (key: keyof InternshipFilters) => {
+    const value = params.get(key);
+    return value === null ? undefined : Number(value);
+  };
+  const remote = params.get("remote");
+
+  return {
+    sort: (text("sort") as InternshipSort | undefined) ?? "composite",
+    term_season: text("term_season") as InternshipSeason | undefined,
+    term_year: number("term_year"),
+    term_unknown: text("term_unknown") as OnUnknown | undefined,
+    // Preserve malformed values at runtime so the backend can return its documented 400
+    // instead of this client quietly turning them into the default.
+    remote:
+      remote === null
+        ? undefined
+        : remote === "true"
+          ? true
+          : remote === "false"
+            ? false
+            : (remote as unknown as boolean),
+    location: text("location"),
+    location_unknown: text("location_unknown") as OnUnknown | undefined,
+    class_year: text("class_year"),
+    class_year_unknown: text("class_year_unknown") as OnUnknown | undefined,
+    pay_min: number("pay_min"),
+    pay_max: number("pay_max"),
+    pay_unknown: text("pay_unknown") as OnUnknown | undefined,
+    company: text("company"),
+    source: text("source"),
+  };
 }
 
 export async function listInternships(
   filters: InternshipFilters = {},
 ): Promise<ListInternshipsResponse> {
-  const res = await apiFetch(`/internships${toQuery(filters)}`);
+  const params = internshipFiltersToSearchParams(filters);
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await apiFetch(`/internships${query}`);
   if (!res.ok) {
     // 400 means the filters themselves were rejected (an unknown sort, an inverted pay
     // window). Surfacing that verbatim beats rendering an empty list, which would look like
