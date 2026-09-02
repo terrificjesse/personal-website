@@ -174,7 +174,7 @@ Each blocks or degrades something after deploy. None is written by this task.
 
 | What | Where | Why it matters |
 |---|---|---|
-| **The extension cannot reach a deployed backend.** `host_permissions` are exactly `localhost:8080` and `127.0.0.1:8080` | `apps/hunt-extension/manifest.json` | After deploy the extension reports `unpermitted` — Firefox MV3 grants host permissions per origin and the manifest never names the new one. Add the public origin, then re-grant via **Test connection**. Until then: no desktop alerts at all |
+| ~~The extension cannot reach a deployed backend~~ | `apps/hunt-extension/manifest.json` | **Done 2026-09-02.** `optional_host_permissions` lets any https origin be *requested*; the extension asks for exactly the backend URL in Settings, from the **Test connection** click. No manifest edit or reload per hostname, and no code change when the host moves |
 | ~~The rate limiter cannot see the caller behind a proxy~~ | `apps/fridge-app/backend/src/rate_limit.rs` | **Done 2026-09-02.** `X-Forwarded-For` is trusted only when the TCP peer is loopback, taking the last hop. From any other peer it is ignored, which is the property a direct-exposure deployment depends on |
 | ~~The tier file path is compiled in~~ | `src/internships/prestige.rs` | **Done 2026-09-02.** `INTERNSHIP_COMPANY_TIERS`, then beside the executable, then the build path — and it now logs which one it read |
 | ~~Three write paths still open *deferred* transactions~~ | `internships/expiry.rs`, `routes/auth.rs` ×2 | **Done, and the original claim here was too strong.** Measured: all three passed under contention as they were, because a deferred transaction whose *first* statement is a write takes the lock there and the busy handler waits. The instant-failure case (`SQLITE_BUSY_SNAPSHOT`, no wait) is specific to **read-then-write** transactions — which is what `decide` was, and why it lost 5 of 8 concurrent writes. All three now use `db::begin_write` so that a future edit adding a SELECT above the first write cannot silently reintroduce it |
@@ -280,7 +280,10 @@ Nothing below can be done by an agent: it needs an account, a card, DNS, or a de
 6. Create the Google Cloud OAuth client and register **both** redirect URIs.
 7. Fill `/etc/personal-website/backend.env` from `deploy/env.production.example` and run the preflight.
 8. Deploy per **First deploy**, then confirm **Is it alive?** — including the company-tier line.
-9. Update the extension: the manifest's host permissions (a code change, listed above), its
-   Settings backend URL (`https://hunt.example.com/api`), and re-grant via **Test connection**.
+9. Update the extension: set its Settings backend URL to `https://hunt.example.com/api` and
+   press **Test connection**, which is what triggers Firefox's permission prompt for that
+   origin — accept it. No manifest edit and no reload: the grant is per origin and happens at
+   runtime. The backend must also name the extension's own `moz-extension://…` origin in
+   `ALLOWED_ORIGINS`; **Test connection** prints the exact value when it is missing.
 10. Watch it for 48 hours without touching it. That is Checkpoint 10, and it is also when the
     corpus Phase 13 needs begins to accumulate.

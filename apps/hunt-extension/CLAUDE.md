@@ -307,6 +307,28 @@ The content script handles your real name, address, phone and work history on th
   found company careers pages are the majority of the corpus and they cannot be enumerated, so
   this is the only honest way to reach them. **Do not ship `<all_urls>`.**
 
+#### `optional_host_permissions` — decided 2026-09-02, and why it is not a hole in this rule
+
+The manifest declares `optional_host_permissions: ["https://*/*"]`. That reads close enough to
+`<all_urls>` to need saying out loud, so:
+
+- **Nothing is granted at install.** Optional permissions are a list of what the user *may* be
+  asked for. Firefox prompts per origin, and only from a click.
+- **The code can only ask for one origin: the backend URL in Settings.** `options.js` parses the
+  configured URL and requests exactly that origin — there is no path in the extension that
+  requests a wildcard, and `manifest.test.mjs` pins the shape of what may be declared.
+- **`content_scripts.matches` is untouched**, so declarative injection is still exactly the six
+  ATS hosts. Everything else still goes through `activeTab` behind a toolbar click. This rule's
+  actual subject — where autofill may run — did not move.
+- **`<all_urls>` is still never declared**, and it would additionally cover `http:`, `file:` and
+  `ws:`. The optional pattern is https-only, and `options.js` refuses a non-loopback `http://`
+  backend outright: every poll carries a bearer token, and sending it in the clear is the
+  mistake `COOKIE_SECURE` exists to prevent one layer up.
+
+The alternative was hard-coding the deployment's hostname in the manifest, which means a
+manifest edit and a reload every time the host changes, and cannot be written at all until a
+domain exists. That is not a safety property, it is a rebuild.
+
 ### 11. Autofill is assistive, not evasive
 
 It fills a form the user opened, with the user's own data, on their click, and never submits.
