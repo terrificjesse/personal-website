@@ -1378,7 +1378,8 @@ changes, so after the next uncapped run it points at a row that is on its way to
 
 1. **Keep 12a as shipped.** Coverage 38.7% → 65.0%, zero splits, zero true over-merges. It is a
    clear improvement and needs no revision.
-2. **Add a migration that re-keys existing rows and merges the 60 groups** — and that
+2. **Add a migration that re-keys existing rows and merges the affected groups** (18 or 60 —
+   reconcile the two measurements first; see below) — and that
    **repoints `internship_applications.posting_id` at the surviving row before deleting the
    loser**. Test it against the Roblox row specifically, by name: it is the one row in this
    database whose loss would be felt.
@@ -1390,13 +1391,31 @@ changes, so after the next uncapped run it points at a row that is on its way to
 any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
 id. Neither appeared in 1,828 rows.
 
-### A handoff that did not happen
+### Two measurements, and they do not agree on the count
 
-12a was asked to hand over a reproducible command and fixture for this measurement, and
-`861dce0` contains only `dedup.rs` and § C. The measurement was rebuilt here from scratch —
-about forty lines against a snapshot. Recorded not as a complaint but because the two-agent
-rule ("the person measuring the blast radius is not the person who wrote the key") only works
-if the handoff is part of the first task rather than a nice-to-have at the end of it.
+**Correction to an earlier claim in this section: the 12a handoff DID happen, and the first
+version of this write-up said it had not.** `861dce0` ships
+`dedup::tests::report_new_ats_key_merge_and_split_candidates` — an `#[ignore = "…"]` test —
+and § C documents the exact `sqlite3 .backup` command and invocation. It was missed by checking
+the commit's *file list* rather than reading § C, which is the file this task was told to read
+first. The error is worth keeping visible: it produced a public claim that another agent had
+skipped its work, from evidence that never supported it.
+
+Running Codex's tool against the same snapshot reports **18 merge candidates**, where the
+independent measurement above found **60 groups**. They measure different populations:
+
+| | This section's probe | `report_new_ats_key_merge_and_split_candidates` |
+|---|---|---|
+| Source of the URL | `internship_postings.canonical_url`, one per posting | `posting_sightings.url`, one per source per posting |
+| Population | all 1,828 postings | the 1,775 with at least one sighting |
+| Counts a group where one row already carries the new key | yes | apparently not |
+
+**The disagreement does not change the recommendation** — both report zero splits, every group
+either measurement prints is a duplicate rather than two different jobs, and the
+upsert-creates-a-new-row finding below is independent of either count. But **a migration would
+need the exact set**, not the direction, so reconciling the two is a prerequisite for step 2
+and not for the decision. The sighting-based population is the more faithful one to how
+collection actually keys a posting, and is where a reconciliation should start.
 
 ---
 
