@@ -4,10 +4,17 @@ Phase 8: a tool for running an internship hunt. Two tracks that share a backend 
 otherwise independent — an inbox agent that reads a burner Gmail (Track A), and a Firefox
 extension that fills applications and raises desktop alerts (Track B).
 
-**Only 8e is built.** This is the **what and where** for what exists, plus a map of the seams
-it left for the rest. Design *rules* live in `apps/hunt-extension/CLAUDE.md` — read that before
-changing anything here, because most of what looks like a detail below is a rule from that
-file made concrete. Phase status is `docs/PLAN.md` § Phase 8.
+**Status 2026-09-02: 8a–8g and Phase 9 are all built.** This file said *"only 8e is built"*
+until today, which stopped being true on 2026-08-30 and was never corrected — the reconciliation
+in task 10a is what found it. Two things are genuinely unfinished, and both are waiting on
+something other than code: **8b's checkpoint** needs a hand-labelled fortnight of real mail
+(Phase 13), and **the browser half of 8g** needs the extension loaded in Firefox against two
+live ATS forms (task 12g).
+
+This is the **what and where** for what exists, plus a map of the seams it left. Design *rules*
+live in `apps/hunt-extension/CLAUDE.md` — read that before changing anything here, because most
+of what looks like a detail below is a rule from that file made concrete. Phase status is
+`docs/PLAN.md` § Phase 8 and § Phases 10–13.
 
 **None of this is Learning Mode.** The user decided on 2026-08-29 that all of Phase 8 is
 `[gen]`, including the email classifier and the email→application matcher, both of which are
@@ -24,9 +31,17 @@ edited.
 | `POST /hunt/events/{id}/ack` — delivery receipt | ✅ idempotent |
 | Posting producer — tier-1/2 company posts something new | ✅ `internships::alerts` |
 | Firefox MV3 extension: alarm poll, notifications, popup, options | ✅ `apps/hunt-extension/` |
-| Verified in Firefox itself | ⬜ **not yet** — see "What is not proven" below |
-| Email producer — OA / interview / offer mail | ⬜ 8d, writes to the same table |
-| Gmail OAuth, sync, classify, match, labels | ⬜ 8a–8c |
+| Verified in Firefox itself | ✅ 2026-08-30 — see "Verified in Firefox" below |
+| Extension auth — `hunt_tokens` bearer, minted from the site | ✅ migration `0015` |
+| Email producer — OA / interview / offer mail | ✅ 8d (`95f0443`), same table, gated on `is_pressing()` |
+| Gmail OAuth, sync, classify, match | ✅ 8a–8b (`afe7c8c`), rules layer; **classifier checkpoint unmet** |
+| Gmail label writes | ✅ 8c (`f911f46`) — **on by default**, `INBOX_APPLY_LABELS=false` opts out |
+| Status proposals — every email-driven change is reviewable | ✅ 8c (`c976955`), `status_proposals` |
+| Auto-apply above a confidence threshold | ◐ built, **off by default** — no threshold set until 13e |
+| Unattended sync on an interval | ✅ Phase 9 (`c001445`), `INBOX_SYNC_INTERVAL_SECS`, `0` disables |
+| Proposals review panel on the internships tab | ✅ Phase 9, `InboxPanel.tsx` |
+| Inbox health visible in the extension popup | ✅ Phase 9, four distinct states |
+| 8b's measurement harness — export, grade, ledger | ✅ `src/inbox/labelset.rs` (`c05e710`) |
 | CV autofill on ATS pages | ✅ Greenhouse, Lever, Ashby — verified live 2026-08-30 |
 | Answer library | ◐ 8g — built; retrieval + the popup's request contract verified 2026-08-31, browser half unverified |
 
@@ -55,7 +70,7 @@ or its own notification code, something has gone wrong with this shape.
 | `id` | UUID text, like every other table here |
 | `kind` | `'posting'` \| `'email'`. The extension filters alert kinds on it, so "should cold outreach interrupt me" stays a client-side predicate rather than a schema change |
 | `user_id` | **NULL = from the shared posting corpus, visible to every signed-in user. NOT NULL = private to that user.** The email producer must always set it; a leak would require it to write NULL, which is a visible bug at the write site rather than a forgotten predicate at the read site |
-| `subject_id` | What the event is about, and the idempotency key: a posting id, or a Gmail message id in 8d. Polymorphic, so no `REFERENCES` clause is possible |
+| `subject_id` | What the event is about, and the idempotency key: a posting id, or a Gmail message id (8d). Polymorphic, so no `REFERENCES` clause is possible |
 | `title`, `body` | **Rendered, not structured.** One notification path serves both producers; each producer decides how its own event reads |
 | `url` | Where clicking goes. Nullable |
 | `payload_json` | The facts behind those two lines — company, tier, term, source — for the popup |
@@ -155,6 +170,77 @@ cargo run --release -- labelset score  --labels labelsets/aug.csv
 
 `labelsets/` is gitignored: the sheets hold real subject lines and snippets.
 
+## The inbox agent — `src/inbox/` (8a–8d, plus Phase 9)
+
+Track A. Reads a burner Gmail, decides what each message is, matches it to an application, and
+proposes what that means for the application's status. **The four email categories were already
+in the database before this existed** — Phase 7's `internship_applications.status` is
+`applied → oa → interview → offer → rejected` — so this never sorts mail into folders. It
+matches mail to a row and proposes a transition; Gmail labels are written afterwards as a
+*projection* of application status. Built the other way round you get two taxonomies that
+drift.
+
+### Modules
+
+| Module | What it is |
+|---|---|
+| `oauth` | Connecting the account and keeping the access token fresh |
+| `gmail` | The Gmail surface actually used. **Read-only by construction** — a test fails the build if a write call appears here |
+| `labels` | The **only** module that modifies a mailbox. Adds labels; never removes one (including its own), never archives, never touches a disregarded message |
+| `sync` | The pass: fetch, record, classify, count. Owns `inbox_runs`, and hosts both write decisions (`labelling_enabled`, `auto_apply_threshold`) |
+| `classify` | The rules layer. A pure function: email in, a constrained enum out, no tools, no SQL — rule 1 |
+| `advance` | Matching, and what an email may do to a status. Rules 2 and 3, pure, no database |
+| `labelset` | 8b's measurement harness. Tooling, not pipeline — documented above |
+
+### Tables (migration `0019`, plus `0020`)
+
+`gmail_accounts`, `inbox_runs`, `email_messages`, `email_verdicts`, `status_proposals`; `0020`
+adds `email_messages.labels_applied` and `labels_applied_at`, so *"which of my emails has this
+touched"* is answerable — worth being able to ask about the first thing in this project that
+changes someone else's account.
+
+`email_verdicts` is written for **every** message including disregarded ones (rule 7), and kept
+even when superseded, so a bad call is diagnosable rather than merely wrong — the same instinct
+as `posting_rejects` one subsystem over. `sync` pins the invariant
+`classified = pressing + confirmation + outreach + disregarded` (`sync.rs:62`): without it,
+*"correctly ignored 400 newsletters"* and *"ate an OA"* produce identical output.
+
+### Endpoints
+
+```
+GET  /auth/gmail/start                  CurrentUser -> consent redirect
+GET  /auth/gmail/callback               state cookie checked BEFORE the jar is cleared
+GET  /hunt/inbox/status                 connected account, last run, outcome
+POST /hunt/inbox/sync                   run a pass now (the interval worker is the normal path)
+POST /hunt/inbox/disconnect
+GET  /hunt/proposals                    pending only, newest first, joined to the causing email
+POST /hunt/proposals/{id}/accept        apply the status change, mark reviewed
+POST /hunt/proposals/{id}/reject        mark reviewed; undoes an auto-applied change
+```
+
+### The three environment variables that decide how much it may do
+
+| Variable | Default | Effect |
+|---|---|---|
+| `INBOX_SYNC_INTERVAL_SECS` | unset | The unattended pass. `0` disables. Spawned in `main.rs:93`, never called from a request handler |
+| `INBOX_APPLY_LABELS` | **on** | `false` or `0` stops all mailbox writes without touching anything else (`sync.rs:354`) |
+| `INBOX_AUTO_APPLY_CONFIDENCE` | **unset — nothing auto-applies** | A float in `0.0..=1.0`. Only forwards, and **never `offer` or `rejected` at any confidence** |
+
+The last two are the whole write-access posture, and the first default is the one Phase 10's
+task 10k asks you to confirm deliberately before the agent runs unattended on a deployed host.
+
+### Phase 9 — the parts that made it usable without an operator
+
+- **The interval worker** (`inbox::sync::spawn`), so a sync is not something you remember to
+  POST. Spawned rather than awaited: a slow Gmail cannot delay startup.
+- **The proposals panel** (`frontend/src/app/internships/InboxPanel.tsx`), showing the causing
+  email beside each proposed transition. Rule 2's audit trail is worthless if the only way to
+  read it is SQL.
+- **The inbox line in the extension popup** (`popup.js:597`), reporting *no account* / *no sync
+  yet* / *reconnected* / *failed, with the reason* as four distinct states. Rule 5 says a broken
+  sync must be visible, and the Gmail token's 7-day expiry is the difference between noticing in
+  an hour and noticing in a fortnight.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
@@ -226,9 +312,15 @@ revocation, which is explicit and visible.
 
 ## The auth path that did not work, kept for the record
 
-`host_permissions` for the backend origin plus `fetch(..., { credentials: "include" })` puts the
-ordinary `fridge_session` cookie on the request. Signed in on the site means signed in in the
-extension. **There is no extension token and no second auth path.**
+**Everything in this section is the superseded design, written in the present tense it was
+written in.** It is kept because the four failure modes below are still the four failure modes,
+and three of the four fixes are still live. Only the cookie half was replaced — by
+`hunt_tokens`, documented in the section above. Read this as history; read that as fact.
+
+The plan was: `host_permissions` for the backend origin plus `fetch(..., { credentials:
+"include" })` puts the ordinary `fridge_session` cookie on the request. Signed in on the site
+means signed in in the extension. ~~There is no extension token and no second auth path.~~
+There is; that sentence is exactly what stopped being true.
 
 ### Firefox does not grant `host_permissions` from the manifest
 
@@ -275,9 +367,12 @@ separate stored state rather than one "error":
 | `unauthenticated` | reachable, 401 | sign in on the site — **or this is the SameSite problem** |
 | `error` | reachable, unexpected status | read the status code |
 
-The remaining open question is the cookie: `fridge_session` is `SameSite=Lax` and a request
-from a `moz-extension://` page is cross-site. Host permissions exempt the request from CORS;
-whether Firefox also attaches a Lax cookie is what `unauthenticated` vs `ok` answers.
+**That open question is answered: Firefox does not attach it.** `fridge_session` is
+`SameSite=Lax`, a request from a `moz-extension://` page is cross-site, and the backend
+therefore answered a truthful 401 to a signed-in user. `hunt_tokens` is the recorded fallback,
+and the failure-state list above gained `no-token` and `token-rejected` — which is why two
+tables in this file name overlapping-but-different states: this one is the cookie era, the
+later one is current.
 
 ## Three rules worth not rediscovering
 
@@ -405,17 +500,66 @@ covers the embed.
 extension root — from `popup/popup.html`, `content/fields.js` became `popup/content/fields.js`.
 Chrome resolves from the root, which is why every example omits the leading slash.
 
-## Seams left for the rest of Phase 8
+## The answer library — `src/hunt/answers.rs` (8g)
 
-- **8d writes to `hunt_events`, it does not alter it.** `kind = 'email'`, `user_id` set,
-  `subject_id` = the Gmail message id. Nothing about the poll, the ack, or the extension's
-  notification path should need to change.
-- **The `email` alert kind already has a checkbox** in the options page and a filter in
-  `poll()`. It has no producer.
-- **The inbox tables are migration `0015`**, and Track B's `cv_profile` is `0016`.
-  `hunt_events` took `0014` because 8e needed it first.
+Questions you have already answered well, offered back when a form asks something close enough.
+
+**Tables** (migration `0018`): `application_answers` and `answer_revisions` — an edit keeps the
+prior text rather than overwriting it, because the reason to store an answer is that it was
+good once.
+
+```
+GET    /hunt/answers                    list
+POST   /hunt/answers                    save (question, answer, company)
+PATCH  /hunt/answers/{id}               edit — the old text becomes a revision
+DELETE /hunt/answers/{id}
+GET    /hunt/answers/{id}/revisions
+POST   /hunt/answers/{id}/used          usage, so "still good" is observable
+GET    /hunt/answers?q=…&company=…      retrieval — the shape `popup.js` actually builds
+```
+
+| Piece | What it does |
+|---|---|
+| `normalize_question` | Retrieval compares normalized question text, not raw markup |
+| `MIN_SIMILARITY` = `0.45` | Below this nothing is offered **at all**. A weak match is worse than none: it invites a glance rather than a read, and the failure mode here is pasting something that looked close enough |
+| `suggest` | `strsim::normalized_damerau_levenshtein`, chosen over embeddings because the corpus is tiny and the dependency already exists |
+| `detect_company_specific` | "Why do you want to work *here*" is not reusable; "a project you're proud of" is. Marked at save time from question markers, the answer text, and the company |
+| `MAX_QUESTION_LENGTH` / `MAX_ANSWER_LENGTH` | 2,000 / 20,000. Unbounded client text is a denial-of-service vector, not a feature — the blog's body cap, one subsystem over |
+
+**The seam is tested with the exact requests the popup builds** (`f17d983`). The extension and
+the routes meet in two languages with no compiler between them, and a renamed query parameter
+degrades to *no suggestions*, which is indistinguishable from an empty library. So
+`routes::hunt::answer_loop_tests` drives the real handlers with `popup.js`'s own `?q=` /
+`&company=` query string and its three-field save body, and asserts **both** directions: the
+company-specific answer is withheld from another company, and the reusable one is offered. A
+mutation that breaks the offering shows the withholding assertion still passing under it, which
+is why one direction alone would not have bitten.
+
+**What is still unverified is everything inside the browser**: whether `questions()` finds the
+free-text boxes on a real ATS form, whether `describePage()` names the employer, and whether
+Save and Suggest behave against a live page. That is task 12g, and it needs Firefox — jsdom
+would be a new dependency in a folder that is deliberately plain JS with no build step.
+
+## Seams — what was left for the rest of Phase 8, and what is left now
+
+- ~~**8d writes to `hunt_events`, it does not alter it.**~~ **Done, and the prediction held.**
+  `kind = 'email'`, `user_id` set, `subject_id` = the Gmail message id, emitted from
+  `sync.rs:222`. Nothing about the poll, the ack or the extension's notification path changed —
+  which is the two-producer shape paying for itself.
+- ~~**The `email` alert kind has no producer.**~~ It has one, behind
+  `verdict.category.is_pressing()` (`sync.rs:245`): an OA, an interview or an offer interrupts
+  you; a confirmation or cold outreach is labelled and recorded and does not.
+- **The migration numbers here were wrong** and contradicted this file's own prose in two
+  other places. Corrected 2026-09-02: `0014` `hunt_events`, `0015` `hunt_tokens`, `0017`
+  `cv_profile`, `0018` the answer library (`application_answers`, `answer_revisions`), `0019`
+  the inbox tables (`gmail_accounts`, `inbox_runs`, `email_messages`, `email_verdicts`,
+  `status_proposals`), `0020` `email_messages.labels_applied{,_at}`. (`0016` is
+  `blog_post_source_path` — a different tab entirely.) `hunt_events` took `0014` because 8e
+  needed it first, which is the only part of the original bullet that was true.
 - **The extension shows no internship list**, only alerts and a link out. Whether it should is
   an open question in `apps/hunt-extension/CLAUDE.md`.
-- **8b's checkpoint is waiting on mail, not on code.** `src/inbox/labelset.rs` is the harness
-  for it; the burner held 14 messages over 2 days with zero digests when it was written, so the
-  relevance gate still has nothing to measure against.
+- **8b's checkpoint is waiting on mail, not on code** — still true, and now scheduled.
+  `src/inbox/labelset.rs` is the harness; the burner held 14 messages over 2 days with zero
+  digests when it was written, and the six held-out messages that could be graded were spent by
+  being fixed against. Phase 10's deploy is what starts the corpus accumulating unattended, and
+  Phase 13 is where it gets labelled and graded. See `docs/PLAN.md` § Phases 10–13.

@@ -677,10 +677,29 @@ reading `applied` for a job you already interviewed at.
   so it cannot measure the relevance gate, which is the highest-volume decision in the system.
   Measure junk leaking into `Hunt/Outreach` and **real mail getting disregarded** separately;
   the second is the one that costs an interview.
-- [gen] **8c — Writes.** Gmail labels + `status_proposals`. *Checkpoint:* a late-arriving
-  autoresponder does not drag an interview back to `applied`.
-- [gen] **8d — The email producer.** Classified mail writes `hunt_events` rows. Depends on the
-  table, which 8e built.
+- [gen] **8c — Writes. — complete**, in two commits and in the order the build order demands:
+  `c976955` shipped the reversible half (`status_proposals` — propose a status change, never
+  make one silently), and `f911f46` shipped the irreversible-feeling half (Gmail labels,
+  creating them when they do not exist). Both halves are in `src/inbox/`; `labels.rs` is the
+  only module in the crate that modifies a mailbox, kept apart from the read-only `gmail.rs`
+  by a test that fails the build if a write call appears there.
+
+  *Checkpoint:* ⚠️ **met by test, not live.** `advance::rank` / `is_terminal` implement rule 3,
+  and `a_late_autoresponder_cannot_drag_an_interview_back_to_applied`
+  (`src/inbox/advance.rs:129`) pins it, alongside eleven siblings covering terminal arrivals,
+  same-status no-ops, and the auto-apply refusals. The live version of this checkpoint needs a
+  real late autoresponder to actually arrive, which is the same mail Phase 13 is waiting on.
+
+  **Two defaults chosen here that Phase 10 revisits:** label writing is **on** by default
+  (`INBOX_APPLY_LABELS=false` opts out — `sync.rs:354`), and auto-apply is **off** by default
+  (`auto_apply_threshold()` returns `None` unless `INBOX_AUTO_APPLY_CONFIDENCE` is set —
+  `sync.rs:414`). The second is this phase declining to guess a number 8b has not produced.
+- [gen] **8d — The email producer. — complete 2026-08-31** (`95f0443`). Pressing mail raises a
+  desktop alert through the channel 8e built: `sync.rs:222` emits a `kind = 'email'` event
+  keyed on the Gmail message id, gated on `verdict.category.is_pressing()` (`sync.rs:245`) so
+  only an OA, an interview or an offer interrupts you. It added a producer and changed nothing
+  about the table, the poll, the ack or the extension — which is what the two-producer shape
+  was for.
 - [gen] **8e — The extension shell, end to end. — complete 2026-08-30**
 - [gen] **8f — Autofill. — complete 2026-08-30**
 - [gen] **8g — The answer library. — checkpoint met at the HTTP layer 2026-08-31; the browser
@@ -894,15 +913,28 @@ either way), but it is the same shape of gap.
 
 ### Open questions
 
-- Should `Hunt/Outreach` raise a notification? **Currently no.** Cold outreach is high-volume
-  and low-precision, and a noisy channel gets muted wholesale, taking the OA alerts with it.
-  8e made this a one-line predicate plus an existing checkbox in the options page.
-- Confidence threshold for auto-apply — set it after 8b gives real numbers, not by guessing.
-- Does the extension need the internship *list*, or only alerts? 8e shipped alerts only.
-- How does an answer first get into the library? Cheapest: after a fill, offer to save what you
-  typed into the free-text boxes — also the version most likely to catch answers while good.
-- Does the answer library want embeddings, or is `strsim` over normalized question text enough?
-  Start with `strsim`; it is already a dependency and the corpus is tiny.
+Three of these were answered by the code that shipped; the answers are recorded here rather
+than left as questions, because an open question nobody closes is read as undecided forever.
+
+- **Should `Hunt/Outreach` raise a notification? Answered: no**, and it is now enforced rather
+  than merely intended — 8d's producer runs behind `verdict.category.is_pressing()`
+  (`src/inbox/sync.rs:245`), so outreach is labelled and recorded but never interrupts. Cold
+  outreach is high-volume and low-precision, and a noisy channel gets muted wholesale, taking
+  the OA alerts with it.
+- **Confidence threshold for auto-apply. Answered: deliberately unset.**
+  `auto_apply_threshold()` returns `None` unless `INBOX_AUTO_APPLY_CONFIDENCE` is set
+  (`src/inbox/sync.rs:414`), so nothing auto-applies today. Setting it is task 13e, after 8b's
+  checkpoint produces a real number — guessing it would invent the measurement it is meant to
+  come from.
+- **Does the answer library want embeddings, or is `strsim` enough? Answered: `strsim`**, and
+  it shipped — `strsim::normalized_damerau_levenshtein` over normalized question text, with a
+  floor below which nothing is offered at all (`src/hunt/answers.rs:243`). Revisit only if
+  real retrieval starts missing, not on principle.
+- Does the extension need the internship *list*, or only alerts? **Still open.** 8e shipped
+  alerts only and Phase 9 added an inbox-status line; neither made a list feel missing.
+- How does an answer first get into the library? **Still open.** Cheapest: after a fill, offer
+  to save what you typed into the free-text boxes — also the version most likely to catch
+  answers while they are still good.
 
 ---
 
@@ -928,11 +960,22 @@ being used is also what produces the corpus 8b's checkpoint needs, so this unblo
   meant a JSON endpoint nobody opens. The 7-day token expiry makes this the difference between
   noticing in an hour and noticing in a fortnight.
 
-### What this phase is not
+### What this phase is not — ~~held~~ **overtaken, 2026-08-31**
 
-Not the Gmail label writes. Those are 8c's remaining half and stay held until 8b has met a real
-corpus — write access to a mailbox on the strength of a classifier measured against ten
-messages is exactly what the build order exists to prevent.
+This said: *not the Gmail label writes; those are 8c's remaining half and stay held until 8b has
+met a real corpus.* They did not stay held. `f911f46` shipped them the same week, with
+`labelling_enabled()` **on by default**, and 8b's checkpoint is still unmet.
+
+Kept rather than deleted, because the disagreement is the useful part. The code's reasoning is
+recorded at `src/inbox/sync.rs:351` and is not unreasonable — the granted `gmail.modify` scope
+withholds permanent delete and send, `labels.rs` never removes a label, never archives and
+never touches a disregarded message, so the worst case is a visible, removable, wrong label on
+a message you can still find. That is a genuinely different risk from the one this paragraph
+was written about.
+
+But *the plan said held and the code says on*, and nobody reconciled the two until Phase 10a.
+**Task 10k makes it an explicit decision** before 10h puts the agent on a host that runs
+unattended against a real mailbox.
 
 ### Status — the code landed in `c001445`, the checkpoint was never written (recorded 2026-09-02)
 
