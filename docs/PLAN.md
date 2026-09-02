@@ -1378,8 +1378,16 @@ changes, so after the next uncapped run it points at a row that is on its way to
 
 1. **Keep 12a as shipped.** Coverage 38.7% → 65.0%, zero splits, zero true over-merges. It is a
    clear improvement and needs no revision.
-2. **Add a migration that re-keys existing rows and merges the affected groups** (18 or 60 —
-   reconcile the two measurements first; see below) — and that
+2. ~~Add a migration that re-keys existing rows and merges the affected groups~~ — **done,
+   `0025_rekey_ats_postings.sql`.** Applied to a copy: 1,828 → 1,764 postings, ATS-keyed
+   707 → 1,120, zero orphaned applications or sightings, and the Roblox application repointed
+   to its survivor. It is a generated list of literal ids rather than logic, because
+   `ats_identity` is Rust and a boot-time routine would decide at runtime what to merge. Three
+   defects surfaced by applying it to a copy rather than reading it: a UNIQUE collision from
+   claim-before-release (fixed with a two-phase swap through `rekey-0025:<id>`), a second from
+   rewriting both rows of a *refused* group to their shared key, and `sqlx::migrate!` embedding
+   at compile time so a changed `.sql` needs `touch src/main.rs` before it is really being
+   tested. The original recommendation to
    **repoints `internship_applications.posting_id` at the surviving row before deleting the
    loser**. Test it against the Roblox row specifically, by name: it is the one row in this
    database whose loss would be felt.
@@ -1390,6 +1398,30 @@ changes, so after the next uncapped run it points at a row that is on its way to
 **What would change this recommendation:** a non-zero true over-merge count, or evidence that
 any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
 id. Neither appeared in 1,828 rows.
+
+### The two counts, reconciled 2026-09-02
+
+Exactly, not plausibly. Their tool filters to the three parsers 12a added —
+`matches!(identity.ats.as_str(), "workday" | "workable" | "rippling")` — and treats every other
+sighting as keeping its stored key. The independent probe recomputes every key from each
+posting's canonical URL.
+
+| | Groups |
+|---|---|
+| Probe (all postings, canonical URL, any ATS) | **60** — greenhouse 46, workday 11, rippling 2, workable 1 |
+| Their tool (sightings, three new parsers only) | **18** |
+| In the probe only | **46** — every one Greenhouse, which their filter excludes by design |
+| In their tool only | **4** — Workday rows whose *sighting* URL yields an identity where the posting's canonical URL does not |
+
+60 − 46 = 14 shared, + 4 = **18**. The arithmetic closes; both tools are correct about different
+questions. Theirs measures *what 12a caused*. The probe measures *what the next collection run
+will do*, which is the question a migration has to answer — and the 46 Greenhouse groups are
+rows whose stored keys predate an earlier parser fix and were never back-applied.
+
+The third hypothesis on record — the 53 postings with no sighting — is **killed**: every
+probe-only group is explained by the ATS filter.
+
+**The definitive set is 60 groups**, of which the conservative rule merges **58** and refuses 2.
 
 ### Two measurements, and they do not agree on the count
 
