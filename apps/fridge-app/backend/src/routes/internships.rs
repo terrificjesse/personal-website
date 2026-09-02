@@ -186,6 +186,21 @@ pub async fn create_application(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Which résumé was sent. Checked before the insert so an unknown or archived variant is a
+    // 400 rather than a foreign-key error at the bottom of a transaction — and archived is
+    // refused deliberately: retiring a variant means "no longer sending this one", so attaching
+    // it to a new application would be recording something that did not happen.
+    if let Some(variant_id) = req.resume_variant_id.as_deref()
+        && !crate::hunt::variants::is_attachable(&pool, &user.id, variant_id)
+            .await
+            .map_err(|err| {
+                eprintln!("internships: checking a resume variant failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -203,9 +218,10 @@ pub async fn create_application(
              company_name, title, url, location_raw,
              pay_min, pay_max, pay_currency, pay_period,
              term_season, term_year, source, snapshot_json, snapshot_at,
-             status, applied_at, status_changed_at, notes, created_at, updated_at)
+             status, applied_at, status_changed_at, notes, created_at, updated_at,
+             resume_variant_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?16, ?16, ?18, ?16, ?16)",
+                 ?17, ?16, ?16, ?18, ?16, ?16, ?19)",
     )
     .bind(&id)
     .bind(&user.id)
@@ -225,6 +241,7 @@ pub async fn create_application(
     .bind(now)
     .bind(status.as_str())
     .bind(&notes)
+    .bind(&req.resume_variant_id)
     .execute(&mut *tx)
     .await;
 
@@ -1256,6 +1273,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: Some("first choice".into()),
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1289,6 +1307,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1324,6 +1343,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: Some("mine".into()),
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1351,6 +1371,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1388,6 +1409,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             })
         };
         let _ = create_application(State(pool.clone()), me.clone(), Credential::Session, req())
@@ -1409,6 +1431,7 @@ mod handler_tests {
                 posting_id: "nope".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await;
@@ -1522,6 +1545,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1535,6 +1559,7 @@ mod handler_tests {
                 posting_id: "p2".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1566,6 +1591,7 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1610,4 +1636,122 @@ mod handler_tests {
         );
     }
 
+
+    /// Attaching a résumé that is not yours, does not exist, or has been retired is a 400 —
+    /// checked before the insert, so it never reaches a foreign-key error mid-transaction.
+    #[tokio::test]
+    async fn a_variant_that_cannot_be_attached_is_a_bad_request_not_a_500() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let retired = crate::hunt::variants::create(
+            &pool,
+            &me.0.id,
+            crate::hunt::variants::NewVariant { label: "retired".into(), notes: None },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        crate::hunt::variants::edit(
+            &pool,
+            &me.0.id,
+            &retired.id,
+            crate::hunt::variants::EditVariant { label: None, notes: None, archived: Some(true) },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        for variant_id in ["does-not-exist".to_string(), retired.id.clone()] {
+            let result = create_application(
+                State(pool.clone()),
+                me.clone(),
+                Credential::Session,
+                Json(CreateApplicationRequest {
+                    posting_id: "p1".into(),
+                    status: None,
+                    notes: None,
+                    resume_variant_id: Some(variant_id.clone()),
+                }),
+            )
+            .await;
+            assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST), "{variant_id}");
+        }
+
+        // And nothing was written on the way to refusing.
+        let applications: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM internship_applications")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applications, 0);
+    }
+
+    #[tokio::test]
+    async fn an_application_records_the_variant_it_was_sent_with() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let variant = crate::hunt::variants::create(
+            &pool,
+            &me.0.id,
+            crate::hunt::variants::NewVariant { label: "one-page".into(), notes: None },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (_, Json(created)) = create_application(
+            State(pool.clone()),
+            me,
+            Credential::HuntToken,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+                resume_variant_id: Some(variant.id.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT resume_variant_id FROM internship_applications WHERE id = ?",
+        )
+        .bind(&created.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some(variant.id.as_str()));
+    }
+
+    /// The seam between `popup.js` and this handler, pinned the way 8g's was.
+    ///
+    /// The extension and these routes meet in two languages with no compiler between them. A
+    /// renamed field here degrades to an application that is silently *unattributed* — which
+    /// is indistinguishable from one where the user chose "Not recorded", and would go
+    /// unnoticed until a report months later showed everything in the "no variant" bucket.
+    ///
+    /// So this deserializes the exact body the popup builds, rather than a struct literal.
+    #[test]
+    fn the_popup_body_deserializes_into_the_request_the_handler_expects() {
+        // Exactly what popup.js sends when a variant is chosen.
+        let with_variant: CreateApplicationRequest = serde_json::from_str(
+            r#"{"posting_id":"p1","resume_variant_id":"v1"}"#,
+        )
+        .expect("the popup's body must deserialize");
+        assert_eq!(with_variant.posting_id, "p1");
+        assert_eq!(with_variant.resume_variant_id.as_deref(), Some("v1"));
+
+        // And what it sends when the empty "Not recorded" option is selected: the key is
+        // omitted entirely rather than sent as "", which would be a variant id of "".
+        let without: CreateApplicationRequest =
+            serde_json::from_str(r#"{"posting_id":"p1"}"#).expect("still valid");
+        assert_eq!(without.resume_variant_id, None);
+    }
 }

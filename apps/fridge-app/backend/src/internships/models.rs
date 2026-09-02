@@ -543,6 +543,9 @@ pub struct CreateApplicationRequest {
     /// Defaults to `applied` when omitted, which is what pressing "I applied" means.
     pub status: Option<String>,
     pub notes: Option<String>,
+    /// Which résumé was sent (Phase 12f). Optional, and an application without one stays
+    /// unattributed forever — see `docs/HUNT.md` § Résumé variants on why nothing guesses.
+    pub resume_variant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

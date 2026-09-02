@@ -765,6 +765,108 @@ that missing it costs the opportunity. `subject_id` is `"{deadline_id}:{lead_hou
 `HUNT_DEADLINE_LEAD_HOURS` (`72,24`). **A deadline already past raises nothing** — a "you
 missed it" notification is noise arriving exactly when it can no longer help.
 
+## Résumé variants (spec for 12f)
+
+**Written 2026-09-02 before any of it was built.** It crosses the backend↔extension seam, and
+that seam is in two languages with no compiler between them, so the shapes are settled here
+first and one lane writes both halves.
+
+### A variant is a label, not a file
+
+A `resume_variant` names a résumé the user maintains **outside this app** — "one-page, systems"
+— and nothing more. The application does not store, render, version or serve a PDF.
+
+**Storing the file is a different feature with a different risk, and it should be argued for on
+its own.** A résumé is the most identifying document most people own: full name, address,
+phone, school, employment history. This database already holds a Gmail refresh token, its
+backups already have to be treated as credential material, and it is about to sit on a public
+host. Adding résumés raises what a leak costs without changing what this feature answers —
+*which résumé gets replies* needs an identity, not the bytes.
+
+### Schema (migration `0024`)
+
+| Column | Notes |
+|---|---|
+| `resume_variants.id` | UUID text |
+| `user_id` | `REFERENCES users (id)` |
+| `label` | What the user calls it. `UNIQUE (user_id, label)` — two variants with one name make every report ambiguous |
+| `notes` | What is different about it. Free text, never parsed |
+| `created_at` | |
+| `archived_at` | NULL while in use. Retiring is this column, never a `DELETE` |
+| `internship_applications.resume_variant_id` | **Nullable**, `REFERENCES resume_variants (id)` |
+
+**Nullable is a decision, not laziness, and there is no backfill.** Every application that
+already exists was sent with a résumé nobody recorded. Assigning them a guess — the oldest
+variant, the most-used one — would put invented data into the only number this feature
+produces, and it would be indistinguishable from measurement. An unattributed application
+stays unattributed forever, and the reports must say "no variant" rather than silently dropping
+it.
+
+**A variant is not an `application_events` row.** It is an attribute of the application, not a
+transition: nothing happened to the application when the variant was chosen. Same reasoning
+that keeps nudges out of the event log.
+
+### Renaming and retiring, which is where this feature could delete its own evidence
+
+- **Attribution is by `id`, so a rename is an `UPDATE label` and history follows it.** This is
+  the reason the foreign key is on the id rather than on the label string — the obvious
+  shortcut of storing the name on the application would make "rename" mean "orphan every
+  application that used it".
+- **Retiring sets `archived_at`.** An archived variant is not offered for new applications and
+  still appears in every report that covers a window it was used in. A retired résumé is
+  exactly the thing you want to compare against.
+- **Deleting a variant that any application references is refused with a 409**, not cascaded.
+  Cascading would delete the evidence; nulling the column would silently convert measured rows
+  into unattributed ones, which is worse than an error message.
+
+### Endpoints
+
+```
+GET    /hunt/resume-variants          CurrentUser — active first, archived flagged
+POST   /hunt/resume-variants          { label, notes? }
+PATCH  /hunt/resume-variants/{id}     { label?, notes?, archived? }
+DELETE /hunt/resume-variants/{id}     204, or 409 when an application references it
+POST   /internships/applications      now accepts an optional resume_variant_id
+```
+
+### Where the variant is chosen, and why there
+
+**On the popup's "track this application" button**, which is the moment the user knows which
+résumé they just uploaded. Anything later asks them to remember, and an attribution built on
+recollection is worse than none — it looks like data.
+
+The rest of rule 10 is untouched: nothing new fires on page load, the content script's reach
+does not change, and the tracker row is still created only by an explicit click.
+
+### Built 2026-09-02, and the one gap it leaves
+
+Migration `0024`, `src/hunt/variants.rs`, four routes, and a variant picker on the popup's
+track offer. Verified through the real routes against a copy of the live database: a rename
+kept `application_count: 1`, and `DELETE` on a variant in use answered **409**.
+
+**There is no way to create a variant except the API.** The popup only *selects* among
+variants that already exist, because a popup is the wrong place to manage a list, and the site
+panel that would create them is frontend work this session did not own. Until it exists:
+
+```bash
+curl -X POST -H "Authorization: Bearer $HUNT_TOKEN" -H 'Content-Type: application/json'      -d '{"label":"one-page, systems"}' https://…/api/hunt/resume-variants
+```
+
+That is a real gap, not a deferral dressed up as one: with no variants defined, the picker
+never appears and every application stays unattributed — which is exactly what the feature
+looks like when it is switched off.
+
+### The reporting half is deliberately not here
+
+**12f stores the attribution; the `by_variant` breakdown in `GET /hunt/analytics` is a separate
+task in `src/routes/analytics.rs`** and is handed to whoever owns that file. It is one more
+grouping beside `by_source`, `by_tier` and `by_month`, sharing the same totals shape, and it
+must use `application_events::HAS_RESPONDED` like every other response question here.
+
+Recorded so the absence reads as a split rather than as something forgotten — and so that
+whoever writes it knows that **applications with no variant get their own bucket** rather than
+being dropped from the denominator, for the same reason `None` tier is `unknown` and not tier 3.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
