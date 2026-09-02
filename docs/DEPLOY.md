@@ -172,7 +172,7 @@ Each blocks or degrades something after deploy. None is written by this task.
 | What | Where | Why it matters |
 |---|---|---|
 | **The extension cannot reach a deployed backend.** `host_permissions` are exactly `localhost:8080` and `127.0.0.1:8080` | `apps/hunt-extension/manifest.json` | After deploy the extension reports `unpermitted` — Firefox MV3 grants host permissions per origin and the manifest never names the new one. Add the public origin, then re-grant via **Test connection**. Until then: no desktop alerts at all |
-| **The rate limiter cannot see the caller behind a proxy** | `apps/fridge-app/backend/src/rate_limit.rs` (10j, Codex) | See the risk table below. This is the one that can lock the user out |
+| ~~The rate limiter cannot see the caller behind a proxy~~ | `apps/fridge-app/backend/src/rate_limit.rs` | **Done 2026-09-02.** `X-Forwarded-For` is trusted only when the TCP peer is loopback, taking the last hop. From any other peer it is ignored, which is the property a direct-exposure deployment depends on |
 | **The tier file path is compiled in** | `src/internships/prestige.rs:97` | Resolve it from the executable's own directory or an env var instead of `CARGO_MANIFEST_DIR`, so the deployed layout stops being load-bearing |
 | ~~Three write paths still open *deferred* transactions~~ | `internships/expiry.rs`, `routes/auth.rs` ×2 | **Done, and the original claim here was too strong.** Measured: all three passed under contention as they were, because a deferred transaction whose *first* statement is a write takes the lock there and the busy handler waits. The instant-failure case (`SQLITE_BUSY_SNAPSHOT`, no wait) is specific to **read-then-write** transactions — which is what `decide` was, and why it lost 5 of 8 concurrent writes. All three now use `db::begin_write` so that a future edit adding a SELECT above the first write cannot silently reintroduce it |
 
@@ -248,12 +248,18 @@ Caddy, the TCP peer is always `127.0.0.1`, so:
 `rate_limit.rs`'s own module docs name the proxy sharing; this is what it costs once a proxy
 exists.
 
-**Recommended, in order:** (1) teach the limiter to trust `X-Forwarded-For` **only** when the
-peer is loopback, taking the last hop — the proxy is the only thing that can reach the backend,
-so the header is trustworthy exactly there; (2) until then, raise the login IP bucket well above
-the account bucket so it stops being the binding constraint; (3) do not simply drop the IP
-bucket — it is what stops one client spraying account names. The Caddyfile already sets both
-forwarded headers so (1) is a backend change alone.
+**Resolved 2026-09-02.** The limiter now trusts `X-Forwarded-For` only when the TCP peer is
+loopback, and takes the last hop. Two properties keep that honest, and both matter:
+
+- **From a non-loopback peer the header is ignored entirely**, so a directly-exposed
+  deployment is exactly as safe as before. This is the assertion to keep if the file is ever
+  rewritten — `a_forwarded_header_is_ignored_from_a_remote_peer`.
+- **`deploy/Caddyfile` sets the header rather than appending to it**, so a header forged by a
+  remote client does not survive the hop. If the proxy is ever swapped for one that appends,
+  the last-hop rule still holds, but check that assumption rather than inheriting it.
+
+The per-account bucket is untouched — it is what actually protects the password, and it was
+never the part the proxy broke.
 
 ---
 
