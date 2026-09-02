@@ -444,26 +444,74 @@ The strongest key is not the company name or the title — it is the **(ats, boa
 job_id)** triple, which is recoverable from *both* sides of the join because the GitHub lists
 link directly at the ATS:
 
-| ATS | Simplify `url` shape | API identity |
+| ATS | Observed posting-URL shape | Identity recovered from the URL |
 |---|---|---|
 | Greenhouse | `job-boards.greenhouse.io/{slug}/jobs/{id}` | `{slug}` + `id` |
 | Lever | `jobs.lever.co/{site}/{uuid}[/apply]` | `{site}` + `id` (uuid) |
 | Ashby | `jobs.ashbyhq.com/{org}/{uuid}[/application]` | `{org}` + `id` (uuid) |
 | SmartRecruiters | `jobs.smartrecruiters.com/{co}/{id}-{slug}` | `{co}` + `id` |
-| Workday | `{tenant}.wd{N}.myworkdayjobs.com/…/{path}_{JR…}` | tenant + `jobReqId` |
+| Workday jobs host | `{tenant}.wd{N}.myworkdayjobs.com/[locale/]{site}/job/…/{slug}_{id}` | `{tenant}.wd{N}` + the full suffix after the first `_` |
+| Workday site host | `wd{N}.myworkdaysite.com/[locale/]recruiting/{tenant}/{site}/job/…/{slug}_{id}` | `{tenant}.wd{N}` + the full suffix after the first `_` |
+| Workable | `apply.workable.com/{account}/j/{10-hex-id}[/apply]` | `{account}` + `id` |
+| Rippling | `ats.rippling.com/[locale/]{company}/jobs/{uuid}` | `{company}` + `uuid` |
 
-This is an exact key with no fuzzy matching, and it covers **73% of Simplify listings (58% of
-active ones)**.
+This is an exact key with no fuzzy matching. The original source/host count projected that it
+could cover **73% of Simplify listings (58% of active ones)**, but the Phase 7 real run measured
+only ~35% before the Workday, Workable and Rippling parsers existed. Task 12b owns the new
+measurement; do not turn the projection into a result before that independent check runs.
 
 **Normalize the URL before extracting**, or the join silently misses:
 
-- **Trailing action segments**: Lever appends `/apply` (579 records), Ashby appends
-  `/application`. 94 of 1,881 active records end in `/apply`.
+- **Trailing action segments**: Lever and Workable append `/apply`; Ashby appends
+  `/application`. Lever accounts for the previously measured 579 records, and Workable has
+  both forms for the same job in the current database.
 - **Query strings**: 544 records carry `?gh_jid=…`, 574 `?mobile=…`, 339 `?ats=…`, plus
   `?embed`, `?job`, `?nl`. Strip the query entirely before comparing.
 - **Two Greenhouse hosts**: `job-boards.greenhouse.io` (1,244) and `boards.greenhouse.io` (179)
   are the same board. Canonicalize the host.
 - **Workday's locale segment** (`/en-US`) appears in browse URLs and must come off.
+
+#### URL shapes verified while adding the missing identities (2026-09-02)
+
+These parsers were built from the read-only local posting corpus, not invented examples. It
+contained **384 Workday**, **19 Workable**, and **18 Rippling** stored posting URLs. Workable's
+job token is an observed ten-character uppercase hexadecimal string; Rippling uses a UUID and
+appears both with and without `/en-GB`; identical Rippling and Workable jobs occur in both URL
+forms, which verifies that locale and trailing-action removal are identity-preserving.
+
+Workday needs two cautions that the earlier table missed:
+
+- `myworkdaysite.com` does not necessarily put a tenant before the shard. The observed form is
+  `wd3.myworkdaysite.com/recruiting/magna/Magna/job/…`; the tenant has to come from the
+  `recruiting/{tenant}` path. The parser also accepts the tenant-hosted form already recognized
+  by board discovery. Task 12a changes identity only: `sources::simplify::board_of` still reads
+  the first two host labels for the bare-shard form and therefore derives
+  `wd3.myworkdaysite`, not `magna.wd3`. That discovery gap must be fixed separately before
+  those boards can be polled by tenant.
+- All 384 observed final path segments have one display/id separator `_`; 11 have another
+  underscore **inside** the identity (`R_12318`, `REQ_0000080335-1`). Split on the first,
+  never the last. Same-title URLs in the corpus whose suffixes differ only by `-1` or `-2`
+  suggest those endings can be route disambiguation, but the URL alone cannot tell that case
+  from a requisition id that genuinely contains a final hyphen-number. The parser preserves it
+  and keeps the shard in `{tenant}.wd{N}`. Both choices can under-merge; neither can collapse
+  two jobs on an assumption the URL does not prove. That is the deliberate side of the error
+  direction for this table.
+
+Task 12b can measure the blast radius without collecting or touching the live database. The
+fixture is the consistent SQLite backup `/tmp/fridge-12b-copy.db`; the ignored test opens it
+read-only, reports one-new-key/multiple-row merge candidates, and separately reports
+one-stored-row/multiple-key split candidates. Run exactly from the `pw-lane-ab` worktree root
+(the live, gitignored database remains in the sibling main worktree):
+
+```sh
+sqlite3 -readonly ../personal-website/apps/fridge-app/backend/fridge.db ".backup '/tmp/fridge-12b-copy.db'"
+cd apps/fridge-app/backend
+REKEY_FIXTURE_DB=/tmp/fridge-12b-copy.db cargo test internships::dedup::tests::report_new_ats_key_merge_and_split_candidates -- --ignored --nocapture
+```
+
+The 12a author deliberately did **not** run that ignored test: 12b is the independent
+merge/split measurement. Normal unit tests use the real URL strings above without reading a
+database.
 
 **Verified caveat:** the join is not lossless. An `active: true` Simplify record pointed at
 Greenhouse board `mcghealth` job `8350486002`; the board's list endpoint returned 200 while
