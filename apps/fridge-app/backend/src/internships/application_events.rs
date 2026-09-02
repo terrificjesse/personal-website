@@ -197,6 +197,9 @@ application-events — rebuild the append-only application status history
 
   application-events backfill
       Reconstruct application_events in one transaction from proposals and tracker timestamps.
+
+  application-events verify
+      Assert that every non-empty event history folds to its application's cached status.
 ";
 
 /// Dispatch for the `application-events` server-binary subcommand.
@@ -220,11 +223,100 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
             Ok(())
         }
         "backfill" => bail!("application-events backfill takes no arguments"),
+        "verify" if args.len() == 1 => {
+            let report = verify_invariant(pool).await?;
+            println!(
+                "application-events invariant: {} covered, {} exempt, {} mismatches",
+                report.covered,
+                report.exempt,
+                report.mismatches.len(),
+            );
+            for mismatch in &report.mismatches {
+                eprintln!(
+                    "application {}: status={}, fold(events)={}",
+                    mismatch.application_id,
+                    mismatch.status.as_str(),
+                    mismatch.folded_status.as_str(),
+                );
+            }
+            if report.mismatches.is_empty() {
+                Ok(())
+            } else {
+                bail!(
+                    "{} application statuses disagree with their event fold",
+                    report.mismatches.len()
+                )
+            }
+        }
+        "verify" => bail!("application-events verify takes no arguments"),
         other => {
             print!("{USAGE}");
             bail!("unknown application-events command: {other}")
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldMismatch {
+    pub application_id: String,
+    pub status: ApplicationStatus,
+    pub folded_status: ApplicationStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvariantReport {
+    /// Applications with at least one event, whether they agree or not.
+    pub covered: u64,
+    /// Applications with no events. The Phase 10 contract explicitly exempts these.
+    pub exempt: u64,
+    pub mismatches: Vec<FoldMismatch>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct FoldRow {
+    id: String,
+    status: String,
+    folded_status: Option<String>,
+}
+
+/// Check `status == fold(events)` for every application with at least one event.
+///
+/// The correlated subquery is deliberately the literal fold definition in reverse: newest
+/// `at`, then newest `created_at`, then greatest `id`. `LIMIT 1` is therefore exactly the
+/// final `to_status` from the ascending definition, including deterministic ties.
+pub async fn verify_invariant(pool: &SqlitePool) -> Result<InvariantReport> {
+    let rows = sqlx::query_as::<_, FoldRow>(
+        "SELECT a.id, a.status,
+                (SELECT e.to_status
+                   FROM application_events e
+                  WHERE e.application_id = a.id
+                  ORDER BY e.at DESC, e.created_at DESC, e.id DESC
+                  LIMIT 1) AS folded_status
+           FROM internship_applications a
+          ORDER BY a.id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut report = InvariantReport::default();
+    for row in rows {
+        let status = parse_status(&row.status, "application status", &row.id)?;
+        let Some(folded_raw) = row.folded_status else {
+            report.exempt += 1;
+            continue;
+        };
+        report.covered += 1;
+        let folded_status = parse_status(&folded_raw, "event to_status", &row.id)?;
+        if status != folded_status {
+            report.mismatches.push(FoldMismatch {
+                application_id: row.id,
+                status,
+                folded_status,
+            });
+        }
+    }
+
+    Ok(report)
 }
 
 /// Reconstruct all provable history atomically.
@@ -715,5 +807,117 @@ mod tests {
             .expect("cause accepted");
         }
         tx.commit().await.expect("commit");
+    }
+
+    async fn insert_raw_event(
+        pool: &SqlitePool,
+        id: &str,
+        application_id: &str,
+        at: &str,
+        created_at: &str,
+        to_status: ApplicationStatus,
+    ) {
+        sqlx::query(
+            "INSERT INTO application_events
+                (id, application_id, at, created_at, from_status, to_status, actor,
+                 cause_kind, cause_id, note)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'unknown', NULL, NULL, NULL)",
+        )
+        .bind(id)
+        .bind(application_id)
+        .bind(at)
+        .bind(created_at)
+        .bind(to_status.as_str())
+        .execute(pool)
+        .await
+        .expect("event");
+    }
+
+    #[tokio::test]
+    async fn invariant_uses_every_tie_breaker_reports_mismatches_and_exempts_empty_histories() {
+        let pool = pool().await;
+        insert_user(&pool).await;
+        insert_application(
+            &pool,
+            "ordered",
+            ApplicationStatus::Rejected,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        insert_application(
+            &pool,
+            "mismatch",
+            ApplicationStatus::Applied,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        insert_application(
+            &pool,
+            "empty",
+            ApplicationStatus::Applied,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        // `at` beats created_at: this was written later, but describes an earlier transition.
+        insert_raw_event(
+            &pool,
+            "z-earlier-at",
+            "ordered",
+            "2026-01-01T00:00:00Z",
+            "2026-01-09T00:00:00Z",
+            ApplicationStatus::Offer,
+        )
+        .await;
+        // At the greatest `at`, created_at breaks the first tie.
+        insert_raw_event(
+            &pool,
+            "z-earlier-created",
+            "ordered",
+            "2026-01-02T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            ApplicationStatus::Oa,
+        )
+        .await;
+        // With both timestamps tied, lexical id order is the final deterministic tie-breaker.
+        insert_raw_event(
+            &pool,
+            "a-final-tie",
+            "ordered",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            ApplicationStatus::Interview,
+        )
+        .await;
+        insert_raw_event(
+            &pool,
+            "z-final-tie",
+            "ordered",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            ApplicationStatus::Rejected,
+        )
+        .await;
+        insert_raw_event(
+            &pool,
+            "mismatch-event",
+            "mismatch",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        let report = verify_invariant(&pool).await.expect("invariant report");
+        assert_eq!(report.covered, 2);
+        assert_eq!(report.exempt, 1);
+        assert_eq!(
+            report.mismatches,
+            vec![FoldMismatch {
+                application_id: "mismatch".into(),
+                status: ApplicationStatus::Applied,
+                folded_status: ApplicationStatus::Oa,
+            }]
+        );
     }
 }
