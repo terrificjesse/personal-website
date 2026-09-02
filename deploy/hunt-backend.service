@@ -1,0 +1,58 @@
+# Backend: Rust/axum, serving the fridge app, the blog, the internship tab and the hunt
+# alert channel. Install to /etc/systemd/system/hunt-backend.service.
+#
+# The path below is deliberately NOT a dated release directory. `CompanyTiers::load()`
+# resolves its data file against `env!("CARGO_MANIFEST_DIR")` — the path the binary was BUILT
+# in — so a layout that builds in `releases/<date>/` and then prunes old releases leaves the
+# compiled-in path dangling. The tier file then fails to load, prestige silently becomes
+# derived-only, and the tier-1/2 alert predicate stops firing. The symptom is no
+# notifications, which is indistinguishable from a quiet job market.
+# See docs/DEPLOY.md § The build path is load-bearing.
+
+[Unit]
+Description=Hunt backend (axum)
+Documentation=file:///srv/hunt/app/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hunt
+Group=hunt
+WorkingDirectory=/srv/hunt/app/apps/fridge-app/backend
+
+# Secrets live outside every checkout, mode 600, owned by the service user.
+EnvironmentFile=/etc/hunt/backend.env
+
+# Refuse to start on a misconfiguration rather than booting into one. A non-zero exit here
+# fails the unit with the reason in the journal.
+ExecStartPre=/srv/hunt/app/deploy/preflight.sh /etc/hunt/backend.env
+
+ExecStart=/srv/hunt/app/apps/fridge-app/backend/target/release/fridge_backend
+
+Restart=on-failure
+RestartSec=5s
+# Five failures inside a minute stops the retry loop rather than hammering a broken config.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hunt-backend
+
+# The database is the record of a hunt in progress. It lives here, not in the checkout, and
+# this is the only path the service may write.
+StateDirectory=hunt
+ReadWritePaths=/var/lib/hunt
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
