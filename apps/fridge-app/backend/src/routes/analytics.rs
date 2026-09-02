@@ -22,6 +22,11 @@
 //! nudge producer cannot disagree. That predicate excludes the earliest event rather than
 //! treating every NULL `from_status` as creation: a provenance-unknown backfill transition
 //! also has a NULL `from_status`, and it is still a real response.
+//!
+//! The mutable application status has one deliberately narrow role here: an application
+//! created directly as `offer` or `rejected` has no event *after* creation, but it is already
+//! closed and therefore cannot be called silent. Current status gates the two no-response
+//! buckets only; response and conversion remain derived from event history.
 
 use std::collections::BTreeMap;
 
@@ -100,6 +105,7 @@ struct AnalyticsRow {
     company_name: String,
     source: Option<String>,
     applied_at: DateTime<Utc>,
+    application_status: String,
     _posting_id: Option<String>,
     has_responded: i64,
     event_id: Option<String>,
@@ -119,6 +125,7 @@ struct ApplicationFacts {
     company_name: String,
     source: Option<String>,
     applied_at: DateTime<Utc>,
+    current_status: ApplicationStatus,
     has_responded: bool,
     events: Vec<EventFact>,
 }
@@ -187,6 +194,7 @@ async fn build_analytics(
                 a.company_name,
                 a.source,
                 a.applied_at,
+                a.status AS application_status,
                 p.id AS _posting_id,
                 CASE WHEN {HAS_RESPONDED} THEN 1 ELSE 0 END AS has_responded,
                 history.id AS event_id,
@@ -270,11 +278,19 @@ fn group_rows(rows: Vec<AnalyticsRow>) -> Result<Vec<ApplicationFacts>> {
             .map(|application| application.id.as_str())
             != Some(row.application_id.as_str())
         {
+            let status = ApplicationStatus::parse(&row.application_status).ok_or_else(|| {
+                anyhow!(
+                    "invalid application status {:?} for {}",
+                    row.application_status,
+                    row.application_id
+                )
+            })?;
             applications.push(ApplicationFacts {
                 id: row.application_id.clone(),
                 company_name: row.company_name,
                 source: row.source,
                 applied_at: row.applied_at,
+                current_status: status,
                 has_responded: row.has_responded != 0,
                 events: Vec::new(),
             });
@@ -322,6 +338,11 @@ fn metrics_for(
         .transpose()?;
     let responded = application.has_responded;
     let is_dead = now - application.applied_at > Duration::days(i64::from(dead_after_days));
+    let eligible_no_response = !responded
+        && !matches!(
+            application.current_status,
+            ApplicationStatus::Offer | ApplicationStatus::Rejected
+        );
     let reached_oa = events_after_creation.iter().any(|event| {
         matches!(
             event.to_status,
@@ -347,8 +368,8 @@ fn metrics_for(
 
     Ok(ApplicationMetrics {
         responded,
-        no_response_live: !responded && !is_dead,
-        no_response_dead: !responded && is_dead,
+        no_response_live: eligible_no_response && !is_dead,
+        no_response_dead: eligible_no_response && is_dead,
         reached_oa,
         reached_interview,
         offers,
@@ -633,6 +654,58 @@ mod tests {
                 + analytics.totals.no_response_dead,
             analytics.totals.applications
         );
+    }
+
+    #[tokio::test]
+    async fn applications_created_terminal_are_never_no_response() {
+        let pool = pool().await;
+        let now = instant("2026-09-01T00:00:00Z");
+
+        for (id, age, status) in [
+            ("created-rejected", 100, ApplicationStatus::Rejected),
+            ("created-offer", 10, ApplicationStatus::Offer),
+        ] {
+            let applied_at = now - Duration::days(age);
+            insert_application(
+                &pool,
+                ApplicationFixture {
+                    id,
+                    company: "Example Co",
+                    source: Some("simplify"),
+                    status,
+                    applied_at,
+                },
+            )
+            .await;
+
+            // POST /internships/applications records the requested initial status on the
+            // creation event. The general fixture starts at `applied` so later transitions
+            // can be added; update this event to reproduce the direct-terminal path exactly.
+            sqlx::query(
+                "UPDATE application_events SET to_status = ?1 WHERE application_id = ?2",
+            )
+            .bind(status.as_str())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("terminal creation event");
+        }
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            now,
+        )
+        .await;
+
+        assert_eq!(analytics.totals.applications, 2);
+        assert_eq!(analytics.totals.responded, 0);
+        for totals in all_totals(&analytics) {
+            assert_eq!(totals.no_response_live, 0);
+            assert_eq!(totals.no_response_dead, 0);
+        }
     }
 
     #[tokio::test]
