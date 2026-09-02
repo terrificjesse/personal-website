@@ -1399,6 +1399,45 @@ changes, so after the next uncapped run it points at a row that is on its way to
 any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
 id. Neither appeared in 1,828 rows.
 
+### 0025 verified against a real collection run, 2026-09-02
+
+The migration was argued for on a claim about `upsert_posting`, verified against copies and
+against the schema, and applied to the real database — but never watched during a collection,
+which is the only thing that could show the claim was wrong. A capped run (Simplify only, board
+cap 2) against a snapshot of the post-0025 database:
+
+```
+fetched 2,763 · accepted 1,328 · postings_created 79 · postings_updated 1,249
+```
+
+**335 of the 413 re-keyed postings were re-seen and updated rather than duplicated**, and all
+413 are still present. That is the premise confirmed on live data: without 0025 those 335 would
+have computed a key no row held and been inserted as new rows, with the originals left to
+expire.
+
+Postings sharing a canonical URL went **24 → 25**. Exactly one duplicate appeared, and it is the
+interesting one.
+
+### The refusal has a cost, and it is self-healing
+
+The new duplicate is `ats:workday:nwis.wd12:JR101733` — the ATS-keyed row for a job the two
+stale `co:`-keyed **Nightwing** rows already represent. That is one of the two groups 0025
+deliberately refused to merge.
+
+**Refusing to merge does not leave things as they were.** It leaves rows carrying keys that no
+longer match what the collector computes, so the next run inserts the ATS-keyed row alongside
+them. The choice was never "merge or leave alone"; it was "merge, or gain one row per refused
+group at the next collection".
+
+That is still the right call, and the end state is correct without a risky merge: the new
+`ats:` row is the one future runs update, the two `co:` rows go stale, and expiry removes them.
+The cost is a transient duplicate and the loss of the old rows' sighting history — acceptable
+here because **no application points at either of them**. Had one done so, this would need the
+repointing 0025 does for the merged groups, and the refusal would have been the wrong call.
+
+Tower Research stayed at 3 rows this run: its posting was not re-fetched under the board cap.
+Expect the same one-row addition there on a run that reaches it.
+
 ### The two counts, reconciled 2026-09-02
 
 Exactly, not plausibly. Their tool filters to the three parsers 12a added —
