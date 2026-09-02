@@ -533,6 +533,154 @@ task 10k asks you to confirm deliberately before the agent runs unattended on a 
   sync must be visible, and the Gmail token's 7-day expiry is the difference between noticing in
   an hour and noticing in a fortnight.
 
+## The analytics contract (spec for Phase 11)
+
+**Written 2026-09-02 as task 11a, before any of it is built**, so 11b (the endpoint), 11c (the
+panel) and 11d (the second slice) can be picked up by either agent from this section alone.
+
+**The analytics layer reads and never writes.** `GET /hunt/analytics` runs entirely over
+`application_events` joined to `internship_applications`; it creates no table, no column and no
+row. The one Phase 11 task that *does* write is 11e's nudge producer, which appends to
+`hunt_events` and is specified at the end of this section — keeping those two facts apart is
+what stops "analytics" quietly growing a writer.
+
+### Why this needs the event log at all
+
+The single question that justifies the whole of Phase 10: **an application that went
+`applied → oa → rejected` did reach OA.** `internship_applications.status` says `rejected` and
+cannot say anything else. Every conversion number below is computed from the *maximum stage
+ever reached*, which only the log knows.
+
+### The endpoint
+
+```
+GET /hunt/analytics?from=<RFC3339>&to=<RFC3339>&dead_after_days=<n>   CurrentUser
+```
+
+```jsonc
+{
+  "window": { "from": "…", "to": "…", "dead_after_days": 45 },
+  "totals": {
+    "applications": 128,
+    "responded": 41,          // reached any stage past `applied`
+    "no_response_live": 52,   // silent, younger than dead_after_days
+    "no_response_dead": 35,   // silent, older than it
+    "reached_oa": 24,
+    "reached_interview": 12,
+    "offers": 2,
+    "rejected": 29            // an explicit rejection, which IS a response
+  },
+  "time_to_first_response_days": { "median": 6.0, "p90": 21.0, "n": 41 },
+  "by_source":  [ { "key": "simplify",  "…totals…": {} } ],
+  "by_tier":    [ { "key": "1",  "…totals…": {} }, { "key": "unknown", "…": {} } ],
+  "by_month":   [ { "key": "2026-08", "…totals…": {} } ]
+}
+```
+
+Every breakdown carries the **same totals shape** as the top level, so the panel renders one
+component three times and a future breakdown costs nothing. `limit`-style paging is not needed:
+the cardinality is bounded by sources (~8), tiers (4) and months.
+
+### The definitions, which are the actual work
+
+Each of these has a plausible wrong answer that makes the funnel flatter — that is, more
+flattering — than reality.
+
+**A RESPONSE is the first event after creation whose `to_status` is not `applied`, whatever the
+actor.** Not "an email-driven transition": the employer replied whether the evidence arrived in
+the burner inbox or you typed it in after a phone call, and scoring only what the classifier
+caught would measure the classifier, not the hunt. The actor still matters — for *"how often do
+I accept what the classifier proposes"*, which is 13e's question and a different query over the
+same rows.
+
+**A rejection is a response.** Counting only positive outcomes as responses would report a
+response rate made of good news. `rejected` appears in both `responded` and `rejected`.
+
+**NO RESPONSE is not REJECTED, and the two must never be summed.** A silent application is its
+own bucket. Collapsing them is the standard way a job-hunt tracker lies in the flattering
+direction: it converts *"nobody replied"* — which is information about your applications — into
+*"they said no"*, which is information about employers.
+
+**DEAD is derived, never stored: no response, and created more than `dead_after_days` ago.**
+Default 45, and it is a query parameter rather than a constant because the honest value depends
+on the season and nobody knows it yet. Dead is not a status, nothing writes it, and an
+application that answers after 60 days simply stops being dead. **`dead` and `closed` are
+different**: an application with a terminal status (`offer`/`rejected`) is closed and is never
+counted as dead.
+
+**CONVERTED is computed from the maximum stage ever reached, not the current status.**
+`reached_oa` counts every application that was ever at `oa` or beyond, including those later
+rejected. Two rates are reported and never multiplied together into one "success rate":
+interview rate and offer rate. A single blended number hides which stage you are actually
+losing at, which is the only thing this panel is for.
+
+**An expired posting is not an ended application.** `internship_postings.expired_at` describes
+the market; `internship_applications` is the record of what you did. The join to the posting is
+`LEFT` and enrichment-only — an `INNER JOIN` here silently drops applications whose posting was
+pruned, which is trap 1 in `routes/internships.rs` arriving through a new door.
+
+### Cohort semantics — `from`/`to` filter the APPLICATION, not the event
+
+The window is compared against `internship_applications.applied_at`. An application made in June
+that reaches interview in September belongs to **June's** cohort in every metric, including
+September's report.
+
+Filtering on event time instead is the tempting mistake, and it produces a September row with
+interviews in the numerator and no denominator — a conversion rate above 100%, or worse, one
+just under it that looks plausible.
+
+### Time to first response
+
+Median and p90 of `(first response event.at − creation event.at)` in days, over applications
+that responded. `n` is reported beside them so a median over four applications is visibly a
+median over four applications.
+
+**Median, not mean**: one company replying after seven months should not move the number that
+tells you whether a week of silence is normal.
+
+### Timezones — where the boundary is
+
+Everything stored is UTC (RFC3339, as every timestamp in this schema). `from`/`to` are parsed as
+UTC instants; a malformed value is a **400**, never a silent default — the same rule the
+`?sort=` enum follows one tab over.
+
+**`by_month` buckets in UTC**, and the frontend renders labels in local time. This is wrong by
+up to a day for applications made late in the evening, which is accepted: the alternative is a
+`tz` parameter threaded through every bucket, and month boundaries are not a decision anyone
+makes an hour before midnight. If that ever matters, it is a parameter, not a rewrite.
+
+### 11e's nudge producer — and the migration nobody has budgeted for
+
+The trap `docs/PLAN.md` § Phase 11 names is real, and there is a second one under it.
+
+**The key.** `hunt_events` has `UNIQUE (kind, subject_id)`, which is what makes alert dedup
+structural rather than a caller remembering to check. A nudge at 14 days and a nudge at 30 days
+for the same application are legitimately different events, so:
+
+```
+kind       = 'nudge'
+subject_id = "{application_id}:{threshold_days}"
+```
+
+Keyed on the application alone you get one nudge ever; keyed on something that varies per sweep
+you get one nudge per sweep, which is how a channel gets muted — taking the OA alerts with it.
+
+**The cost nobody has counted:** `kind` is `CHECK (kind IN ('posting', 'email'))`, and **SQLite
+cannot alter a CHECK constraint**. Adding `'nudge'` means a full table rebuild — create, copy,
+drop, rename — on the alert channel itself. That migration must preserve `acked_at` exactly:
+losing it re-raises every historical alert at once, which is the single failure the entire ack
+design exists to prevent. Take a backup first (`ops/backup-fridge-db.sh`), and pin the
+before/after row counts and the `acked_at` non-null count in the migration's test.
+
+Do **not** dodge this by reusing an existing kind. The extension filters alert kinds on `kind`
+and the options page has a checkbox per kind; a nudge filed under `'email'` gets muted along
+with cold outreach, which is exactly backwards.
+
+**A kind the extension has never heard of defaults to ENABLED.** Stored settings from an older
+install have no checkbox for `nudge`, and the safe default for a *notifier* is to notify: a
+producer that ships and silently raises nothing is the failure mode this project keeps
+re-learning, and one unwanted notification is cheaper than a missed OA.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
