@@ -838,34 +838,33 @@ recollection is worse than none — it looks like data.
 The rest of rule 10 is untouched: nothing new fires on page load, the content script's reach
 does not change, and the tracker row is still created only by an explicit click.
 
-### Built 2026-09-02, and the one gap it leaves
+### Built 2026-09-02, end to end
 
 Migration `0024`, `src/hunt/variants.rs`, four routes, and a variant picker on the popup's
-track offer. Verified through the real routes against a copy of the live database: a rename
-kept `application_count: 1`, and `DELETE` on a variant in use answered **409**.
+track offer store the attribution. `frontend/src/app/internships/ResumeVariantsPanel.tsx` closes
+the setup loop on the site: it lists, creates, renames, retires, restores and deletes variants.
+Archived variants stay in the list with a **Retired** badge, and each row shows its
+`application_count`, making it visible that a rename keeps every linked application.
 
-**There is no way to create a variant except the API.** The popup only *selects* among
-variants that already exist, because a popup is the wrong place to manage a list, and the site
-panel that would create them is frontend work this session did not own. Until it exists:
+The panel presents the three write refusals as different actions for the user: an invalid label
+asks for a 1–120 character name, a duplicate says that name already exists, and an in-use delete
+explains that removing it would destroy application attribution and offers retirement instead.
+It still stores labels and notes only; no résumé file crosses this boundary.
 
-```bash
-curl -X POST -H "Authorization: Bearer $HUNT_TOKEN" -H 'Content-Type: application/json'      -d '{"label":"one-page, systems"}' https://…/api/hunt/resume-variants
-```
+Verified through the real routes against a copy of the live database: a rename kept
+`application_count: 1`, and `DELETE` on a variant in use answered **409**.
 
-That is a real gap, not a deferral dressed up as one: with no variants defined, the picker
-never appears and every application stays unattributed — which is exactly what the feature
-looks like when it is switched off.
+### Reporting is wired through the same attribution
 
-### The reporting half is deliberately not here
+`GET /hunt/analytics` includes `by_variant` beside `by_source`, `by_tier` and `by_month`, with
+the same totals shape and the shared `application_events::HAS_RESPONDED` predicate. Renamed and
+archived variants remain reportable because grouping follows the referenced id and current
+label.
 
-**12f stores the attribution; the `by_variant` breakdown in `GET /hunt/analytics` is a separate
-task in `src/routes/analytics.rs`** and is handed to whoever owns that file. It is one more
-grouping beside `by_source`, `by_tier` and `by_month`, sharing the same totals shape, and it
-must use `application_events::HAS_RESPONDED` like every other response question here.
-
-Recorded so the absence reads as a split rather than as something forgotten — and so that
-whoever writes it knows that **applications with no variant get their own bucket** rather than
-being dropped from the denominator, for the same reason `None` tier is `unknown` and not tier 3.
+Applications with no variant are never dropped from the denominator. They use the empty string
+as a collision-free wire key — a real variant may be named `no variant`, but labels cannot be
+empty — and the site renders that key as **No variant**. Tests pin both the explicit bucket and
+the sum of all variant buckets equalling the report's application total.
 
 ## The extension — `apps/hunt-extension/`
 

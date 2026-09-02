@@ -7,7 +7,9 @@
  * résumé itself. Retiring sets `archived_at` and leaves the row visible because an old résumé
  * is exactly what a replacement should be compared against. Deletion remains available for an
  * unused mistake, but the backend's 409 for an attributed variant is explained as preservation
- * of history rather than shown as a generic failed request.
+ * of history rather than shown as a generic failed request. Invalid and duplicate labels have
+ * their own messages, and the visible application count makes the id-stable rename guarantee
+ * legible before the user edits a name.
  */
 
 import { useEffect, useState, type FormEvent } from "react";
@@ -206,7 +208,9 @@ export function ResumeVariantsPanel() {
       <h2 className="font-semibold">Résumé variants</h2>
       <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
         Name the résumés you keep outside this app so applications and response rates can be
-        attributed honestly. Retired variants stay here for comparison.
+        attributed honestly. Renaming is safe: applications stay linked to the same variant,
+        and the count beside each name shows how much history follows it. Retired variants stay
+        here for comparison.
       </p>
 
       <form
