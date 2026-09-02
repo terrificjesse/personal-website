@@ -1056,17 +1056,33 @@ tool running unattended on a host that stays up.
 
 | # | Task | Tag | Lane | Primary | Swap | Est. |
 |---|---|---|---|---|---|---|
-| 10a | Reconcile `PLAN.md` + `HUNT.md` with what actually shipped in `c001445`, `f911f46`, `f17d983` | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 10a ✅ | Reconcile `PLAN.md` + `HUNT.md` with what actually shipped in `c001445`, `f911f46`, `f17d983` | `[gen]` | C | Claude Code | ✅ | 1–2h |
 | 10b | `AGENTS.md` unification — **done 2026-09-02** | `[gen]` | C | — | — | — |
-| 10c | Write the `application_events` schema + emit contract into `docs/HUNT.md` **before any code** | `[gen]` | C | Claude Code | ✅ | 1–2h |
-| 10d | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
-| 10e | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
-| 10f | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
-| 10g | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
-| 10h | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
-| 10i | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
-| 10j | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
-| 10k | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
+| 10c ✅ | Write the `application_events` schema + emit contract into `docs/HUNT.md` **before any code** | `[gen]` | C | Claude Code | ✅ | 1–2h |
+| 10d ⬜ | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
+| 10e ◐ | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
+| 10f ⬜ | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
+| 10g ✅ | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
+| 10h ◐ | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
+| 10i ⬜ | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
+| 10j ✅ | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
+| 10k ⬜ | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
+
+**Progress — 2026-09-02.** ✅ done · ◐ part done · ⬜ not started. Two branches, not yet merged
+into each other: `phase-10-spec` (Lane C/A) and `phase-10-hardening` (Codex). They merge
+cleanly as of this writing — verified with a throwaway `git merge --no-commit`, not assumed.
+
+| Task | Where it stands |
+|---|---|
+| 10a | `57137d8`. Six discrepancies beyond the four already recorded, incl. `HUNT.md`'s migration numbers contradicting its own prose twice |
+| 10b | `7dcc0fd`. `AGENTS.md` is a symlink; two more added where Codex had no rules file at all |
+| 10c | `87a6b08`. The spec is in `docs/HUNT.md`; 10d builds from it |
+| 10e | **Half.** `d0caf73` made all three status writers transactional (and fixed a live defect: `decide` discarded the application UPDATE's `Result`); `8cb4c10` added `routes::auth::Credential`. The `record()` calls wait on 10d |
+| 10g | `fed4813` (Codex). Sender and subject are now separate fields end to end |
+| 10j | `227a5fd` (Codex). Two-bucket sliding window, IP and account, login and reviews. **See the proxy interaction in `docs/DEPLOY.md` before deploying** |
+| 10h | **In progress.** Everything that is not a secret is in `deploy/` and `docs/DEPLOY.md`; the `[you]` half is listed at the end of that runbook |
+| 10d, 10f, 10i | Outstanding with Codex |
+| 10k | Outstanding with the user, and 10h names it as a gate |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 10h, you ≈ 10h of deploy. Neither agent blocks the other:
 10c is the only ordering constraint, and it is a doc.
