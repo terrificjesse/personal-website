@@ -700,6 +700,22 @@ install have no checkbox for `nudge`, and the safe default for a *notifier* is t
 producer that ships and silently raises nothing is the failure mode this project keeps
 re-learning, and one unwanted notification is cheaper than a missed OA.
 
+### Built 2026-09-02
+
+Migration `0022` rebuilt the table and preserved all 64 events and all 63 delivery receipts on
+a copy of the real database. `src/hunt/nudge.rs` is the producer: `HUNT_NUDGE_INTERVAL_SECS`
+(6h default, `0` disables) and `HUNT_NUDGE_DAYS` (`14,30`).
+
+**"No response" is `application_events::HAS_RESPONDED`**, a SQL fragment rather than a query
+written twice, so 11b's endpoint and this sweep cannot drift into disagreeing about the same
+application. It excludes the *earliest* event rather than testing `from_status IS NULL`: a
+backfilled fallback event has a null `from_status` too and does represent a real answer, so
+testing the null would score every reconstructed response as silence.
+
+**The sweep writes no `application_events` row.** A nudge is not a status transition; nothing
+about the application changed. `Actor::Sweep` is still unconstructed and still reserved for
+dead-application detection, which the contract defines as derived and never stored.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
