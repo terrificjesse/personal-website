@@ -17,9 +17,11 @@
 //! belong in `docs/HUNT.md` when the documentation lane reconciles this commit.
 //!
 //! This layer deliberately has no writer. It loads the company-tier file once per request,
-//! groups tiers in Rust using the application's company snapshot, and shares the response
-//! predicate in [`crate::internships::application_events::is_response_status`] with the nudge
-//! producer.
+//! groups tiers in Rust using the application's company snapshot, and uses
+//! [`crate::internships::application_events::HAS_RESPONDED`] verbatim so the dashboard and
+//! nudge producer cannot disagree. That predicate excludes the earliest event rather than
+//! treating every NULL `from_status` as creation: a provenance-unknown backfill transition
+//! also has a NULL `from_status`, and it is still a real response.
 
 use std::collections::BTreeMap;
 
@@ -35,7 +37,7 @@ use sqlx::SqlitePool;
 
 use crate::{
     internships::{
-        application_events::is_response_status, models::ApplicationStatus, normalize::company_key,
+        application_events::HAS_RESPONDED, models::ApplicationStatus, normalize::company_key,
         prestige::CompanyTiers,
     },
     routes::auth::CurrentUser,
@@ -99,16 +101,15 @@ struct AnalyticsRow {
     source: Option<String>,
     applied_at: DateTime<Utc>,
     _posting_id: Option<String>,
+    has_responded: i64,
     event_id: Option<String>,
     event_at: Option<DateTime<Utc>>,
-    event_from_status: Option<String>,
     event_to_status: Option<String>,
 }
 
 #[derive(Debug)]
 struct EventFact {
     at: DateTime<Utc>,
-    from_status: Option<ApplicationStatus>,
     to_status: ApplicationStatus,
 }
 
@@ -118,6 +119,7 @@ struct ApplicationFacts {
     company_name: String,
     source: Option<String>,
     applied_at: DateTime<Utc>,
+    has_responded: bool,
     events: Vec<EventFact>,
 }
 
@@ -180,26 +182,27 @@ async fn build_analytics(
 ) -> Result<AnalyticsResponse> {
     // Do not push the window into a TEXT comparison. RFC 3339 permits equivalent UTC instants
     // with different offsets and spellings, so comparing parsed instants in Rust is exact.
-    let rows = sqlx::query_as::<_, AnalyticsRow>(
+    let sql = format!(
         "SELECT a.id AS application_id,
                 a.company_name,
                 a.source,
                 a.applied_at,
                 p.id AS _posting_id,
-                e.id AS event_id,
-                e.at AS event_at,
-                e.from_status AS event_from_status,
-                e.to_status AS event_to_status
+                CASE WHEN {HAS_RESPONDED} THEN 1 ELSE 0 END AS has_responded,
+                history.id AS event_id,
+                history.at AS event_at,
+                history.to_status AS event_to_status
            FROM internship_applications a
            LEFT JOIN internship_postings p ON p.id = a.posting_id
-           LEFT JOIN application_events e ON e.application_id = a.id
+           LEFT JOIN application_events history ON history.application_id = a.id
           WHERE a.user_id = ?1
-          ORDER BY a.id ASC, e.at ASC, e.created_at ASC, e.id ASC",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .context("load analytics cohort and event histories")?;
+          ORDER BY a.id ASC, history.at ASC, history.created_at ASC, history.id ASC"
+    );
+    let rows = sqlx::query_as::<_, AnalyticsRow>(&sql)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .context("load analytics cohort and event histories")?;
 
     let applications = group_rows(rows)?;
     let mut totals = Totals::default();
@@ -272,6 +275,7 @@ fn group_rows(rows: Vec<AnalyticsRow>) -> Result<Vec<ApplicationFacts>> {
                 company_name: row.company_name,
                 source: row.source,
                 applied_at: row.applied_at,
+                has_responded: row.has_responded != 0,
                 events: Vec::new(),
             });
         }
@@ -281,22 +285,11 @@ fn group_rows(rows: Vec<AnalyticsRow>) -> Result<Vec<ApplicationFacts>> {
             (Some(_), Some(at), Some(to_status)) => {
                 let to_status = ApplicationStatus::parse(&to_status)
                     .ok_or_else(|| anyhow!("invalid to_status {to_status:?} in event log"))?;
-                let from_status = match row.event_from_status.as_deref() {
-                    Some(value) => Some(
-                        ApplicationStatus::parse(value)
-                            .ok_or_else(|| anyhow!("invalid from_status {value:?} in event log"))?,
-                    ),
-                    None => None,
-                };
                 applications
                     .last_mut()
                     .expect("application was inserted above")
                     .events
-                    .push(EventFact {
-                        at,
-                        from_status,
-                        to_status,
-                    });
+                    .push(EventFact { at, to_status });
             }
             _ => bail!("incomplete application event row"),
         }
@@ -310,23 +303,24 @@ fn metrics_for(
     dead_after_days: u32,
     now: DateTime<Utc>,
 ) -> Result<ApplicationMetrics> {
-    let creation = application.events.iter().position(|event| {
-        event.from_status.is_none() && event.to_status == ApplicationStatus::Applied
-    });
-
-    let events_after_creation = match creation {
-        Some(index) => &application.events[index + 1..],
-        None if application.events.is_empty() => &application.events[..],
-        None => bail!(
-            "application {} has transition events but no creation event",
-            application.id
-        ),
-    };
-
-    let first_response = events_after_creation
-        .iter()
-        .find(|event| is_response_status(event.to_status));
-    let responded = first_response.is_some();
+    // HAS_RESPONDED defines creation structurally as the earliest ordered event. Locate the
+    // first qualifying event only to calculate elapsed time; do not re-decide the boolean here.
+    let events_after_creation = application.events.get(1..).unwrap_or_default();
+    let first_response = application
+        .has_responded
+        .then(|| {
+            events_after_creation
+                .iter()
+                .find(|event| event.to_status != ApplicationStatus::Applied)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "HAS_RESPONDED was true for {} but no response event was loaded",
+                        application.id
+                    )
+                })
+        })
+        .transpose()?;
+    let responded = application.has_responded;
     let is_dead = now - application.applied_at > Duration::days(i64::from(dead_after_days));
     let reached_oa = events_after_creation.iter().any(|event| {
         matches!(
@@ -347,7 +341,7 @@ fn metrics_for(
         .iter()
         .any(|event| event.to_status == ApplicationStatus::Rejected);
     let response_days = first_response.map(|response| {
-        let creation_at = application.events[creation.expect("response requires creation")].at;
+        let creation_at = application.events[0].at;
         (response.at - creation_at).num_milliseconds() as f64 / 86_400_000.0
     });
 
@@ -549,7 +543,9 @@ mod tests {
             "advanced-then-rejected",
             "oa",
             applied_at + Duration::days(2),
-            Some(ApplicationStatus::Applied),
+            // A backfilled fallback transition has unknown provenance, hence NULL here. It is
+            // still a response because HAS_RESPONDED excludes only the earliest event.
+            None,
             ApplicationStatus::Oa,
         )
         .await;
