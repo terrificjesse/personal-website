@@ -1296,6 +1296,7 @@ that is actually about *you* rather than about the market.
 | 12g ⬜ | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
 | 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
 | 12i ✅ | **Scoped expiry** — per-board verdicts, so one dead board out of 485 stops disqualifying Greenhouse. Found by 12c | `[gen]` | A (+ the panel half) | Claude Code | ✅ | 4–5h |
+| 12j ✅ | 0026 watched during a real collection; migration `0027` deletes the immortal rows 12c found | `[gen]` | A | Claude Code | ✅ | 3–4h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1581,6 +1582,80 @@ into `expiry.rs`'s module doc so the next reader inherits the reasoning and not 
 
 **Lever and Ashby are the obvious next scoped sources** and were deliberately left out of this
 change: both are multi-board with the same problem, and the adapter half is all that is missing.
+
+### 12j — 0026 watched during a real run, 2026-09-02, and it narrows a claim I made in 12i
+
+0026 was in the position 0025 had been in: applied to the live database, unit tests green, and
+never watched during an actual collection. Zero sightings carried a scope tag and
+`source_run_scopes` had zero rows, so none of the scoped path had run against real data.
+
+**Setup.** Greenhouse only, every other source disabled, `INTERNSHIP_MAX_BOARDS_PER_RUN=100`,
+against a `sqlite3 .backup` copy. A capped run is exactly the case 12i was built for: the budget
+truncates the board list so the run reports `partial`, and the boards it *did* read report
+themselves as completed scopes. The 100 alphabetically-first slugs cover 17 of the 82 boards
+that existing sightings live on, holding 42 of the 254 greenhouse sightings.
+
+```
+fetched 8,309 · accepted 36 · filtered 8,273 · created 0 · updated 36
+greenhouse: partial — disappearance counters advanced for 100 of 100 scope(s)
+```
+
+**The predictions, written before the run.**
+
+| | prediction | result |
+|---|---|---|
+| P1 | 100 scope rows, completed + failed = 100, and 0 failures | ✅ 100 completed, 0 failed. 6 boards 404'd and were recorded `completed` with no postings, which is the intended reading of "no such board" |
+| P2 | `outcome = partial` **and** `counts_for_expiry = 1` — impossible before 0026 | ✅ |
+| P3 | at most 42 sightings tagged, every tag one of the polled 100 | ✅ 37 tagged, 0 tags outside the polled set, 0 tags disagreeing with the slug in the sighting's own URL |
+| P4 | **zero** miss counters move, greenhouse and everything else | ✅ 61 → 61 for greenhouse, 3,254 → 3,254 for the rest |
+| P5 | a handful of postings created | ❌ **0 created.** Careless: 12c had polled all 485 boards seven hours earlier, so nothing on these boards was new. The prediction ignored a run I had written up myself |
+| P6 | the panel reports 100/100 for greenhouse, 0/0 for the disabled sources | ✅ |
+
+### Finding 1 — scoped expiry is forward-looking only, and 12i's doc overclaimed
+
+P3's shortfall is the finding. 42 legacy sightings sat on boards that were **completely
+enumerated**, and only 37 were tagged. The missing 5 — four on `astranis`, one on
+`axontalentcommunity` — are sightings whose jobs are already gone from those boards.
+
+A sighting is tagged only when it is **seen**. A sighting whose job is already dead can never be
+seen, so it is never tagged; and an untagged sighting does not advance on a partial run, which
+is nearly every Greenhouse run. Those 5 are therefore stuck, and `expiry.rs`'s claim that the
+untagged population "self-clears over a run or two" — written in 12i, by me, without measuring —
+is wrong. It self-clears for everything still listed, and does nothing for what had already
+gone.
+
+**This is not a regression.** Before 0026 a partial run advanced nothing at all, so those 5 rows
+were equally immortal. But it bounds what 12i actually bought: scoped expiry expires what
+disappears *after* it starts watching, and it does not reach backwards. The corrected claim is
+now in the module doc with the measurement attached.
+
+**Proposed, not done: migration `0028`, backfilling `posting_sightings.scope` from the URL.** A
+greenhouse sighting's URL already records its board — `job-boards.greenhouse.io/{slug}/jobs/{id}`
+— and parsing it is exactly as reliable as the tag written at fetch time, because it *is* the
+slug the fetch used. Backfilling would give the 254 legacy sightings their scopes without
+waiting to see each one, and the 5 dead ones would then advance the next time their board is
+polled cleanly. It is a separate decision from 12j's two commits and wants its own measurement
+of how many of the 254 URLs parse.
+
+### Finding 2 — a capped run had stopped warning, and that was my regression
+
+Before 0026 the run-health panel showed `didn't expire` for a capped Greenhouse run, which was
+true and useful. After 0026 a capped run has `counts_for_expiry = 1` and `scopes 100/100` —
+every board it *attempted* completed — so the badge went silent and the run read as clean, while
+385 boards had not been looked at. The un-attempted boards deliberately produce no scope row
+(no verdict is the honest record of not looking), which is right, and it makes
+`scopes_attempted` a count of boards reached rather than boards that exist.
+
+Fixed in the same commit: a `partial` run that advanced any scope now renders
+`expired within N boards` rather than nothing. The 484-of-485 case still renders
+`expired 484/485 boards`.
+
+### Also worth recording
+
+The run's own log printed *"capped sources report Partial and will never expire postings"*
+immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. The binary
+predated `2880651`, the commit that corrected exactly that sentence — so the stale build
+demonstrated the defect that commit was written for, on real output.
 
 ### 0025 verified against a real collection run, 2026-09-02
 

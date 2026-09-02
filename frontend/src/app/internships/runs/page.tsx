@@ -155,6 +155,15 @@ export default function RunHealthPage() {
                                 expired {sourceRun.scopes_completed}/{sourceRun.scopes_attempted}{" "}
                                 boards
                               </span>
+                            ) : sourceRun.outcome === "partial" && sourceRun.scopes_completed > 0 ? (
+                              /* Every board it attempted succeeded, and it still did not attempt
+                                 them all — a per-run board budget truncated the list, and the
+                                 boards beyond the cap have no row here at all. Saying nothing
+                                 would read as a clean run, which before scopes existed this
+                                 column correctly warned about. */
+                              <span title="Expiry ran for the boards this run polled. It did not poll every board — see the outcome and its reason — so postings on the boards it skipped were left exactly as they were.">
+                                expired within {sourceRun.scopes_completed} boards
+                              </span>
                             ) : null}
                           </td>
                         </tr>

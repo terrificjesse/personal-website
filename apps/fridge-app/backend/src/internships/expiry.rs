@@ -36,8 +36,18 @@
 //! - A sighting whose scope failed is untouched, run after run. Same as today, one board at a
 //!   time instead of the whole source.
 //! - Sightings recorded before migration 0026 carry `scope IS NULL`, and on a scoped source's
-//!   *partial* run those do not advance. They are tagged the next time they are seen, so this
-//!   self-clears over a run or two, and until then it errs toward keeping things.
+//!   *partial* run those do not advance. A sighting is tagged the next time it is **seen** —
+//!   so this clears for everything still listed, and never for a sighting whose job is already
+//!   gone. That one cannot be seen, therefore is never tagged, therefore never advances on a
+//!   partial run; and Greenhouse is partial nearly always.
+//!
+//!   Measured rather than assumed (2026-09-02, `docs/PLAN.md` § 12j): of 42 legacy sightings on
+//!   100 completely-enumerated boards, 37 were tagged and **5 were already dead and stayed
+//!   untagged**. An earlier draft of this doc claimed the untagged population "self-clears over
+//!   a run or two". It does not. This is not a regression — before 0026 a partial run advanced
+//!   nothing at all, so those 5 were equally stuck — but it means scoped expiry is
+//!   **forward-looking only**: it expires what disappears after it starts watching, and does
+//!   nothing for what had already gone before its sighting was tagged.
 //! - A slug dropped from [`BoardDirectory`](super::sources::BoardDirectory) produces no
 //!   completed scope, so its sightings stop advancing entirely. This is a strict improvement:
 //!   that type's doc warns that pruning a slug makes its postings expire together,
