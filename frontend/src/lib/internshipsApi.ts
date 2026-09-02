@@ -303,6 +303,8 @@ export type HuntAnalyticsResponse = {
   by_source: HuntAnalyticsBreakdown[];
   by_tier: HuntAnalyticsBreakdown[];
   by_month: HuntAnalyticsBreakdown[];
+  /** Includes an empty-key bucket for unattributed applications, rendered as “No variant”. */
+  by_variant: HuntAnalyticsBreakdown[];
 };
 
 export async function getHuntAnalytics(input: {

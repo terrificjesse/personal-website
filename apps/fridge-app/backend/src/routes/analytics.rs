@@ -27,6 +27,17 @@
 //! created directly as `offer` or `rejected` has no event *after* creation, but it is already
 //! closed and therefore cannot be called silent. Current status gates the two no-response
 //! buckets only; response and conversion remain derived from event history.
+//!
+//! Résumé variants are grouped by their current label, so renaming a variant carries its
+//! history with it and archived variants remain visible. A NULL `resume_variant_id` is the
+//! explicit `no variant` bucket; it is never removed from the denominator or guessed from a
+//! later variant.
+//!
+//! The variants API currently permits a real label equal to `no variant`, while the analytics
+//! wire shape gives every breakdown only a string `key`. Variant groups are therefore keyed as
+//! `Option<label>` internally and NULL serializes as the empty string, which label validation
+//! cannot store. The site renders that collision-free sentinel as “No variant”; the shared
+//! contract should record this wire decision when the documentation lane reconciles the task.
 
 use std::collections::BTreeMap;
 
@@ -97,6 +108,7 @@ pub struct AnalyticsResponse {
     by_source: Vec<Breakdown>,
     by_tier: Vec<Breakdown>,
     by_month: Vec<Breakdown>,
+    by_variant: Vec<Breakdown>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -107,6 +119,8 @@ struct AnalyticsRow {
     applied_at: DateTime<Utc>,
     application_status: String,
     _posting_id: Option<String>,
+    resume_variant_id: Option<String>,
+    resume_variant_label: Option<String>,
     has_responded: i64,
     event_id: Option<String>,
     event_at: Option<DateTime<Utc>>,
@@ -126,6 +140,7 @@ struct ApplicationFacts {
     source: Option<String>,
     applied_at: DateTime<Utc>,
     current_status: ApplicationStatus,
+    resume_variant_label: Option<String>,
     has_responded: bool,
     events: Vec<EventFact>,
 }
@@ -196,12 +211,16 @@ async fn build_analytics(
                 a.applied_at,
                 a.status AS application_status,
                 p.id AS _posting_id,
+                a.resume_variant_id,
+                variant.label AS resume_variant_label,
                 CASE WHEN {HAS_RESPONDED} THEN 1 ELSE 0 END AS has_responded,
                 history.id AS event_id,
                 history.at AS event_at,
                 history.to_status AS event_to_status
            FROM internship_applications a
            LEFT JOIN internship_postings p ON p.id = a.posting_id
+           LEFT JOIN resume_variants variant
+                  ON variant.id = a.resume_variant_id AND variant.user_id = a.user_id
            LEFT JOIN application_events history ON history.application_id = a.id
           WHERE a.user_id = ?1
           ORDER BY a.id ASC, history.at ASC, history.created_at ASC, history.id ASC"
@@ -218,6 +237,7 @@ async fn build_analytics(
     let mut by_source = BTreeMap::new();
     let mut by_tier = BTreeMap::new();
     let mut by_month = BTreeMap::new();
+    let mut by_variant = BTreeMap::new();
 
     for application in applications
         .iter()
@@ -240,6 +260,7 @@ async fn build_analytics(
             .tier(&company_key(&application.company_name))
             .map_or_else(|| "unknown".to_string(), |tier| tier.to_string());
         let month = application.applied_at.format("%Y-%m").to_string();
+        let variant = application.resume_variant_label.clone();
 
         by_source
             .entry(source)
@@ -251,6 +272,10 @@ async fn build_analytics(
             .add(metrics);
         by_month
             .entry(month)
+            .or_insert_with(Totals::default)
+            .add(metrics);
+        by_variant
+            .entry(variant)
             .or_insert_with(Totals::default)
             .add(metrics);
     }
@@ -266,6 +291,7 @@ async fn build_analytics(
         by_source: breakdowns(by_source),
         by_tier: breakdowns(by_tier),
         by_month: breakdowns(by_month),
+        by_variant: variant_breakdowns(by_variant),
     })
 }
 
@@ -285,12 +311,24 @@ fn group_rows(rows: Vec<AnalyticsRow>) -> Result<Vec<ApplicationFacts>> {
                     row.application_id
                 )
             })?;
+            let resume_variant_label = match (
+                row.resume_variant_id.as_deref(),
+                row.resume_variant_label.as_deref(),
+            ) {
+                (None, None) => None,
+                (Some(_), Some(label)) => Some(label.to_string()),
+                _ => bail!(
+                    "incomplete resume variant attribution for {}",
+                    row.application_id
+                ),
+            };
             applications.push(ApplicationFacts {
                 id: row.application_id.clone(),
                 company_name: row.company_name,
                 source: row.source,
                 applied_at: row.applied_at,
                 current_status: status,
+                resume_variant_label,
                 has_responded: row.has_responded != 0,
                 events: Vec::new(),
             });
@@ -423,6 +461,16 @@ fn breakdowns(groups: BTreeMap<String, Totals>) -> Vec<Breakdown> {
         .collect()
 }
 
+fn variant_breakdowns(groups: BTreeMap<Option<String>, Totals>) -> Vec<Breakdown> {
+    groups
+        .into_iter()
+        .map(|(key, totals)| Breakdown {
+            key: key.unwrap_or_default(),
+            totals,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,8 +588,35 @@ mod tests {
                 .iter()
                 .chain(&report.by_tier)
                 .chain(&report.by_month)
+                .chain(&report.by_variant)
                 .map(|bucket| bucket.totals),
         )
+    }
+
+    async fn attach_variant(
+        pool: &SqlitePool,
+        application_id: &str,
+        variant_id: &str,
+        label: &str,
+        archived_at: Option<DateTime<Utc>>,
+    ) {
+        sqlx::query(
+            "INSERT INTO resume_variants
+                (id, user_id, label, notes, created_at, archived_at)
+             VALUES (?1, 'analytics-user', ?2, NULL, '2026-01-01T00:00:00Z', ?3)",
+        )
+        .bind(variant_id)
+        .bind(label)
+        .bind(archived_at.map(|at| at.to_rfc3339()))
+        .execute(pool)
+        .await
+        .expect("resume variant");
+        sqlx::query("UPDATE internship_applications SET resume_variant_id = ?1 WHERE id = ?2")
+            .bind(variant_id)
+            .bind(application_id)
+            .execute(pool)
+            .await
+            .expect("application variant attribution");
     }
 
     #[tokio::test]
@@ -681,14 +756,12 @@ mod tests {
             // POST /internships/applications records the requested initial status on the
             // creation event. The general fixture starts at `applied` so later transitions
             // can be added; update this event to reproduce the direct-terminal path exactly.
-            sqlx::query(
-                "UPDATE application_events SET to_status = ?1 WHERE application_id = ?2",
-            )
-            .bind(status.as_str())
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("terminal creation event");
+            sqlx::query("UPDATE application_events SET to_status = ?1 WHERE application_id = ?2")
+                .bind(status.as_str())
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("terminal creation event");
         }
 
         let analytics = report(
@@ -828,6 +901,136 @@ mod tests {
         assert_eq!(analytics.by_tier[0].key, "unknown");
         assert_ne!(analytics.by_tier[0].key, "3");
         assert_eq!(analytics.by_source[0].key, "unknown");
+    }
+
+    #[tokio::test]
+    async fn variant_breakdown_keeps_archived_and_unattributed_applications() {
+        let pool = pool().await;
+        let applied_at = instant("2026-06-01T00:00:00Z");
+
+        for id in ["attributed", "unattributed"] {
+            insert_application(
+                &pool,
+                ApplicationFixture {
+                    id,
+                    company: "Example Co",
+                    source: Some("simplify"),
+                    status: ApplicationStatus::Applied,
+                    applied_at,
+                },
+            )
+            .await;
+        }
+        attach_variant(
+            &pool,
+            "attributed",
+            "systems-resume",
+            "one-page, systems",
+            Some(instant("2026-08-01T00:00:00Z")),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "attributed",
+            "attributed-oa",
+            applied_at + Duration::days(2),
+            Some(ApplicationStatus::Applied),
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            instant("2026-06-10T00:00:00Z"),
+        )
+        .await;
+
+        let attributed = analytics
+            .by_variant
+            .iter()
+            .find(|bucket| bucket.key == "one-page, systems")
+            .expect("archived variant remains in reports");
+        assert_eq!(attributed.totals.applications, 1);
+        assert_eq!(attributed.totals.responded, 1);
+        assert_eq!(attributed.totals.reached_oa, 1);
+
+        let unattributed = analytics
+            .by_variant
+            .iter()
+            .find(|bucket| bucket.key.is_empty())
+            .expect("unattributed application has an explicit bucket");
+        assert_eq!(unattributed.totals.applications, 1);
+        assert_eq!(unattributed.totals.no_response_live, 1);
+        assert_eq!(
+            analytics
+                .by_variant
+                .iter()
+                .map(|bucket| bucket.totals.applications)
+                .sum::<u64>(),
+            analytics.totals.applications
+        );
+    }
+
+    #[tokio::test]
+    async fn a_variant_named_no_variant_does_not_merge_with_unattributed() {
+        let pool = pool().await;
+        let applied_at = instant("2026-06-01T00:00:00Z");
+
+        for id in ["named-no-variant", "actually-unattributed"] {
+            insert_application(
+                &pool,
+                ApplicationFixture {
+                    id,
+                    company: "Example Co",
+                    source: Some("simplify"),
+                    status: ApplicationStatus::Applied,
+                    applied_at,
+                },
+            )
+            .await;
+        }
+        attach_variant(
+            &pool,
+            "named-no-variant",
+            "conflicting-label",
+            "no variant",
+            None,
+        )
+        .await;
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            instant("2026-06-10T00:00:00Z"),
+        )
+        .await;
+
+        assert_eq!(analytics.by_variant.len(), 2);
+        assert!(
+            analytics
+                .by_variant
+                .iter()
+                .any(|bucket| bucket.key.is_empty())
+        );
+        assert!(
+            analytics
+                .by_variant
+                .iter()
+                .any(|bucket| bucket.key == "no variant")
+        );
+        assert_eq!(
+            analytics
+                .by_variant
+                .iter()
+                .map(|bucket| bucket.totals.applications)
+                .sum::<u64>(),
+            2
+        );
     }
 
     #[test]
