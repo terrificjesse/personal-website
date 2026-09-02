@@ -407,3 +407,364 @@ fn breakdowns(groups: BTreeMap<String, Totals>) -> Vec<Breakdown> {
         .map(|(key, totals)| Breakdown { key, totals })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        sqlx::query(
+            "INSERT INTO users (id, email, created_at)
+             VALUES ('analytics-user', 'analytics@example.com', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("user");
+        pool
+    }
+
+    struct ApplicationFixture<'a> {
+        id: &'a str,
+        company: &'a str,
+        source: Option<&'a str>,
+        status: ApplicationStatus,
+        applied_at: DateTime<Utc>,
+    }
+
+    async fn insert_application(pool: &SqlitePool, fixture: ApplicationFixture<'_>) {
+        sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, posting_id, company_name, title, url, source, snapshot_json,
+                 snapshot_at, status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1, 'analytics-user', NULL, ?2, 'Engineer', 'https://example.com/job', ?3,
+                     '{}', ?4, ?5, ?4, ?4, ?4, ?4)",
+        )
+        .bind(fixture.id)
+        .bind(fixture.company)
+        .bind(fixture.source)
+        .bind(fixture.applied_at.to_rfc3339())
+        .bind(fixture.status.as_str())
+        .execute(pool)
+        .await
+        .expect("application");
+
+        insert_event(
+            pool,
+            fixture.id,
+            &format!("{}-created", fixture.id),
+            fixture.applied_at,
+            None,
+            ApplicationStatus::Applied,
+        )
+        .await;
+    }
+
+    async fn insert_event(
+        pool: &SqlitePool,
+        application_id: &str,
+        id: &str,
+        at: DateTime<Utc>,
+        from_status: Option<ApplicationStatus>,
+        to_status: ApplicationStatus,
+    ) {
+        sqlx::query(
+            "INSERT INTO application_events
+                (id, application_id, at, created_at, from_status, to_status, actor)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'manual')",
+        )
+        .bind(id)
+        .bind(application_id)
+        .bind(at.to_rfc3339())
+        .bind(from_status.map(ApplicationStatus::as_str))
+        .bind(to_status.as_str())
+        .execute(pool)
+        .await
+        .expect("event");
+    }
+
+    fn instant(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    async fn report(
+        pool: &SqlitePool,
+        from: &str,
+        to: &str,
+        dead_after_days: u32,
+        now: DateTime<Utc>,
+    ) -> AnalyticsResponse {
+        build_analytics(
+            pool,
+            "analytics-user",
+            instant(from),
+            instant(to),
+            dead_after_days,
+            now,
+            &CompanyTiers::default(),
+        )
+        .await
+        .expect("analytics")
+    }
+
+    fn all_totals(report: &AnalyticsResponse) -> impl Iterator<Item = Totals> + '_ {
+        std::iter::once(report.totals).chain(
+            report
+                .by_source
+                .iter()
+                .chain(&report.by_tier)
+                .chain(&report.by_month)
+                .map(|bucket| bucket.totals),
+        )
+    }
+
+    #[tokio::test]
+    async fn maximum_stage_survives_a_later_rejection() {
+        let pool = pool().await;
+        let applied_at = instant("2026-06-01T00:00:00Z");
+        insert_application(
+            &pool,
+            ApplicationFixture {
+                id: "advanced-then-rejected",
+                company: "Example Co",
+                source: Some("simplify"),
+                status: ApplicationStatus::Rejected,
+                applied_at,
+            },
+        )
+        .await;
+        insert_event(
+            &pool,
+            "advanced-then-rejected",
+            "oa",
+            applied_at + Duration::days(2),
+            Some(ApplicationStatus::Applied),
+            ApplicationStatus::Oa,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "advanced-then-rejected",
+            "rejected",
+            applied_at + Duration::days(3),
+            Some(ApplicationStatus::Oa),
+            ApplicationStatus::Rejected,
+        )
+        .await;
+
+        let analytics = report(
+            &pool,
+            "2026-06-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            45,
+            instant("2026-09-01T00:00:00Z"),
+        )
+        .await;
+
+        assert_eq!(analytics.totals.applications, 1);
+        assert_eq!(analytics.totals.responded, 1);
+        assert_eq!(analytics.totals.reached_oa, 1);
+        assert_eq!(analytics.totals.rejected, 1);
+        for totals in all_totals(&analytics) {
+            assert_eq!(totals.no_response_live, 0);
+            assert_eq!(totals.no_response_dead, 0);
+            assert!(totals.rejected <= totals.responded);
+        }
+    }
+
+    #[tokio::test]
+    async fn silence_is_live_or_dead_while_terminal_applications_are_neither() {
+        let pool = pool().await;
+        let now = instant("2026-09-01T00:00:00Z");
+        for (id, age, status) in [
+            ("young-silent", 10, ApplicationStatus::Applied),
+            ("old-silent", 50, ApplicationStatus::Applied),
+            ("old-rejected", 100, ApplicationStatus::Rejected),
+        ] {
+            let applied_at = now - Duration::days(age);
+            insert_application(
+                &pool,
+                ApplicationFixture {
+                    id,
+                    company: "Example Co",
+                    source: Some("simplify"),
+                    status,
+                    applied_at,
+                },
+            )
+            .await;
+            if status == ApplicationStatus::Rejected {
+                insert_event(
+                    &pool,
+                    id,
+                    "terminal-response",
+                    applied_at + Duration::days(1),
+                    Some(ApplicationStatus::Applied),
+                    ApplicationStatus::Rejected,
+                )
+                .await;
+            }
+        }
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            now,
+        )
+        .await;
+
+        assert_eq!(analytics.totals.applications, 3);
+        assert_eq!(analytics.totals.responded, 1);
+        assert_eq!(analytics.totals.no_response_live, 1);
+        assert_eq!(analytics.totals.no_response_dead, 1);
+        assert_eq!(analytics.totals.rejected, 1);
+        assert_eq!(
+            analytics.totals.responded
+                + analytics.totals.no_response_live
+                + analytics.totals.no_response_dead,
+            analytics.totals.applications
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_interview_stays_in_the_application_month_cohort() {
+        let pool = pool().await;
+        let applied_at = instant("2026-06-20T12:00:00Z");
+        insert_application(
+            &pool,
+            ApplicationFixture {
+                id: "summer-cohort",
+                company: "Example Co",
+                source: Some("simplify"),
+                status: ApplicationStatus::Interview,
+                applied_at,
+            },
+        )
+        .await;
+        insert_event(
+            &pool,
+            "summer-cohort",
+            "september-interview",
+            instant("2026-09-03T12:00:00Z"),
+            Some(ApplicationStatus::Applied),
+            ApplicationStatus::Interview,
+        )
+        .await;
+
+        let june = report(
+            &pool,
+            "2026-06-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            45,
+            instant("2026-10-01T00:00:00Z"),
+        )
+        .await;
+        assert_eq!(june.totals.applications, 1);
+        assert_eq!(june.totals.reached_interview, 1);
+        assert_eq!(june.by_month[0].key, "2026-06");
+        assert_eq!(june.by_month[0].totals.applications, 1);
+
+        let september = report(
+            &pool,
+            "2026-09-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+            45,
+            instant("2026-10-01T00:00:00Z"),
+        )
+        .await;
+        assert_eq!(september.totals.applications, 0);
+        assert!(september.by_month.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_time_reports_n_median_and_nearest_rank_p90() {
+        let pool = pool().await;
+        let applied_at = instant("2026-06-01T00:00:00Z");
+        for days in [1, 2, 3, 4, 200] {
+            let id = format!("response-{days}");
+            insert_application(
+                &pool,
+                ApplicationFixture {
+                    id: &id,
+                    company: "Example Co",
+                    source: Some("simplify"),
+                    status: ApplicationStatus::Oa,
+                    applied_at,
+                },
+            )
+            .await;
+            insert_event(
+                &pool,
+                &id,
+                &format!("{id}-oa"),
+                applied_at + Duration::days(days),
+                Some(ApplicationStatus::Applied),
+                ApplicationStatus::Oa,
+            )
+            .await;
+        }
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            instant("2027-01-01T00:00:00Z"),
+        )
+        .await;
+
+        assert_eq!(analytics.time_to_first_response_days.n, 5);
+        assert_eq!(analytics.time_to_first_response_days.median, Some(3.0));
+        assert_eq!(analytics.time_to_first_response_days.p90, Some(200.0));
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_company_uses_unknown_instead_of_tier_three() {
+        let pool = pool().await;
+        insert_application(
+            &pool,
+            ApplicationFixture {
+                id: "unlisted-company",
+                company: "A Company Definitely Missing From The Tier File",
+                source: None,
+                status: ApplicationStatus::Applied,
+                applied_at: instant("2026-06-01T00:00:00Z"),
+            },
+        )
+        .await;
+
+        let analytics = report(
+            &pool,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+            45,
+            instant("2026-06-02T00:00:00Z"),
+        )
+        .await;
+
+        assert_eq!(analytics.by_tier.len(), 1);
+        assert_eq!(analytics.by_tier[0].key, "unknown");
+        assert_ne!(analytics.by_tier[0].key, "3");
+        assert_eq!(analytics.by_source[0].key, "unknown");
+    }
+
+    #[test]
+    fn malformed_bounds_are_rejected_instead_of_defaulted() {
+        assert_eq!(parse_bound("June 2026"), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(parse_bound(""), Err(StatusCode::BAD_REQUEST));
+        assert!(parse_bound("2026-06-01T00:00:00-04:00").is_ok());
+    }
+}
