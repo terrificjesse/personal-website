@@ -1,0 +1,25 @@
+# Phase 10i deployment contract: install the repository at /opt/personal-website, run the
+# backend as personal-website, and keep database/backup paths in the mode-600 EnvironmentFile.
+# The restore procedure lives in ../restore-fridge-db.sh and must be drilled before deploy.
+# Install both unit files in /etc/systemd/system, install backup.env.example as the configured
+# EnvironmentFile, create/chown both data directories, then `systemctl daemon-reload` and
+# `systemctl enable --now fridge-db-backup.timer`. Run the service once immediately and inspect
+# `journalctl -u fridge-db-backup.service`; do not wait until 03:30 to learn the paths are wrong.
+[Unit]
+Description=Verified backup of personal-website fridge.db
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=personal-website
+Group=personal-website
+UMask=0077
+EnvironmentFile=/etc/personal-website/backup.env
+ExecStart=/opt/personal-website/apps/fridge-app/backend/ops/backup-fridge-db.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
