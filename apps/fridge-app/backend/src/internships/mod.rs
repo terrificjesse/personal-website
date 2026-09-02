@@ -33,6 +33,7 @@
 //!    `posting_sightings.consecutive_misses` in migration `0012`.
 
 pub mod alerts;
+pub mod application_events;
 pub mod collector;
 pub mod dedup;
 pub mod expiry;
