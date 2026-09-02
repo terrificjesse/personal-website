@@ -1332,6 +1332,74 @@ exception was granted for the ranking, not for NLP. Three outcomes, all legitima
 
 ---
 
+### 12b — the re-key measured, 2026-09-02, and it found something bigger than a merge risk
+
+Measured over a **consistent snapshot of the live database** (`sqlite3 .backup`, not `cp` — a
+collection run was writing at the time). 12a is purely additive — 351 lines added, none removed
+— so a posting's key can only change where the new parser recognises a host the old one did not.
+
+| | |
+|---|---|
+| Postings | **1,828** |
+| Keys that change | **481** (26%) |
+| ATS coverage | **707 → 1,188**, i.e. **38.7% → 65.0%** (§ C predicted 73%; previously measured 35%) |
+| Groups that would newly merge | **60** |
+| Groups that would split apart | **0** |
+| **True over-merges — distinct jobs colliding** | **0** |
+
+**The over-merge count is zero, and that is the headline.** All 60 merging groups are duplicates
+the *old* key wrongly kept apart:
+
+- **46** have byte-identical URLs in every row — the same posting stored twice, once before the
+  `gh_jid` query-param handling existed and once after.
+- **11** share one ATS job id under different titles (Epic Games' "Machine Learning Intern -
+  Special Projects" and "Machine Learning Research Intern" are one Greenhouse job with two
+  surface names).
+- **5** look like different companies and are not: `Tower Research` / `Tower Research Capital`,
+  `SpreeAI` / `SPREEAI`, `pony.ai` / `Pony.ai`, `Monolithic Power Systems` /
+  `Monolithic Power Systems, Inc.`, `Nightwing` / `Nightwing Intelligence Solutions` — same ATS,
+  same board, same job id. **These are exactly the cases the deferred fuzzy matcher (12d/12e)
+  exists for, and the ATS key solves them for free.** Worth knowing before that decision is made.
+
+### What the measurement actually surfaced
+
+**The next collection run will duplicate 481 postings rather than update them.**
+`collector::upsert_posting` computes `dedup_key(posting)` and relies on `ON CONFLICT` against
+the unique index to keep the existing row's id. A posting whose key changed does not conflict
+with its own row, so it is **inserted as a new row**; the old row then stops being seen, its
+disappearance counters climb, and it expires.
+
+Nobody planned this, and it is not a defect in 12a — it is what shipping a key change against a
+populated table means. It matters most for the **one application that reached OA**: of the two
+applications pointing at a posting, the Roblox one is inside a merging group and its key
+changes, so after the next uncapped run it points at a row that is on its way to expiring.
+
+### Recommendation — re-key, but only with repointing, and before the next uncapped run
+
+1. **Keep 12a as shipped.** Coverage 38.7% → 65.0%, zero splits, zero true over-merges. It is a
+   clear improvement and needs no revision.
+2. **Add a migration that re-keys existing rows and merges the 60 groups** — and that
+   **repoints `internship_applications.posting_id` at the surviving row before deleting the
+   loser**. Test it against the Roblox row specifically, by name: it is the one row in this
+   database whose loss would be felt.
+3. **Do not simply do nothing.** Doing nothing produces the same 60 merges anyway, via new rows
+   and expiry, but *without* repointing anything — strictly worse than doing it deliberately.
+   "Leave it and let expiry sort it out" is the option that looks cheapest and is not.
+
+**What would change this recommendation:** a non-zero true over-merge count, or evidence that
+any of the 5 same-company-different-name groups is genuinely two employers sharing an ATS job
+id. Neither appeared in 1,828 rows.
+
+### A handoff that did not happen
+
+12a was asked to hand over a reproducible command and fixture for this measurement, and
+`861dce0` contains only `dedup.rs` and § C. The measurement was rebuilt here from scratch —
+about forty lines against a snapshot. Recorded not as a complaint but because the two-agent
+rule ("the person measuring the blast radius is not the person who wrote the key") only works
+if the handoff is part of the first task rather than a nice-to-have at the end of it.
+
+---
+
 ## Phase 13 — Week 4 (2026-09-23 → 09-29): measurement week
 
 **Goal:** 8b's checkpoint, met honestly — or reported honestly as still unmeetable, with the
