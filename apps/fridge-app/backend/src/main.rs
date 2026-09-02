@@ -9,6 +9,7 @@ mod internships;
 mod models;
 mod nlp;
 mod purchase_history;
+mod rate_limit;
 mod recommend;
 mod recommend_recipes;
 mod rerank;
@@ -98,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         catalog,
         recipe_catalog,
         google_oauth,
+        rate_limits: rate_limit::RateLimits::default(),
     });
 
     // Sets up a socket listening connection address. The port is configurable so a second
@@ -112,7 +114,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Awaits a connection from the frontend
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

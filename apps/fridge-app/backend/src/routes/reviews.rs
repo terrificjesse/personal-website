@@ -4,6 +4,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
 };
 use chrono::Utc;
 use serde::Serialize;
@@ -11,6 +12,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::models::{AddReviewRequest, MAX_NOTES_LENGTH, MAX_RATING, MIN_RATING, Review};
+use crate::rate_limit::{ClientIp, RateLimits};
 use crate::routes::auth::CurrentUser;
 use crate::themealdb::Catalog as RecipeCatalog;
 
@@ -22,8 +24,24 @@ const SELECT_COLUMNS: &str = "id, recipe_id, rating, cooked_at, notes, user_id, 
 
 pub async fn submit_review(
     State(pool): State<SqlitePool>,
+    State(rate_limits): State<RateLimits>,
+    ClientIp(ip): ClientIp,
     CurrentUser(user): CurrentUser,
     Json(req): Json<AddReviewRequest>,
+) -> axum::response::Response {
+    if let Err(retry) = rate_limits.check_review(ip, &user.id) {
+        return retry.response("POST /reviews", ip, &user.id);
+    }
+
+    submit_review_after_rate_limit(&pool, user.id, req)
+        .await
+        .into_response()
+}
+
+async fn submit_review_after_rate_limit(
+    pool: &SqlitePool,
+    user_id: String,
+    req: AddReviewRequest,
 ) -> Result<(StatusCode, Json<Review>), StatusCode> {
     if req.recipe_id.trim().is_empty() || !(MIN_RATING..=MAX_RATING).contains(&req.rating) {
         return Err(StatusCode::BAD_REQUEST);
@@ -38,7 +56,7 @@ pub async fn submit_review(
 
     let id = Uuid::new_v4().to_string();
     let cooked_at = req.cooked_at.unwrap_or_else(Utc::now);
-    let user_id = Some(user.id.clone());
+    let user_id = Some(user_id);
 
     sqlx::query(
         "INSERT INTO reviews (id, recipe_id, rating, cooked_at, notes, user_id, is_public, hidden) \
@@ -51,7 +69,7 @@ pub async fn submit_review(
     .bind(&req.notes)
     .bind(&user_id)
     .bind(req.is_public)
-    .execute(&pool)
+    .execute(pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -176,4 +194,64 @@ pub async fn list_recipe_reviews(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(reviews))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::User;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn the_review_route_refuses_the_thirty_first_submission_without_inserting_it() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        let rate_limits = RateLimits::default();
+        let ip = IpAddr::from([192, 0, 2, 1]);
+        let user = User {
+            id: "user-1".to_string(),
+            email: "reviewer@example.com".to_string(),
+            password_hash: None,
+            created_at: Utc::now(),
+            is_admin: false,
+        };
+
+        for attempt in 0..=30 {
+            let response = submit_review(
+                State(pool.clone()),
+                State(rate_limits.clone()),
+                ClientIp(ip),
+                CurrentUser(user.clone()),
+                Json(AddReviewRequest {
+                    recipe_id: format!("recipe-{attempt}"),
+                    rating: 5,
+                    notes: None,
+                    cooked_at: None,
+                    is_public: false,
+                }),
+            )
+            .await;
+
+            let expected = if attempt < 30 {
+                StatusCode::CREATED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(response.status(), expected, "submission {}", attempt + 1);
+        }
+
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews")
+            .fetch_one(&pool)
+            .await
+            .expect("review count");
+        assert_eq!(stored, 30);
+    }
 }
