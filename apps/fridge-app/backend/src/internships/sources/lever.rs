@@ -129,7 +129,7 @@ impl Source for LeverSource {
                     // advances toward expiry — which is correct, and is new for this source.
                     BoardRead::Gone => {
                         retired.push(slug.clone());
-                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
+                        scopes.push(ScopeRun::gone(slug.as_str()));
                         enumerated += 1;
                     }
                     BoardRead::Incomplete { kept, error } => {

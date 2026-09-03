@@ -155,7 +155,7 @@ impl Source for GreenhouseSource {
                     // board's postings could only expire on a run where all 485 succeeded.
                     Err(error) if error.is_not_found() => {
                         retired.push(slug.clone());
-                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
+                        scopes.push(ScopeRun::gone(slug.as_str()));
                         enumerated += 1;
                     }
                     Err(error) => {
