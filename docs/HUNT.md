@@ -499,6 +499,24 @@ drift.
 | `gmail` | The Gmail surface actually used. **Read-only by construction** — a test fails the build if a write call appears here |
 | `labels` | The **only** module that modifies a mailbox. Adds labels; never removes one (including its own), never archives, never touches a disregarded message |
 | `sync` | The pass: fetch, record, classify, count. Owns `inbox_runs`, and hosts both write decisions (`labelling_enabled`, `auto_apply_threshold`) |
+
+**`inbox_runs` accounts for every fetched message, since migration `0031`.** Two invariants,
+both checked where the row is written and both queryable afterwards:
+
+```
+fetched    = classified + already_seen
+classified = pressing + confirmation + outreach + disregarded
+```
+
+The second was pinned from the start and holds on every row. The first had **no column to hold
+`already_seen`**, so a run reading `fetched 44, classified 0` said exactly the same thing whether
+those 44 were messages a previous pass had already handled or 44 the classifier had eaten. On
+2026-09-03 that covered 142 of 152 stored runs and 2,881 fetched messages — the quiet-inbox
+failure this table's own design comment says it exists to prevent, in the table itself.
+
+The stored counts are what make this real, not the warnings beside them. `source_runs` can be
+confirmed to hold its equivalent invariant across every run ever recorded precisely because the
+numbers survive the run; a log line only names which row to go and look at.
 | `classify` | The rules layer. A pure function: email in, a constrained enum out, no tools, no SQL — rule 1 |
 | `advance` | Matching, and what an email may do to a status. Rules 2 and 3, pure, no database |
 | `labelset` | 8b's measurement harness. Tooling, not pipeline — documented above |

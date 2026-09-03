@@ -63,6 +63,21 @@ impl SyncReport {
     pub fn counts_balance(&self) -> bool {
         self.classified == self.pressing + self.confirmation + self.outreach + self.disregarded
     }
+
+    /// The half above it: `fetched = classified + already_seen`.
+    ///
+    /// [`counts_balance`](SyncReport::counts_balance) accounts for every message the classifier
+    /// *saw*. This accounts for every message the pass **fetched**, which is the number the
+    /// mailbox actually handed over. Without it a run reading `fetched 44, classified 0` is
+    /// indistinguishable from one that dropped 44 messages — and until migration `0031` there
+    /// was no column recording the difference, so 2,881 fetched messages across 152 runs were
+    /// unaccounted for in the schema.
+    ///
+    /// A failed pass can legitimately fetch and never classify; those are excluded by the caller
+    /// rather than here, because this is a statement about arithmetic and not about outcomes.
+    pub fn accounts_for_every_message(&self) -> bool {
+        self.fetched == self.classified + self.already_seen
+    }
 }
 
 /// Run one pass for a user.
@@ -310,8 +325,9 @@ async fn finish(
             SET finished_at = ?1, outcome = ?2, error = ?3,
                 fetched_count = ?4, classified_count = ?5,
                 pressing_count = ?6, confirmation_count = ?7,
-                outreach_count = ?8, disregarded_count = ?9
-          WHERE id = ?10",
+                outreach_count = ?8, disregarded_count = ?9,
+                already_seen_count = ?10
+          WHERE id = ?11",
     )
     .bind(now.to_rfc3339())
     .bind(outcome)
@@ -322,9 +338,49 @@ async fn finish(
     .bind(report.confirmation)
     .bind(report.outreach)
     .bind(report.disregarded)
+    .bind(report.already_seen)
     .bind(run_id)
     .execute(pool)
     .await?;
+
+    // Both invariants, checked where the numbers are written rather than only in a test.
+    //
+    // **Storing the counts is the load-bearing half, not this warning.** `source_runs` holds
+    // `fetched = accepted + filtered + rejected` for every run ever recorded, and the reason
+    // that invariant could be confirmed to hold — zero violations, checked 2026-09-03 — is that
+    // the numbers are queryable afterwards, not that anything shouted at the time. A log line
+    // nobody greps is worth very little on its own; it earns its place by naming which run to go
+    // and look at, and migration `0031` is what makes looking possible.
+    //
+    // Deliberately not an error and not `outcome = 'partial'`. A pass whose arithmetic is wrong
+    // still fetched real mail and still stored it, and throwing that away would lose data over a
+    // counting bug. `partial` already means "Gmail gave us part of it", which is a different
+    // statement about a different thing.
+    if !report.counts_balance() {
+        eprintln!(
+            "inbox: run {run_id} does not balance — classified {} but bucketed {} \
+             (pressing {} + confirmation {} + outreach {} + disregarded {}). A message was \
+             classified into nothing; the run row is stored and queryable.",
+            report.classified,
+            report.pressing + report.confirmation + report.outreach + report.disregarded,
+            report.pressing,
+            report.confirmation,
+            report.outreach,
+            report.disregarded,
+        );
+    }
+    // Only on a pass that ran to completion: a failure can legitimately fetch and then stop.
+    if outcome == "success" && !report.accounts_for_every_message() {
+        eprintln!(
+            "inbox: run {run_id} does not account for every message — fetched {} but \
+             classified {} + already seen {} = {}. Messages left the pass without being \
+             counted anywhere.",
+            report.fetched,
+            report.classified,
+            report.already_seen,
+            report.classified + report.already_seen,
+        );
+    }
     Ok(())
 }
 
@@ -1052,5 +1108,28 @@ mod tests {
 
         let lost_one = SyncReport { disregarded: 3, ..balanced.clone() };
         assert!(!lost_one.counts_balance(), "a dropped email must not balance");
+
+        // The half above it, which nothing recorded until migration 0031. A pass that fetches
+        // 44 and classifies 0 is a healthy idle pass when the 44 were already seen, and a
+        // catastrophe when they were not — and for 152 runs the stored row said the same thing
+        // either way.
+        let idle = SyncReport {
+            fetched: 44,
+            classified: 0,
+            already_seen: 44,
+            ..SyncReport::default()
+        };
+        assert!(idle.accounts_for_every_message(), "an idle pass accounts for everything");
+
+        let lost = SyncReport {
+            fetched: 44,
+            classified: 0,
+            already_seen: 0,
+            ..SyncReport::default()
+        };
+        assert!(
+            !lost.accounts_for_every_message(),
+            "44 messages fetched and counted nowhere must not balance"
+        );
     }
 }
