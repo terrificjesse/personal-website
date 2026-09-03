@@ -673,8 +673,15 @@ anything at all.
 
 Measured on the first uncapped run (2026-09-02): Greenhouse polled **485 boards, 484 read
 cleanly, one — `designmehair` — returned a network error**, and the source-level verdict was
-therefore `partial`. Not one of those 484 complete enumerations counted toward closure. At 485
-boards a fully clean sweep is improbable, so that was the steady state, not an unlucky run.
+therefore `partial`. Not one of those 484 complete enumerations counted toward closure.
+
+**Corrected 2026-09-03, and the correction matters.** The sentence that used to follow said a
+clean sweep at 485 boards is "improbable" and that this was the steady state. That was a rate
+inferred from a single observation. Over its full recorded history Greenhouse is
+**`success` on 8 of 16 runs** — Lever 16 of 20, Ashby 14 of 18. So the real cost was never "this
+source cannot expire anything"; it was that **half** of its runs contribute nothing, which
+roughly doubles the wall-clock time to reach the three-consecutive-eligible-runs threshold.
+Scoping recovers those runs. A real gain, and a smaller one than first claimed.
 
 A **scope** is a sub-unit of a source that can be enumerated completely on its own. The rule is
 unchanged — absence is evidence only from a complete enumeration — but completeness is now

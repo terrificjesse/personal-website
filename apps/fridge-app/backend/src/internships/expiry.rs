@@ -23,9 +23,14 @@
 //! `settle_source_run` grants the right to advance counters per SOURCE, and for a source that
 //! is one endpoint that is the right unit. Greenhouse is 485 endpoints under one name, and
 //! "`Success` only if every board was enumerated" then means one unreachable board disqualifies
-//! the other 484. On the 2026-09-02 uncapped run that is precisely what happened, and at 485
-//! boards it is the steady state rather than bad luck: the largest ATS source could
-//! essentially never expire anything.
+//! the other 484. On the 2026-09-02 uncapped run that is precisely what happened.
+//!
+//! **Corrected 2026-09-03.** This doc previously said Greenhouse "could essentially never expire
+//! anything", inferring a rate from one observation. Measured over its full history it succeeds
+//! on **8 of 16 runs** — half. So the cost was never "no expiry"; it was that *half* of
+//! Greenhouse's runs contributed nothing, and the three-consecutive-eligible-runs threshold
+//! therefore took about twice as long to reach as the collection cadence suggests. Scoping
+//! recovers those runs, which is a real gain and a smaller one than the original claim.
 //!
 //! A source may now report [`ScopeRun`]s — per-board verdicts — and counters advance for the
 //! scopes that were completely enumerated. The rule is unchanged, only its grain: absence is

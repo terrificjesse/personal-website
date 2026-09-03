@@ -40,11 +40,15 @@
 //!
 //! # ...and why that stopped being enough
 //!
-//! All three rules are still exactly right, and all three together made this source unable to
-//! expire anything. On the 2026-09-02 uncapped run 484 boards read cleanly, `designmehair`
+//! All three rules are still exactly right, and all three together cost this source half its
+//! expiry evidence. On the 2026-09-02 uncapped run 484 boards read cleanly, `designmehair`
 //! returned a network error, and the source-level verdict was `Partial` — so not one of the
-//! 484 complete enumerations counted for expiry. At 485 boards a clean sweep is improbable, so
-//! that was the steady state, not bad luck.
+//! 484 complete enumerations counted for expiry.
+//!
+//! **Corrected 2026-09-03**: an earlier version of this doc called a clean sweep "improbable"
+//! and said the source could never expire anything. Measured, Greenhouse succeeds on **8 of 16
+//! runs**. Half its runs are wasted for expiry, not all of them — which is what scoping
+//! recovers.
 //!
 //! This adapter therefore also reports a [`ScopeRun`] per board. The aggregate rules above are
 //! untouched; the boards that *were* fully enumerated now say so individually, and

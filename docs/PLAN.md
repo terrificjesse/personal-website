@@ -1487,8 +1487,16 @@ small share of the corpus.
 
 ### Three findings, one of which corrects an earlier claim in this document
 
-**1. Greenhouse can almost never expire anything.** One failed board out of 485 makes the whole
-source `partial`, and `partial` may never advance disappearance counters. That is exactly the
+**1. Greenhouse loses half its expiry evidence.** One failed board out of 485 makes the whole
+source `partial`, and `partial` may never advance disappearance counters.
+
+> **Corrected 2026-09-03.** This finding was originally written as "Greenhouse can almost never
+> expire anything", and the sections below inherited that. It was a rate inferred from one run.
+> Measured across all 16 recorded Greenhouse runs: **8 succeeded**. Half its runs are wasted for
+> expiry, not effectively all of them. Everything built on this finding — 12i, 12j, 12k — is
+> still worth having, because recovering half a source's evidence is a real gain; the
+> justification was simply inflated, and inflated justifications are how a project talks itself
+> into work it has not measured. That is exactly the
 rule Phase 7 wanted — a blocked fetch must not expire what it used to supply — but at 485 boards
 the chance of a clean sweep is small, so in practice the largest ATS source is permanently
 disqualified from expiry. Worth deciding deliberately rather than discovering later: per-board
@@ -1715,9 +1723,11 @@ not. What that costs: the run cannot be re-run, the "before" is whatever
 `fridge-20260903T002827Z.db` happens to contain, and anything the backup does not capture is
 simply unavailable.
 
-**Greenhouse was `success` for the first time ever** — 485 of 485 scopes completed. On 12c one
-board of 485 failed, the whole source was disqualified, and that is the finding this entire arc
-started from. Five sources counted for expiry, the most in any run so far.
+**Greenhouse was `success` with scopes recorded for the first time** — 485 of 485. Note the
+qualifier: an earlier draft of this section said "`success` for the first time ever", which is
+false. Greenhouse had succeeded on seven previous runs; what was new here is that `0026` was
+applied, so the success was recorded *per board*. Five sources counted for expiry, the most in
+any run so far.
 
 #### The arithmetic, verified against the backup rather than taken on trust
 
