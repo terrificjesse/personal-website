@@ -884,6 +884,43 @@ as a collision-free wire key — a real variant may be named `no variant`, but l
 empty — and the site renders that key as **No variant**. Tests pin both the explicit bucket and
 the sum of all variant buckets equalling the report's application total.
 
+### 13f — the classifier regression gate, and why its fixture is a liability as well as an asset
+
+`cargo run -- labelset gate`, run in CI on every push and pull request. It grades a committed
+labelled set with `classify::classify`, compares five counts against
+`data/inbox/regression-baseline.json`, and exits non-zero if **any** of them got worse.
+
+**The fixture is synthetic and it grades the harness, not the classifier.** Twelve invented
+messages, written to touch each category once. A green gate says the rules still do what they
+did to twelve strings somebody made up. It says nothing about real mail, and the moment it is
+read as a quality signal it becomes worse than having no gate — a number that looks like
+evidence and is not is the failure this project keeps finding in its own prose. The real
+measurement is 13b's hand-labelled fortnight. **When that exists, point the gate at it and keep
+this fixture only as a fast smoke test.**
+
+Three design points worth not re-deriving:
+
+- **Counts, not rates.** The fixture is fixed so every denominator is fixed, and integers do not
+  raise the question of whether 8.33% and 8.34% differ. Rates are still printed for a human; the
+  comparison never uses them.
+- **No budget between the failure modes.** Each of the three is compared alone and any one
+  worsening fails, because they do not cost the same thing — a tidier Outreach folder does not
+  repay a lost interview. `a_gain_in_one_mode_does_not_pay_for_a_loss_in_another` pins that, and
+  it is the same refusal-to-average the two-denominator report is built on.
+- **A shrinking fixture fails.** Deleting the rows a change breaks is the cheapest way to make
+  any gate green, so a row-count change is itself a regression and has to be re-baselined
+  deliberately with `--update`.
+
+**One row disagrees today and that is recorded, not hidden.** `syn-008`, a staffing-agency cold
+email labelled `outreach`, is classified `disregarded` — the relevance gate making a debatable
+call. The baseline records `real_mail_disregarded: 1` rather than the fixture being edited until
+the number looked better. If a future change fixes it, agreement rises and the gate reports an
+improvement; if the fixture had been tuned, the same change would have been invisible.
+
+The gate needs **no database and no secrets** — fixture, company list and baseline are all
+`include_str!`d into the binary. A gate that needed the live database could not run in CI, and
+one that read its fixture off disk could be pointed at a different one.
+
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
 The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first
