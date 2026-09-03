@@ -16,6 +16,9 @@
 //! reason this is a table rather than a queue in the extension.
 
 pub mod answers;
+pub mod deadline;
 pub mod events;
+pub mod nudge;
 pub mod profile;
 pub mod tokens;
+pub mod variants;

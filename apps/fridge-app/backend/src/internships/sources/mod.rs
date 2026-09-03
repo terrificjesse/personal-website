@@ -45,6 +45,20 @@
 //! - **A truncated feed can never be `Success`.** WeWorkRemotely publishes the 25 most recent
 //!   items and nothing older, so a complete enumeration is not available at any price and
 //!   absence from it means nothing at all.
+//!
+//! # Scopes: the same rule at a finer grain
+//!
+//! Those three rules are about one verdict for a whole source, and for a source that is one
+//! endpoint that is the right shape. Greenhouse is 485 endpoints under one name, and the first
+//! rule then means a single unreachable board disqualifies the other 484 — which on the
+//! 2026-09-02 uncapped run is exactly what happened.
+//!
+//! A source may therefore also report [`ScopeRun`]s: per-scope verdicts, attached with
+//! [`SourceFetch::with_scopes`], where a scope is a sub-unit it can enumerate completely on its
+//! own. The source-level outcome is unchanged and still means what it always meant — scopes are
+//! additive, and a source that reports none behaves exactly as it did before. Greenhouse is the
+//! only scoped source today; Lever and Ashby are the obvious next candidates and need only the
+//! adapter half, the rest of the mechanism being source-agnostic.
 
 pub mod ashby;
 pub mod best_effort;
@@ -62,7 +76,7 @@ use serde::Deserialize;
 
 use super::expiry::SourceRunResult;
 use super::http::PoliteClient;
-use super::models::{RawPosting, SourceOutcome};
+use super::models::{RawPosting, ScopeRun, SourceOutcome};
 
 // ------------------------------------------------------------------------------------------
 // The result of one source's run
@@ -81,6 +95,7 @@ pub struct SourceFetch {
     postings: Vec<RawPosting>,
     closed_external_ids: Vec<String>,
     error: Option<String>,
+    scopes: Vec<ScopeRun>,
 }
 
 impl SourceFetch {
@@ -95,6 +110,7 @@ impl SourceFetch {
             postings,
             closed_external_ids: Vec::new(),
             error: None,
+            scopes: Vec::new(),
         }
     }
 
@@ -107,6 +123,7 @@ impl SourceFetch {
             postings,
             closed_external_ids: Vec::new(),
             error: Some(reason.into()),
+            scopes: Vec::new(),
         }
     }
 
@@ -117,6 +134,7 @@ impl SourceFetch {
             postings: Vec::new(),
             closed_external_ids: Vec::new(),
             error: Some(reason.into()),
+            scopes: Vec::new(),
         }
     }
 
@@ -128,6 +146,7 @@ impl SourceFetch {
             postings: Vec::new(),
             closed_external_ids: Vec::new(),
             error: Some(reason.into()),
+            scopes: Vec::new(),
         }
     }
 
@@ -140,6 +159,22 @@ impl SourceFetch {
     /// expire these with `ExpiryReason::SourceMarkedClosed`.
     pub fn with_closed_ids(mut self, ids: Vec<String>) -> Self {
         self.closed_external_ids = ids;
+        self
+    }
+
+    /// Declare what each of this source's scopes did — see [`ScopeRun`].
+    ///
+    /// Additive: the overall [`SourceOutcome`] is unchanged and still means what it always
+    /// meant. A source that reports scopes is saying "my verdict is answerable at a finer
+    /// grain than one row", and `expiry::settle_source_run` will then advance disappearance
+    /// counters for the completed scopes even when the source as a whole is `Partial`.
+    ///
+    /// **The postings and the scopes must come from the same pass.** A scope reported
+    /// `Completed` whose ids are missing from `external_ids` gets its whole board incremented
+    /// and nothing reset, which is the one way this mechanism loses data. Build both from one
+    /// parse, never from two.
+    pub fn with_scopes(mut self, scopes: Vec<ScopeRun>) -> Self {
+        self.scopes = scopes;
         self
     }
 
@@ -157,6 +192,10 @@ impl SourceFetch {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn scopes(&self) -> &[ScopeRun] {
+        &self.scopes
     }
 }
 
@@ -224,8 +263,14 @@ pub struct SourceContext {
     /// Ceiling on boards fetched per multi-board source in one run.
     ///
     /// Defaults to no cap. A cap makes the run finish sooner and makes the enumeration
-    /// incomplete, so a capped source reports [`SourceOutcome::Partial`] **forever** and can
-    /// never expire anything. That is the correct trade and it is not free; set it knowingly.
+    /// incomplete, so a capped source reports [`SourceOutcome::Partial`] **forever**.
+    ///
+    /// What that costs changed with migration 0026. For an unscoped source it is still total:
+    /// `Partial` advances no counters, so a capped Lever or Ashby can never expire anything.
+    /// For a **scoped** source it is now proportional — the boards inside the cap are genuinely
+    /// complete enumerations and do advance counters; the boards beyond it have no verdict and
+    /// are left alone. A capped Greenhouse therefore expires within the slice it polled, which
+    /// is correct, and is worth knowing before setting a cap and assuming nothing can move.
     pub max_boards_per_run: usize,
     /// Sources switched off by configuration. They still produce a `source_runs` row, with
     /// [`SourceOutcome::Skipped`] — a source that vanishes from the health panel looks like a
@@ -452,11 +497,19 @@ fn into_output(name: &str, fetch: SourceFetch) -> SourceRunOutput {
     let outcome = fetch.outcome();
     let fetched = fetch.postings().len() as i64;
 
-    // Populated **only** on `Success`. `expiry::settle_source_run` documents this field as
-    // meaningful only then, and leaving it empty otherwise means that if a future edit ever
-    // let a partial run advance counters, the blanket-increment-then-reset would find no ids
-    // to reset and expire everything — a loud, immediate failure instead of a silent wrong
-    // answer. The postings themselves are still returned, so nothing is lost.
+    // Populated **only** on `Success`, and used only by the unscoped settle path.
+    // `expiry::settle_source_run` documents this field as meaningful only then, and leaving it
+    // empty otherwise means that if a future edit ever let a partial run advance counters, the
+    // blanket-increment-then-reset would find no ids to reset and expire everything — a loud,
+    // immediate failure instead of a silent wrong answer. The postings themselves are still
+    // returned, so nothing is lost.
+    //
+    // Migration 0026 is that future edit, arriving on purpose: a scoped source's partial run
+    // now does advance counters. It does not weaken this, because the scoped path never reads
+    // this field. It reads `ScopeRun::external_ids` instead, and the equivalent safety net
+    // there is structural rather than incidental — a scope's verdict and its ids are built in
+    // the same pass, so "completed with no ids" is not a state an adapter reaches by
+    // forgetting something. See `ScopeRun` and `greenhouse::fetch`.
     let seen_external_ids = if outcome == SourceOutcome::Success {
         fetch
             .postings()
@@ -467,10 +520,13 @@ fn into_output(name: &str, fetch: SourceFetch) -> SourceRunOutput {
         Vec::new()
     };
 
+    let scopes = fetch.scopes().to_vec();
+
     let result = SourceRunResult {
         source: name.to_string(),
         outcome,
         seen_external_ids,
+        scopes,
         fetched,
         // QC has not run. The coordinator sets these three after `normalize::normalize`.
         accepted: 0,

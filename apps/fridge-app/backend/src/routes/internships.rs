@@ -60,7 +60,8 @@ use crate::internships::models::{
     Application, Season, ApplicationStatus, CreateApplicationRequest, MAX_APPLICATION_NOTES_LENGTH,
     UpdateApplicationRequest,
 };
-use crate::routes::auth::{CurrentUser, RequireAdmin};
+use crate::internships::application_events::{self, Actor, NewApplicationEvent};
+use crate::routes::auth::{Credential, CurrentUser, RequireAdmin};
 
 /// The application columns plus the one derived field.
 ///
@@ -118,6 +119,7 @@ pub async fn list_applications(
 pub async fn create_application(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
+    credential: Credential,
     Json(req): Json<CreateApplicationRequest>,
 ) -> Result<(StatusCode, Json<Application>), StatusCode> {
     let status = match req.status.as_deref() {
@@ -184,8 +186,31 @@ pub async fn create_application(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Which résumé was sent. Checked before the insert so an unknown or archived variant is a
+    // 400 rather than a foreign-key error at the bottom of a transaction — and archived is
+    // refused deliberately: retiring a variant means "no longer sending this one", so attaching
+    // it to a new application would be recording something that did not happen.
+    if let Some(variant_id) = req.resume_variant_id.as_deref()
+        && !crate::hunt::variants::is_attachable(&pool, &user.id, variant_id)
+            .await
+            .map_err(|err| {
+                eprintln!("internships: checking a resume variant failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
+
+    // One transaction: the application row and the event that records its creation. The event
+    // is inserted *after* the row because `application_events.application_id` is a real
+    // enforced foreign key — sqlx turns `PRAGMA foreign_keys` on per connection.
+    let mut tx = crate::db::begin_write(&pool).await.map_err(|err| {
+        eprintln!("internships: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let result = sqlx::query(
         "INSERT INTO internship_applications
@@ -193,9 +218,10 @@ pub async fn create_application(
              company_name, title, url, location_raw,
              pay_min, pay_max, pay_currency, pay_period,
              term_season, term_year, source, snapshot_json, snapshot_at,
-             status, applied_at, status_changed_at, notes, created_at, updated_at)
+             status, applied_at, status_changed_at, notes, created_at, updated_at,
+             resume_variant_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?16, ?16, ?18, ?16, ?16)",
+                 ?17, ?16, ?16, ?18, ?16, ?16, ?19)",
     )
     .bind(&id)
     .bind(&user.id)
@@ -215,7 +241,8 @@ pub async fn create_application(
     .bind(now)
     .bind(status.as_str())
     .bind(&notes)
-    .execute(&pool)
+    .bind(&req.resume_variant_id)
+    .execute(&mut *tx)
     .await;
 
     if let Err(err) = result {
@@ -230,6 +257,36 @@ pub async fn create_application(
         eprintln!("internships: inserting application failed: {err:?}");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // The creation event. `from_status` is NULL because there was no previous state — not
+    // because it is unknown — and `to_status` is what was actually created, which the request
+    // may set to something other than `applied`.
+    //
+    // The actor comes from the credential, not from anything the caller said about itself: an
+    // application tracked from the extension's "track this application" arrives on a hunt-token
+    // bearer, one created on the site on a session cookie.
+    application_events::record(
+        &mut tx,
+        NewApplicationEvent {
+            application_id: &id,
+            from_status: None,
+            to_status: status,
+            actor: credential.into(),
+            cause: None,
+            at: now,
+            note: None,
+        },
+    )
+    .await
+    .map_err(|err| {
+        eprintln!("internships: recording the creation event failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tx.commit().await.map_err(|err| {
+        eprintln!("internships: committing a new application failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let created = fetch_application(&pool, &user.id, &id).await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -252,6 +309,16 @@ pub async fn update_application(
 
     let now = Utc::now();
 
+    // **One transaction for the whole edit.** A request can carry both a status and a note,
+    // and landing one without the other leaves the tracker in a state the caller never asked
+    // for and gets no error about. It is also the transaction the Phase 10 event record hangs
+    // on: the status change and the row that describes it have to commit together or not at
+    // all — see `docs/HUNT.md` § `application_events`.
+    let mut tx = crate::db::begin_write(&pool).await.map_err(|err| {
+        eprintln!("internships: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     if let Some(raw) = req.status.as_deref() {
         let status = ApplicationStatus::parse(raw).ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -271,12 +338,38 @@ pub async fn update_application(
         .bind(now)
         .bind(&id)
         .bind(&user.id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| {
             eprintln!("internships: updating application status failed: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+        // Only when it actually moved. The log records transitions that happened; a no-op
+        // write is not one, and the same `changed` flag already gates `status_changed_at`.
+        //
+        // `cause_id` is NULL here, and SQLite treats NULLs as distinct in a UNIQUE index — so
+        // two manual edits are two events, which is correct. The idempotency the key provides
+        // covers email- and extension-caused writes only.
+        if changed {
+            application_events::record(
+                &mut tx,
+                NewApplicationEvent {
+                    application_id: &id,
+                    from_status: ApplicationStatus::parse(&existing.status),
+                    to_status: status,
+                    actor: Actor::Manual,
+                    cause: None,
+                    at: now,
+                    note: None,
+                },
+            )
+            .await
+            .map_err(|err| {
+                eprintln!("internships: recording a manual status change failed: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
     }
 
     if let Some(raw) = req.notes.as_deref() {
@@ -289,13 +382,18 @@ pub async fn update_application(
         .bind(now)
         .bind(&id)
         .bind(&user.id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| {
             eprintln!("internships: updating application notes failed: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
+
+    tx.commit().await.map_err(|err| {
+        eprintln!("internships: committing an application edit failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(fetch_application(&pool, &user.id, &id).await?))
 }
@@ -526,7 +624,17 @@ pub struct SourceRunSummary {
     /// Whether this run was allowed to advance disappearance counters. Surfaced rather than
     /// hidden because "this source succeeded but still expired nothing" is a state a human
     /// needs to be able to see and understand, not a silent internal detail.
+    ///
+    /// Since migration 0026 this means "trusted for at least one scope", which for every
+    /// single-endpoint source is the same statement it always made. The two fields below are
+    /// what keeps the Greenhouse case from reading as either extreme.
     pub counts_for_expiry: bool,
+    /// Scopes — Greenhouse boards — this run enumerated completely. `0` for a source that has
+    /// no scopes, which is every source but Greenhouse.
+    pub scopes_completed: i64,
+    /// Scopes this run reached a verdict on at all. `scopes_completed < scopes_attempted` is
+    /// the 484-of-485 case: real expiry happened, and not for everything.
+    pub scopes_attempted: i64,
     pub error: Option<String>,
 }
 
@@ -685,7 +793,13 @@ pub async fn run_health(
         let sources = sqlx::query_as::<_, SourceRunSummary>(
             "SELECT run_id, source, started_at, finished_at, outcome,
                     fetched_count, accepted_count, filtered_count, rejected_count,
-                    counts_for_expiry, error
+                    counts_for_expiry,
+                    (SELECT COUNT(*) FROM source_run_scopes sc
+                      WHERE sc.source_run_id = source_runs.id AND sc.outcome = 'completed')
+                        AS scopes_completed,
+                    (SELECT COUNT(*) FROM source_run_scopes sc
+                      WHERE sc.source_run_id = source_runs.id) AS scopes_attempted,
+                    error
              FROM source_runs WHERE run_id = ? ORDER BY source",
         )
         .bind(&run.id)
@@ -1170,10 +1284,12 @@ mod handler_tests {
         let (status, Json(app)) = create_application(
             State(pool.clone()),
             me,
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
                 notes: Some("first choice".into()),
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1202,10 +1318,12 @@ mod handler_tests {
         let _ = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1236,10 +1354,12 @@ mod handler_tests {
         let _ = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
                 notes: Some("mine".into()),
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1262,10 +1382,12 @@ mod handler_tests {
         let (_, Json(app)) = create_application(
             State(pool.clone()),
             me.clone(),
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await
@@ -1303,12 +1425,13 @@ mod handler_tests {
                 posting_id: "p1".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             })
         };
-        let _ = create_application(State(pool.clone()), me.clone(), req())
+        let _ = create_application(State(pool.clone()), me.clone(), Credential::Session, req())
             .await
             .unwrap();
-        let second = create_application(State(pool.clone()), me, req()).await;
+        let second = create_application(State(pool.clone()), me, Credential::Session, req()).await;
         assert_eq!(second.unwrap_err(), StatusCode::CONFLICT);
     }
 
@@ -1319,10 +1442,12 @@ mod handler_tests {
         let result = create_application(
             State(pool.clone()),
             me,
+            Credential::Session,
             Json(CreateApplicationRequest {
                 posting_id: "nope".into(),
                 status: None,
                 notes: None,
+                resume_variant_id: None,
             }),
         )
         .await;
@@ -1405,5 +1530,244 @@ mod handler_tests {
             .await
             .unwrap();
         assert!(health.in_progress.is_none());
+    }
+
+    // ---- 10e part 2: provenance and manual transitions ----
+
+    async fn actors_for(pool: &SqlitePool, application_id: &str) -> Vec<(String, Option<String>)> {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT actor, cause_id FROM application_events
+              WHERE application_id = ? ORDER BY at ASC, created_at ASC, id ASC",
+        )
+        .bind(application_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The credential decides the actor, not a field in the request body.
+    #[tokio::test]
+    async fn an_application_created_through_the_extension_is_recorded_as_such() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        posting(&pool, "p2").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let (_, Json(from_extension)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Credential::HuntToken,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+                resume_variant_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(from_site)) = create_application(
+            State(pool.clone()),
+            me,
+            Credential::Session,
+            Json(CreateApplicationRequest {
+                posting_id: "p2".into(),
+                status: None,
+                notes: None,
+                resume_variant_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actors_for(&pool, &from_extension.id).await,
+            vec![("extension".to_string(), None)]
+        );
+        assert_eq!(
+            actors_for(&pool, &from_site.id).await,
+            vec![("manual".to_string(), None)]
+        );
+    }
+
+    /// Manual edits carry a NULL cause, and SQLite treats NULLs as distinct in a UNIQUE index —
+    /// so two edits are two events. That is correct: the key's idempotency covers email- and
+    /// extension-caused writes, and two deliberate edits are two things that happened.
+    #[tokio::test]
+    async fn two_manual_status_edits_are_two_events_and_a_no_op_edit_is_none() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let (_, Json(app)) = create_application(
+            State(pool.clone()),
+            me.clone(),
+            Credential::Session,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+                resume_variant_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        for status in ["oa", "interview"] {
+            let _moved = update_application(
+                State(pool.clone()),
+                me.clone(),
+                Path(app.id.clone()),
+                Json(UpdateApplicationRequest {
+                    status: Some(status.into()),
+                    notes: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Re-sending the status it already has moves nothing, so it records nothing.
+        let _unchanged = update_application(
+            State(pool.clone()),
+            me.clone(),
+            Path(app.id.clone()),
+            Json(UpdateApplicationRequest {
+                status: Some("interview".into()),
+                notes: Some("still nothing to record".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let events = actors_for(&pool, &app.id).await;
+        assert_eq!(
+            events,
+            vec![
+                ("manual".to_string(), None), // creation
+                ("manual".to_string(), None), // applied -> oa
+                ("manual".to_string(), None), // oa -> interview
+            ],
+            "three transitions happened; the fourth request changed nothing"
+        );
+    }
+
+
+    /// Attaching a résumé that is not yours, does not exist, or has been retired is a 400 —
+    /// checked before the insert, so it never reaches a foreign-key error mid-transaction.
+    #[tokio::test]
+    async fn a_variant_that_cannot_be_attached_is_a_bad_request_not_a_500() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+
+        let retired = crate::hunt::variants::create(
+            &pool,
+            &me.0.id,
+            crate::hunt::variants::NewVariant { label: "retired".into(), notes: None },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        crate::hunt::variants::edit(
+            &pool,
+            &me.0.id,
+            &retired.id,
+            crate::hunt::variants::EditVariant { label: None, notes: None, archived: Some(true) },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        for variant_id in ["does-not-exist".to_string(), retired.id.clone()] {
+            let result = create_application(
+                State(pool.clone()),
+                me.clone(),
+                Credential::Session,
+                Json(CreateApplicationRequest {
+                    posting_id: "p1".into(),
+                    status: None,
+                    notes: None,
+                    resume_variant_id: Some(variant_id.clone()),
+                }),
+            )
+            .await;
+            assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST), "{variant_id}");
+        }
+
+        // And nothing was written on the way to refusing.
+        let applications: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM internship_applications")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applications, 0);
+    }
+
+    #[tokio::test]
+    async fn an_application_records_the_variant_it_was_sent_with() {
+        let pool = pool().await;
+        posting(&pool, "p1").await;
+        let me = user(&pool, "a@test.local").await;
+        let variant = crate::hunt::variants::create(
+            &pool,
+            &me.0.id,
+            crate::hunt::variants::NewVariant { label: "one-page".into(), notes: None },
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (_, Json(created)) = create_application(
+            State(pool.clone()),
+            me,
+            Credential::HuntToken,
+            Json(CreateApplicationRequest {
+                posting_id: "p1".into(),
+                status: None,
+                notes: None,
+                resume_variant_id: Some(variant.id.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT resume_variant_id FROM internship_applications WHERE id = ?",
+        )
+        .bind(&created.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some(variant.id.as_str()));
+    }
+
+    /// The seam between `popup.js` and this handler, pinned the way 8g's was.
+    ///
+    /// The extension and these routes meet in two languages with no compiler between them. A
+    /// renamed field here degrades to an application that is silently *unattributed* — which
+    /// is indistinguishable from one where the user chose "Not recorded", and would go
+    /// unnoticed until a report months later showed everything in the "no variant" bucket.
+    ///
+    /// So this deserializes the exact body the popup builds, rather than a struct literal.
+    #[test]
+    fn the_popup_body_deserializes_into_the_request_the_handler_expects() {
+        // Exactly what popup.js sends when a variant is chosen.
+        let with_variant: CreateApplicationRequest = serde_json::from_str(
+            r#"{"posting_id":"p1","resume_variant_id":"v1"}"#,
+        )
+        .expect("the popup's body must deserialize");
+        assert_eq!(with_variant.posting_id, "p1");
+        assert_eq!(with_variant.resume_variant_id.as_deref(), Some("v1"));
+
+        // And what it sends when the empty "Not recorded" option is selected: the key is
+        // omitted entirely rather than sent as "", which would be a variant id of "".
+        let without: CreateApplicationRequest =
+            serde_json::from_str(r#"{"posting_id":"p1"}"#).expect("still valid");
+        assert_eq!(without.resume_variant_id, None);
     }
 }

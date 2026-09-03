@@ -1,0 +1,44 @@
+# Frontend: Next.js, `next start` against a production build.
+# Install to /etc/systemd/system/personal-website-frontend.service.
+#
+# It listens on loopback only. Nothing but the reverse proxy should be able to reach it, and
+# binding it publicly would put a second origin on the host — the thing § One origin exists
+# to avoid.
+
+[Unit]
+Description=Hunt frontend (Next.js)
+Documentation=file:///opt/personal-website/docs/DEPLOY.md
+After=network-online.target personal-website-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personal-website
+Group=personal-website
+WorkingDirectory=/opt/personal-website/frontend
+
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+# NEXT_PUBLIC_* is baked in at BUILD time, not read here — see docs/DEPLOY.md § Redeploy.
+EnvironmentFile=-/etc/personal-website/frontend.env
+
+ExecStart=/usr/bin/npm run start
+
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=personal-website-frontend
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# `next start` writes runtime caches (fetch cache, optimized images) into .next/cache, and
+# ProtectSystem=strict makes the whole filesystem read-only otherwise. Without this the server
+# starts and then fails at runtime in ways that look like application bugs.
+ReadWritePaths=/opt/personal-website/frontend/.next
+
+[Install]
+WantedBy=multi-user.target

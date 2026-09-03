@@ -95,6 +95,103 @@ pub enum SourceOutcome {
     Skipped,
 }
 
+/// A sub-unit of a source that can be enumerated completely on its own — a Greenhouse board
+/// slug, today, and nothing else.
+///
+/// # Why this exists
+///
+/// [`SourceOutcome`] is one verdict for a whole source, and for a source that is one endpoint
+/// that is exactly right. For Greenhouse it is 485 endpoints under one name, and the aggregate
+/// rule ("`Success` only if every board was enumerated") means one unreachable board out of
+/// 485 makes the entire source `Partial` and therefore unable to expire anything. Measured on
+/// the 2026-09-02 uncapped run: 484 boards read cleanly, `designmehair` returned a network
+/// error, and the source contributed nothing to expiry. At that board count a clean sweep is
+/// improbable, so the largest ATS source was structurally disqualified — not by a bug, but by
+/// the granularity of the verdict.
+///
+/// A scope restores the granularity without weakening the rule. Absence is still evidence only
+/// from a **complete** enumeration; the change is that "complete" is now answerable per board.
+///
+/// # A scope is all-or-nothing
+///
+/// There is deliberately no `Partial` here. If a sub-unit can be half-read, it is not a scope —
+/// splitting it further, or leaving it unscoped, are the two honest options. Greenhouse returns
+/// a whole board in one request with no pagination, which is what makes its boards scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeOutcome {
+    /// Everything this scope currently offers was seen. Absence from it is evidence.
+    ///
+    /// A board that answers 404 on its *list* endpoint is `Completed` with zero postings, not
+    /// `Failed`: "no such board" is an unambiguous statement that it offers nothing, and its
+    /// postings should expire. See `docs/INTERNSHIP_SCRAPING.md` § A.1.
+    Completed,
+    /// Unreachable, unparseable, or never attempted. Proves nothing about what it holds.
+    Failed,
+}
+
+impl ScopeOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeOutcome::Completed => "completed",
+            ScopeOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// What one scope did on one run.
+///
+/// `external_ids` is the load-bearing field and the reason this carries ids at all rather than
+/// just a verdict: the settle step increments every sighting in a completed scope and then
+/// resets the ones it saw, so a completed scope that failed to report its ids would expire its
+/// whole board. The two therefore come from the same place in the adapter — see
+/// [`crate::internships::sources::greenhouse`], where both are built from one `parse_board`
+/// call — and never from two passes that could disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeRun {
+    /// Stable within its source, and used as a database key on `posting_sightings.scope`.
+    /// Changing the naming scheme orphans every sighting tagged with the old one, exactly as
+    /// renaming a source does.
+    pub scope: String,
+    pub outcome: ScopeOutcome,
+    /// Ids seen in this scope. Empty and ignored unless `outcome` is
+    /// [`ScopeOutcome::Completed`].
+    pub external_ids: Vec<String>,
+    /// What this scope returned, for the health panel. A board that went from 300 to 0 while
+    /// reporting `Completed` is worth a human's attention.
+    pub fetched: i64,
+    /// Why it failed. Non-`None` exactly when `outcome` is [`ScopeOutcome::Failed`] — the
+    /// per-scope rows are the only place a run's 400th failure is legible, since the
+    /// source-level error string shows three and a count.
+    pub error: Option<String>,
+}
+
+impl ScopeRun {
+    pub fn completed(scope: impl Into<String>, external_ids: Vec<String>) -> Self {
+        ScopeRun {
+            scope: scope.into(),
+            outcome: ScopeOutcome::Completed,
+            fetched: external_ids.len() as i64,
+            external_ids,
+            error: None,
+        }
+    }
+
+    pub fn failed(scope: impl Into<String>, error: impl Into<String>) -> Self {
+        ScopeRun {
+            scope: scope.into(),
+            outcome: ScopeOutcome::Failed,
+            external_ids: Vec::new(),
+            fetched: 0,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.outcome == ScopeOutcome::Completed
+    }
+}
+
 /// Whether a row we didn't keep was correctly excluded or wrongly lost.
 ///
 /// The split is the whole point of `posting_rejects`: a source returning thousands of
@@ -543,6 +640,9 @@ pub struct CreateApplicationRequest {
     /// Defaults to `applied` when omitted, which is what pressing "I applied" means.
     pub status: Option<String>,
     pub notes: Option<String>,
+    /// Which résumé was sent (Phase 12f). Optional, and an application without one stays
+    /// unattributed forever — see `docs/HUNT.md` § Résumé variants on why nothing guesses.
+    pub resume_variant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

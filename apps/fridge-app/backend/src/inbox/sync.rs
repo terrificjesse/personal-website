@@ -26,6 +26,8 @@ use uuid::Uuid;
 
 use crate::hunt::events::{self, EventKind, NewHuntEvent};
 
+use super::due_dates;
+use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 
 use super::classify::{self, Category};
@@ -60,6 +62,21 @@ impl SyncReport {
     /// rejected` in `source_runs`.
     pub fn counts_balance(&self) -> bool {
         self.classified == self.pressing + self.confirmation + self.outreach + self.disregarded
+    }
+
+    /// The half above it: `fetched = classified + already_seen`.
+    ///
+    /// [`counts_balance`](SyncReport::counts_balance) accounts for every message the classifier
+    /// *saw*. This accounts for every message the pass **fetched**, which is the number the
+    /// mailbox actually handed over. Without it a run reading `fetched 44, classified 0` is
+    /// indistinguishable from one that dropped 44 messages — and until migration `0031` there
+    /// was no column recording the difference, so 2,881 fetched messages across 152 runs were
+    /// unaccounted for in the schema.
+    ///
+    /// A failed pass can legitimately fetch and never classify; those are excluded by the caller
+    /// rather than here, because this is a statement about arithmetic and not about outcomes.
+    pub fn accounts_for_every_message(&self) -> bool {
+        self.fetched == self.classified + self.already_seen
     }
 }
 
@@ -242,6 +259,19 @@ pub async fn run(
             eprintln!("inbox: could not record a status proposal: {err:?}");
         }
 
+        // 11f: a due date, if the text carries one. Pressing categories only — a deadline in
+        // a newsletter is noise, and rule 7's "disregarded means unlabelled, not unrecorded"
+        // is about the verdict, not about mining every message for dates.
+        //
+        // Failure is logged and the pass continues: an unextracted deadline is a missing
+        // convenience, while a failed sync is a missing OA.
+        if verdict.category.is_pressing()
+            && let Err(err) =
+                record_deadline(pool, user_id, &message, &verdict, &applications, now).await
+        {
+            eprintln!("inbox: could not record a deadline for {}: {err:?}", message.id);
+        }
+
         if verdict.category.is_pressing()
             && let Err(err) = raise_alert(pool, user_id, &message, &verdict, now).await
         {
@@ -295,8 +325,9 @@ async fn finish(
             SET finished_at = ?1, outcome = ?2, error = ?3,
                 fetched_count = ?4, classified_count = ?5,
                 pressing_count = ?6, confirmation_count = ?7,
-                outreach_count = ?8, disregarded_count = ?9
-          WHERE id = ?10",
+                outreach_count = ?8, disregarded_count = ?9,
+                already_seen_count = ?10
+          WHERE id = ?11",
     )
     .bind(now.to_rfc3339())
     .bind(outcome)
@@ -307,9 +338,49 @@ async fn finish(
     .bind(report.confirmation)
     .bind(report.outreach)
     .bind(report.disregarded)
+    .bind(report.already_seen)
     .bind(run_id)
     .execute(pool)
     .await?;
+
+    // Both invariants, checked where the numbers are written rather than only in a test.
+    //
+    // **Storing the counts is the load-bearing half, not this warning.** `source_runs` holds
+    // `fetched = accepted + filtered + rejected` for every run ever recorded, and the reason
+    // that invariant could be confirmed to hold — zero violations, checked 2026-09-03 — is that
+    // the numbers are queryable afterwards, not that anything shouted at the time. A log line
+    // nobody greps is worth very little on its own; it earns its place by naming which run to go
+    // and look at, and migration `0031` is what makes looking possible.
+    //
+    // Deliberately not an error and not `outcome = 'partial'`. A pass whose arithmetic is wrong
+    // still fetched real mail and still stored it, and throwing that away would lose data over a
+    // counting bug. `partial` already means "Gmail gave us part of it", which is a different
+    // statement about a different thing.
+    if !report.counts_balance() {
+        eprintln!(
+            "inbox: run {run_id} does not balance — classified {} but bucketed {} \
+             (pressing {} + confirmation {} + outreach {} + disregarded {}). A message was \
+             classified into nothing; the run row is stored and queryable.",
+            report.classified,
+            report.pressing + report.confirmation + report.outreach + report.disregarded,
+            report.pressing,
+            report.confirmation,
+            report.outreach,
+            report.disregarded,
+        );
+    }
+    // Only on a pass that ran to completion: a failure can legitimately fetch and then stop.
+    if outcome == "success" && !report.accounts_for_every_message() {
+        eprintln!(
+            "inbox: run {run_id} does not account for every message — fetched {} but \
+             classified {} + already seen {} = {}. Messages left the pass without being \
+             counted anywhere.",
+            report.fetched,
+            report.classified,
+            report.already_seen,
+            report.classified + report.already_seen,
+        );
+    }
     Ok(())
 }
 
@@ -479,27 +550,37 @@ async fn propose_status(
 
     let auto = advance::may_auto_apply(to_status, verdict.confidence, threshold);
 
+    // **The proposal and the change it describes commit together.** `applied_automatically`
+    // is a claim that the tracker already moved: the panel renders it as *"already applied —
+    // rejecting undoes it"*, and reject then restores a status the application was never at.
+    // Two statements outside a transaction make that claim survivable on its own.
+    let mut tx = crate::db::begin_write(pool).await?;
+
+    // Captured rather than generated inline: an auto-applied proposal is the `cause_id` of the
+    // event written below, and that link is what makes the change reversible — rule 2.
+    let proposal_id = Uuid::new_v4().to_string();
+
     sqlx::query(
         "INSERT INTO status_proposals
              (id, application_id, verdict_id, from_status, to_status,
               applied_automatically, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&proposal_id)
     .bind(application_id)
     .bind(&verdict_id)
     .bind(from_status.as_str())
     .bind(to_status.as_str())
     .bind(i64::from(auto))
     .bind(now.to_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if auto {
         // Only ever a forward, non-terminal move above the threshold — `may_auto_apply`
         // guarantees all three. `status_changed_at` moves with it, because Phase 7 made that
         // column mean "how long have I been at this stage".
-        sqlx::query(
+        let moved = sqlx::query(
             "UPDATE internship_applications
                 SET status = ?1, status_changed_at = ?2, updated_at = ?2
               WHERE id = ?3 AND user_id = ?4",
@@ -508,11 +589,105 @@ async fn propose_status(
         .bind(now.to_rfc3339())
         .bind(application_id)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
+        .await?;
+
+        // The status was read out of this same row moments ago, so zero here means it moved
+        // or vanished underneath us. Rolling back is the only outcome that leaves the
+        // proposal and the tracker agreeing.
+        if moved.rows_affected() != 1 {
+            anyhow::bail!(
+                "auto-applying to application {application_id} matched {} rows, expected 1",
+                moved.rows_affected()
+            );
+        }
+
+        // Actor `email`: this transition had no human in it. `at` is `now`, which is also the
+        // proposal's `created_at` — the same instant the backfill uses for a proposal-derived
+        // event, so a live row and a reconstructed one mean the same thing when Phase 11
+        // buckets them by month.
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id,
+                from_status: Some(from_status),
+                to_status,
+                actor: Actor::Email,
+                cause: Some(Cause::StatusProposal(&proposal_id)),
+                at: now,
+                note: None,
+            },
+        )
         .await?;
     }
 
+    tx.commit().await?;
+
     Ok(true)
+}
+
+/// Store a due date if the message appears to carry one. **Rule 1: a pure extraction, and
+/// nothing else happens as a result.**
+///
+/// It writes one row and raises nothing; the sweep in `hunt::deadline` decides when to warn.
+/// It never advances a status — a date parsed out of untrusted marketing copy must not move
+/// the tracker, which is the same reasoning rule 2 applies to the classifier one layer up.
+///
+/// `application_id` is best-effort by rule 8: an unmatched pressing email still has its
+/// deadline recorded, because the matcher missing is not the deadline not existing.
+async fn record_deadline(
+    pool: &SqlitePool,
+    user_id: &str,
+    message: &gmail::Message,
+    verdict: &classify::EmailVerdict,
+    applications: &[(String, String)],
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let received = message
+        .received_at
+        .as_deref()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .unwrap_or(now);
+
+    let Some(found) = due_dates::extract(
+        message.subject.as_deref(),
+        message.snippet.as_deref(),
+        received,
+    ) else {
+        return Ok(false);
+    };
+
+    let message_row_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM email_messages WHERE gmail_message_id = ?")
+            .bind(&message.id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(message_row_id) = message_row_id else {
+        return Ok(false);
+    };
+
+    let application_id =
+        advance::match_application(verdict.company_guess.as_deref(), applications);
+
+    let inserted = sqlx::query(
+        "INSERT INTO application_deadlines
+             (id, message_id, user_id, application_id, due_at, source_text, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (message_id) DO NOTHING",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&message_row_id)
+    .bind(user_id)
+    .bind(application_id)
+    .bind(found.due_at.to_rfc3339())
+    .bind(&found.source_text)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(inserted == 1)
 }
 
 /// Raise a desktop alert for pressing mail.
@@ -933,5 +1108,28 @@ mod tests {
 
         let lost_one = SyncReport { disregarded: 3, ..balanced.clone() };
         assert!(!lost_one.counts_balance(), "a dropped email must not balance");
+
+        // The half above it, which nothing recorded until migration 0031. A pass that fetches
+        // 44 and classifies 0 is a healthy idle pass when the 44 were already seen, and a
+        // catastrophe when they were not — and for 152 runs the stored row said the same thing
+        // either way.
+        let idle = SyncReport {
+            fetched: 44,
+            classified: 0,
+            already_seen: 44,
+            ..SyncReport::default()
+        };
+        assert!(idle.accounts_for_every_message(), "an idle pass accounts for everything");
+
+        let lost = SyncReport {
+            fetched: 44,
+            classified: 0,
+            already_seen: 0,
+            ..SyncReport::default()
+        };
+        assert!(
+            !lost.accounts_for_every_message(),
+            "44 messages fetched and counted nowhere must not balance"
+        );
     }
 }

@@ -38,6 +38,18 @@
 //! - **A board budget that truncates the list is `Partial`,** however well the fetches it made
 //!   went.
 //!
+//! # ...and why that stopped being enough
+//!
+//! All three rules are still exactly right, and all three together made this source unable to
+//! expire anything. On the 2026-09-02 uncapped run 484 boards read cleanly, `designmehair`
+//! returned a network error, and the source-level verdict was `Partial` — so not one of the
+//! 484 complete enumerations counted for expiry. At 485 boards a clean sweep is improbable, so
+//! that was the steady state, not bad luck.
+//!
+//! This adapter therefore also reports a [`ScopeRun`] per board. The aggregate rules above are
+//! untouched; the boards that *were* fully enumerated now say so individually, and
+//! `expiry::settle_source_run` advances disappearance counters for those and no others.
+//!
 //! # The § D.2 trap, and why it does not apply here
 //!
 //! A dead Greenhouse job's *public HTML URL* redirects to the board root with **HTTP 200**, so
@@ -48,7 +60,7 @@
 
 use serde_json::Value;
 
-use super::super::models::RawPosting;
+use super::super::models::{RawPosting, ScopeRun};
 use super::{BoxFuture, Source, SourceContext, SourceFetch, first_string, id_string};
 
 /// The ATS key in [`BoardDirectory`](super::BoardDirectory).
@@ -101,30 +113,51 @@ impl Source for GreenhouseSource {
             let mut enumerated = 0usize;
             let mut retired = Vec::new();
             let mut failures = Vec::new();
+            // One verdict per board. Boards the budget never reached get no entry at all:
+            // absence of a row is the honest record of "no verdict", and inventing a `Failed`
+            // one would claim we looked.
+            let mut scopes: Vec<ScopeRun> = Vec::new();
 
             for slug in slugs {
                 let url = board_url(slug);
                 match ctx.http.get(&url).await {
                     Ok(response) => match response.json() {
                         Ok(body) => {
-                            postings.extend(parse_board(slug, &body));
+                            let (board, scope) = board_result(slug, &body);
+                            scopes.push(scope);
+                            postings.extend(board);
                             enumerated += 1;
                         }
-                        Err(error) => failures.push(format!("{slug}: {error}")),
+                        Err(error) => {
+                            failures.push(format!("{slug}: {error}"));
+                            scopes.push(ScopeRun::failed(slug.as_str(), error.to_string()));
+                        }
                     },
                     // robots.txt covers the host, not the board. One refusal means every board
                     // is refused, so stop rather than making 484 more requests we already know
                     // we must not make.
+                    //
+                    // The boards read before the refusal are dropped rather than reported as
+                    // completed scopes. They genuinely were enumerated, so this under-expires
+                    // — which is the safe direction, and it keeps `Skipped` meaning what the
+                    // health panel says it means: we did not fetch this source.
                     Err(error) if error.is_refusal() => {
                         return SourceFetch::skipped(error.to_string());
                     }
                     // A definitive "no such board". The board offers zero postings and the
-                    // slug should be retired; it is not an incomplete enumeration.
+                    // slug should be retired; it is not an incomplete enumeration. As a scope
+                    // it is `Completed` with no ids, so anything still tagged to it advances
+                    // toward expiry — which is correct, and is new: before scopes, a retired
+                    // board's postings could only expire on a run where all 485 succeeded.
                     Err(error) if error.is_not_found() => {
                         retired.push(slug.clone());
+                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
                         enumerated += 1;
                     }
-                    Err(error) => failures.push(format!("{slug}: {error}")),
+                    Err(error) => {
+                        failures.push(format!("{slug}: {error}"));
+                        scopes.push(ScopeRun::failed(slug.as_str(), error.to_string()));
+                    }
                 }
             }
 
@@ -145,6 +178,7 @@ impl Source for GreenhouseSource {
                 truncated,
                 &failures,
             )
+            .with_scopes(scopes)
         })
     }
 }
@@ -205,6 +239,20 @@ fn summarize(failures: &[String]) -> String {
         failures[..SHOWN].join("; "),
         failures.len() - SHOWN
     )
+}
+
+/// One enumerated board: its postings and its scope verdict, from a **single** parse.
+///
+/// Returning both together is the point. The scope says "absence from this board is evidence",
+/// and the ids are the only thing that stops that conclusion from being drawn about postings
+/// that were right there — so computing them in two passes (parse, then re-derive the ids by
+/// filtering `postings` on the slug) is a divergence waiting to happen, and the failure mode of
+/// that divergence is the whole board expiring. One call, one tuple, no way to have one without
+/// the other.
+fn board_result(slug: &str, body: &Value) -> (Vec<RawPosting>, ScopeRun) {
+    let postings = parse_board(slug, body);
+    let ids = postings.iter().map(|job| job.external_id.clone()).collect();
+    (postings, ScopeRun::completed(slug, ids))
 }
 
 /// Turn one board response into raw postings. Pure, so it is tested offline against the
@@ -622,6 +670,47 @@ mod tests {
             crate::internships::models::SourceOutcome::Failed
         );
         assert!(fetch.error().is_some());
+    }
+
+    // ---- scopes ----
+
+    #[test]
+    fn a_boards_scope_ids_are_exactly_the_postings_it_returned() {
+        // The invariant the whole scoped-expiry mechanism rests on. A scope reported
+        // `Completed` whose ids do not cover its postings gets the board incremented with
+        // nothing reset — every posting on it expiring after three runs.
+        let (postings, scope) = board_result("anthropic", &fixture());
+        assert!(scope.is_completed());
+        assert_eq!(scope.fetched, postings.len() as i64);
+        let ids: Vec<&str> = postings.iter().map(|job| job.external_id.as_str()).collect();
+        assert_eq!(scope.external_ids, ids);
+        assert!(!ids.is_empty(), "the fixture must actually carry a job");
+    }
+
+    #[test]
+    fn scopes_ride_along_without_changing_the_source_level_verdict() {
+        // Scopes are additive. A run that was `Partial` before reporting them is still
+        // `Partial`; what changes is only that expiry can now ask about a single board.
+        let scopes = vec![
+            ScopeRun::completed("good", vec!["1".into()]),
+            ScopeRun::failed("bad", "HTTP 500"),
+        ];
+        let bare = finish("Greenhouse", one_posting(), 9, 10, 10, false, &["bad: HTTP 500".into()]);
+        let scoped = finish("Greenhouse", one_posting(), 9, 10, 10, false, &["bad: HTTP 500".into()])
+            .with_scopes(scopes);
+
+        assert_eq!(scoped.outcome(), bare.outcome());
+        assert_eq!(scoped.error(), bare.error());
+        assert_eq!(scoped.scopes().len(), 2);
+        assert_eq!(scoped.scopes().iter().filter(|s| s.is_completed()).count(), 1);
+    }
+
+    #[test]
+    fn a_source_that_reports_no_scopes_carries_none() {
+        // Every other adapter. The unscoped settle path keys off exactly this being empty.
+        assert!(finish("Greenhouse", one_posting(), 10, 10, 10, false, &[])
+            .scopes()
+            .is_empty());
     }
 
     #[test]

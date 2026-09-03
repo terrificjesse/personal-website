@@ -15,6 +15,7 @@ use crate::auth::{
     MIN_PASSWORD_LENGTH, SESSION_COOKIE_NAME, SESSION_DURATION_DAYS,
 };
 use crate::models::{LoginRequest, RegisterRequest, User, normalize_email};
+use crate::rate_limit::{ClientIp, RateLimits};
 
 /// Cookie needed for Google authentication. 10 minutes is plenty of time for a
 /// user to sign in using Google auth.
@@ -67,6 +68,82 @@ async fn user_from_jar(pool: &SqlitePool, jar: &CookieJar) -> Result<Option<User
     auth::validate_session(pool, cookie.value()).await
 }
 
+/// Which credential proved who the caller is.
+///
+/// Phase 10's `application_events` records `actor = 'extension'` for an application created
+/// from the popup, and that has to be decided **here** rather than from a field in the request
+/// body: a claim by the party being described is wrong exactly when someone is debugging why
+/// it is wrong. See `docs/HUNT.md` § `application_events`.
+///
+/// This is not authorization. A hunt token is exactly as powerful as a session and no more —
+/// the difference recorded here is provenance, and nothing may branch on it to decide what a
+/// caller is *allowed* to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The site's `fridge_session` cookie.
+    Session,
+    /// A `hunt_tokens` bearer — in practice, the Firefox extension.
+    HuntToken,
+    /// Nobody proved anything.
+    Anonymous,
+}
+
+/// Who an `application_events` row written on this credential is attributed to.
+///
+/// The mapping lives in exactly one place, and it is this one. `Anonymous` maps to `Unknown`
+/// and never to `Manual`: the provenance rule is that a row whose origin cannot be proved says
+/// so — see `docs/HUNT.md`. It is unreachable behind `CurrentUser` today, and the honest value
+/// is still the one to return.
+///
+/// This replaced a `Credential::actor() -> &'static str` placeholder that existed only while
+/// the `Actor` enum did not.
+impl From<Credential> for crate::internships::application_events::Actor {
+    fn from(credential: Credential) -> Self {
+        use crate::internships::application_events::Actor;
+        match credential {
+            Credential::HuntToken => Actor::Extension,
+            Credential::Session => Actor::Manual,
+            Credential::Anonymous => Actor::Unknown,
+        }
+    }
+}
+
+/// One resolution per request, shared by every extractor that asks.
+///
+/// Without the cache, a handler taking both `CurrentUser` and `Credential` would validate the
+/// same credential twice — and, worse, could get two different answers if a session expired
+/// between the two extractors. Extractors run in declaration order, so the cache also makes
+/// the answer independent of how a handler happens to list its arguments.
+#[derive(Clone)]
+struct Resolved(Option<User>, Credential);
+
+async fn resolve(pool: &SqlitePool, parts: &mut Parts) -> Result<Resolved, AuthError> {
+    if let Some(cached) = parts.extensions.get::<Resolved>() {
+        return Ok(cached.clone());
+    }
+
+    let jar = CookieJar::from_headers(&parts.headers);
+    let resolved = if let Some(user) = user_from_jar(pool, &jar).await? {
+        Resolved(Some(user), Credential::Session)
+    } else {
+        // Then a bearer token. The cookie is still the primary credential and is tried first;
+        // this exists because it cannot reach the Firefox extension — `SameSite=Lax` means a
+        // request from a `moz-extension://` page never carries it. See `hunt::tokens`.
+        //
+        // Adding it HERE rather than on the hunt routes is what keeps it one auth system: a
+        // route's signature still says `CurrentUser` and no route knows tokens exist. It also
+        // means the token is exactly as powerful as a session and no more, which is the
+        // property to preserve if it ever grows a scope.
+        match user_from_bearer(pool, parts).await {
+            Some(user) => Resolved(Some(user), Credential::HuntToken),
+            None => Resolved(None, Credential::Anonymous),
+        }
+    };
+
+    parts.extensions.insert(resolved.clone());
+    Ok(resolved)
+}
+
 // Builds a user using header data in the cookie
 impl<S> FromRequestParts<S> for MaybeUser
 where
@@ -77,21 +154,23 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let pool = SqlitePool::from_ref(state);
-        let jar = CookieJar::from_headers(&parts.headers);
+        Ok(MaybeUser(resolve(&pool, parts).await?.0))
+    }
+}
 
-        if let Some(user) = user_from_jar(&pool, &jar).await? {
-            return Ok(MaybeUser(Some(user)));
-        }
+/// **Never rejects an authenticated request**, and never rejects an anonymous one either — a
+/// caller with no credential is `Anonymous`, which is a fact rather than an error. Pair it with
+/// `CurrentUser` when a route needs both identity and provenance.
+impl<S> FromRequestParts<S> for Credential
+where
+    SqlitePool: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
 
-        // Then a bearer token. The cookie is still the primary credential and is tried first;
-        // this exists because it cannot reach the Firefox extension — `SameSite=Lax` means a
-        // request from a `moz-extension://` page never carries it. See `hunt::tokens`.
-        //
-        // Adding it HERE rather than on the hunt routes is what keeps it one auth system: a
-        // route's signature still says `CurrentUser` and no route knows tokens exist. It also
-        // means the token is exactly as powerful as a session and no more, which is the
-        // property to preserve if it ever grows a scope.
-        Ok(MaybeUser(user_from_bearer(&pool, parts).await))
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let pool = SqlitePool::from_ref(state);
+        Ok(resolve(&pool, parts).await?.1)
     }
 }
 
@@ -289,7 +368,9 @@ pub async fn register(
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(&pool).await?;
 
     let insert =
         sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
@@ -380,16 +461,32 @@ async fn claim_unowned_rows(
 /// password on record. Finally issues a session when the verification is complete.
 pub async fn login(
     State(pool): State<SqlitePool>,
+    State(rate_limits): State<RateLimits>,
+    ClientIp(ip): ClientIp,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
-) -> Result<(CookieJar, Json<AuthenticatedUser>), AuthError> {
+) -> Response {
     let email = normalize_email(&req.email);
+    if let Err(retry) = rate_limits.check_login(ip, &email) {
+        return retry.response("POST /auth/login", ip, &email);
+    }
 
+    login_after_rate_limit(&pool, jar, req, email)
+        .await
+        .into_response()
+}
+
+async fn login_after_rate_limit(
+    pool: &SqlitePool,
+    jar: CookieJar,
+    req: LoginRequest,
+    email: String,
+) -> Result<(CookieJar, Json<AuthenticatedUser>), AuthError> {
     let user: Option<User> = sqlx::query_as::<_, User>(
         "SELECT id, email, password_hash, created_at, is_admin FROM users WHERE email = ?",
     )
     .bind(&email)
-    .fetch_optional(&pool)
+    .fetch_optional(pool)
     .await?;
 
     let user = user.ok_or(AuthError::InvalidCredentials)?;
@@ -402,7 +499,7 @@ pub async fn login(
         return Err(AuthError::InvalidCredentials);
     }
 
-    let session = auth::issue_session(&pool, &user.id).await?;
+    let session = auth::issue_session(pool, &user.id).await?;
 
     Ok((
         jar.add(session_cookie(session.token)),
@@ -541,7 +638,9 @@ async fn resolve_google_identity(
     let user_id = Uuid::new_v4().to_string();
     let created_at = Utc::now();
 
-    let mut tx = pool.begin().await?;
+    // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
+    // for one, even when the first statement happens to be a write today.
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, NULL, ?)")
         .bind(&user_id)
@@ -591,6 +690,8 @@ async fn link_google_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::net::IpAddr;
 
     #[test]
     fn a_short_password_is_rejected() {
@@ -673,5 +774,220 @@ mod tests {
 
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         assert_eq!(cookie.http_only(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn the_login_route_refuses_the_eleventh_normalized_account_attempt() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        let rate_limits = RateLimits::default();
+        let ip = IpAddr::from([192, 0, 2, 1]);
+
+        for attempt in 0..=10 {
+            let email = if attempt % 2 == 0 {
+                "Person@Example.com"
+            } else {
+                " person@example.com "
+            };
+            let response = login(
+                State(pool.clone()),
+                State(rate_limits.clone()),
+                ClientIp(ip),
+                CookieJar::new(),
+                Json(LoginRequest {
+                    email: email.to_string(),
+                    password: "not-the-password".to_string(),
+                }),
+            )
+            .await;
+
+            let expected = if attempt < 10 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(response.status(), expected, "attempt {}", attempt + 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    //! Provenance, not authorization.
+    //!
+    //! Phase 10's `application_events` attributes a write to `extension` or `manual`, and the
+    //! decision is made from the credential that authenticated the request rather than from
+    //! anything the caller says about itself. These pin the mapping, and the one case a
+    //! header-sniffing implementation would get wrong.
+
+    use super::*;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("credential-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(format!("{id}@example.com"))
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn parts_with(headers: &[(&str, String)]) -> Parts {
+        let mut req = axum::http::Request::builder();
+        for (name, value) in headers {
+            req = req.header(*name, value);
+        }
+        req.body(()).unwrap().into_parts().0
+    }
+
+    async fn credential_for(pool: &SqlitePool, headers: &[(&str, String)]) -> Credential {
+        let mut parts = parts_with(headers);
+        Credential::from_request_parts(&mut parts, pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_resolves_to_session() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let session = crate::auth::issue_session(&pool, &user_id).await.unwrap();
+
+        let headers = [("cookie", format!("{SESSION_COOKIE_NAME}={}", session.token))];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::Session);
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_resolves_to_a_hunt_token() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+
+        let headers = [("authorization", format!("Bearer {}", minted.secret))];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::HuntToken);
+    }
+
+    #[tokio::test]
+    async fn no_credential_at_all_is_anonymous() {
+        let pool = pool().await;
+        assert_eq!(credential_for(&pool, &[]).await, Credential::Anonymous);
+    }
+
+    /// The case that decides this belongs in the extractor rather than in a header sniff.
+    ///
+    /// A dead cookie beside a live token is an ordinary state — the extension holds a token
+    /// while the browser still carries a signed-out session — and "which header is present"
+    /// answers `Session` for it, which is wrong in the direction that matters: the event log
+    /// would attribute an extension write to a person sitting at the site.
+    #[tokio::test]
+    async fn a_dead_cookie_beside_a_live_token_resolves_to_the_token() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+
+        let headers = [
+            ("cookie", format!("{SESSION_COOKIE_NAME}=expired-or-revoked")),
+            ("authorization", format!("Bearer {}", minted.secret)),
+        ];
+        assert_eq!(credential_for(&pool, &headers).await, Credential::HuntToken);
+    }
+
+    /// One resolution per request, whatever order a handler lists its extractors in.
+    #[tokio::test]
+    async fn the_user_and_the_credential_come_from_one_resolution() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let minted = crate::hunt::tokens::mint(&pool, &user_id, "firefox", Utc::now())
+            .await
+            .unwrap();
+        let mut parts = parts_with(&[("authorization", format!("Bearer {}", minted.secret))]);
+
+        let MaybeUser(found) = MaybeUser::from_request_parts(&mut parts, &pool).await.unwrap();
+        let credential = Credential::from_request_parts(&mut parts, &pool).await.unwrap();
+
+        assert_eq!(found.map(|u| u.id), Some(user_id));
+        assert_eq!(credential, Credential::HuntToken);
+    }
+
+    #[tokio::test]
+    async fn a_credential_maps_to_the_actor_that_wrote_the_event() {
+        use crate::internships::application_events::Actor;
+        assert_eq!(Actor::from(Credential::HuntToken), Actor::Extension);
+        assert_eq!(Actor::from(Credential::Session), Actor::Manual);
+        // Never `Manual`: the provenance rule is that an origin that cannot be proved says so.
+        assert_eq!(Actor::from(Credential::Anonymous), Actor::Unknown);
+    }
+
+    // ---- the merge seam: rate-limited login (10j) meeting credential provenance (10e) ----
+
+    /// One flow through both branches' changes, which neither branch could have tested.
+    ///
+    /// 10j rewrote `login` to run behind a rate limiter and return `Response` instead of a
+    /// typed `Result`; 10e added the `Credential` extractor that reads the cookie `login`
+    /// issues. A clean textual merge says nothing about whether the cookie that comes out of
+    /// the new handler is still the one the new extractor recognises.
+    #[tokio::test]
+    async fn a_rate_limited_login_still_produces_a_session_credential() {
+        let pool = pool().await;
+        let email = "merge@example.com";
+        let password = "correct horse battery staple";
+
+        sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?1,?2,?3,?4)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(email)
+            .bind(crate::auth::hash_password(password).unwrap())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = login(
+            State(pool.clone()),
+            State(crate::rate_limit::RateLimits::default()),
+            crate::rate_limit::ClientIp(std::net::IpAddr::from([203, 0, 113, 9])),
+            CookieJar::new(),
+            Json(LoginRequest {
+                email: email.into(),
+                password: password.into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("login must still set a session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        // The cookie the rate-limited handler issued, read back by the extractor that decides
+        // what `application_events.actor` will say.
+        assert_eq!(
+            credential_for(&pool, &[("cookie", cookie)]).await,
+            Credential::Session
+        );
     }
 }

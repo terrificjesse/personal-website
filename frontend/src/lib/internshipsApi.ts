@@ -164,23 +164,92 @@ export type ListInternshipsResponse = {
   collection: RunProgress | null;
 };
 
-function toQuery(filters: InternshipFilters): string {
-  const params = new URLSearchParams();
+const INTERNSHIP_FILTER_KEYS: (keyof InternshipFilters)[] = [
+  "sort",
+  "term_season",
+  "term_year",
+  "term_unknown",
+  "remote",
+  "location",
+  "location_unknown",
+  "class_year",
+  "class_year_unknown",
+  "pay_min",
+  "pay_max",
+  "pay_unknown",
+  "company",
+  "source",
+];
+
+/**
+ * Serialize the filter contract once for both API requests and browser URLs.
+ *
+ * `seed` lets the page retain unrelated query parameters while replacing all known filter
+ * keys. API calls omit it so nothing outside the backend contract is forwarded.
+ */
+export function internshipFiltersToSearchParams(
+  filters: InternshipFilters,
+  seed?: URLSearchParams,
+): URLSearchParams {
+  const params = new URLSearchParams(seed);
+  for (const key of INTERNSHIP_FILTER_KEYS) params.delete(key);
   for (const [key, value] of Object.entries(filters)) {
     // `false` is a meaningful value for `remote`, so test for null/undefined rather than
     // truthiness — `if (value)` would silently drop `remote=false` and turn "onsite only"
     // into "no location filter at all".
     if (value === undefined || value === null || value === "") continue;
+    // Composite is the default. Leaving it out makes the unfiltered URL canonical without
+    // changing what the backend receives.
+    if (key === "sort" && value === "composite") continue;
     params.set(key, String(value));
   }
-  const query = params.toString();
-  return query ? `?${query}` : "";
+  return params;
+}
+
+/** Read every backend-supported filter from a bookmarkable URL. */
+export function internshipFiltersFromSearchParams(
+  params: Pick<URLSearchParams, "get">,
+): InternshipFilters {
+  const text = (key: keyof InternshipFilters) => params.get(key) || undefined;
+  const number = (key: keyof InternshipFilters) => {
+    const value = params.get(key);
+    return value === null ? undefined : Number(value);
+  };
+  const remote = params.get("remote");
+
+  return {
+    sort: (text("sort") as InternshipSort | undefined) ?? "composite",
+    term_season: text("term_season") as InternshipSeason | undefined,
+    term_year: number("term_year"),
+    term_unknown: text("term_unknown") as OnUnknown | undefined,
+    // Preserve malformed values at runtime so the backend can return its documented 400
+    // instead of this client quietly turning them into the default.
+    remote:
+      remote === null
+        ? undefined
+        : remote === "true"
+          ? true
+          : remote === "false"
+            ? false
+            : (remote as unknown as boolean),
+    location: text("location"),
+    location_unknown: text("location_unknown") as OnUnknown | undefined,
+    class_year: text("class_year"),
+    class_year_unknown: text("class_year_unknown") as OnUnknown | undefined,
+    pay_min: number("pay_min"),
+    pay_max: number("pay_max"),
+    pay_unknown: text("pay_unknown") as OnUnknown | undefined,
+    company: text("company"),
+    source: text("source"),
+  };
 }
 
 export async function listInternships(
   filters: InternshipFilters = {},
 ): Promise<ListInternshipsResponse> {
-  const res = await apiFetch(`/internships${toQuery(filters)}`);
+  const params = internshipFiltersToSearchParams(filters);
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await apiFetch(`/internships${query}`);
   if (!res.ok) {
     // 400 means the filters themselves were rejected (an unknown sort, an inverted pay
     // window). Surfacing that verbatim beats rendering an empty list, which would look like
@@ -198,6 +267,157 @@ export async function listInternshipSources(): Promise<string[]> {
   const res = await apiFetch("/internships/sources");
   if (!res.ok) throw new Error(`Could not load sources (${res.status})`);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------------------
+// Hunt analytics (Phase 11)
+// ---------------------------------------------------------------------------------------
+
+/** The common count shape used at the top level and for every breakdown. */
+export type HuntAnalyticsTotals = {
+  applications: number;
+  responded: number;
+  no_response_live: number;
+  no_response_dead: number;
+  reached_oa: number;
+  reached_interview: number;
+  offers: number;
+  /** An explicit rejection is also included in `responded`; it is never no-response. */
+  rejected: number;
+};
+
+export type HuntAnalyticsBreakdown = {
+  key: string;
+  totals: HuntAnalyticsTotals;
+};
+
+export type HuntAnalyticsResponse = {
+  window: { from: string; to: string; dead_after_days: number };
+  totals: HuntAnalyticsTotals;
+  time_to_first_response_days: {
+    /** `null` when `n` is zero; zero would falsely claim an immediate response. */
+    median: number | null;
+    p90: number | null;
+    n: number;
+  };
+  by_source: HuntAnalyticsBreakdown[];
+  by_tier: HuntAnalyticsBreakdown[];
+  by_month: HuntAnalyticsBreakdown[];
+  /** Includes an empty-key bucket for unattributed applications, rendered as “No variant”. */
+  by_variant: HuntAnalyticsBreakdown[];
+};
+
+export async function getHuntAnalytics(input: {
+  from: string;
+  to: string;
+  dead_after_days?: number;
+}): Promise<HuntAnalyticsResponse> {
+  const params = new URLSearchParams({ from: input.from, to: input.to });
+  if (input.dead_after_days !== undefined) {
+    params.set("dead_after_days", String(input.dead_after_days));
+  }
+
+  const res = await apiFetch(`/hunt/analytics?${params.toString()}`);
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "That analytics window isn't valid — check both dates and the dead-after threshold."
+        : `Could not load hunt analytics (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------------------
+// Résumé variants (Phase 12)
+// ---------------------------------------------------------------------------------------
+
+/** A label for a résumé kept outside this app; the file itself is never stored here. */
+export type ResumeVariant = {
+  id: string;
+  label: string;
+  notes: string | null;
+  created_at: string;
+  /** Non-null means retired, not hidden or deleted. */
+  archived_at: string | null;
+  /** Existing attribution makes DELETE return 409 so history cannot be erased. */
+  application_count: number;
+};
+
+export type CreateResumeVariantInput = {
+  label: string;
+  notes?: string;
+};
+
+export type UpdateResumeVariantInput = {
+  label?: string;
+  /** Send an empty string to clear existing notes. */
+  notes?: string;
+  archived?: boolean;
+};
+
+export async function listResumeVariants(): Promise<ResumeVariant[]> {
+  const res = await apiFetch("/hunt/resume-variants");
+  if (!res.ok) throw new Error(`Could not load résumé variants (${res.status})`);
+  return res.json();
+}
+
+export async function createResumeVariant(
+  input: CreateResumeVariantInput,
+): Promise<ResumeVariant> {
+  const res = await apiFetch("/hunt/resume-variants", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "Give the résumé variant a label between 1 and 120 characters."
+        : res.status === 409
+          ? "A résumé variant with that name already exists."
+          : `Could not create the résumé variant (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+export async function updateResumeVariant(
+  id: string,
+  input: UpdateResumeVariantInput,
+): Promise<ResumeVariant> {
+  const res = await apiFetch(`/hunt/resume-variants/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "Give the résumé variant a label between 1 and 120 characters."
+        : res.status === 409
+          ? "A résumé variant with that name already exists."
+          : res.status === 404
+            ? "That résumé variant no longer exists."
+            : `Could not update the résumé variant (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+export async function deleteResumeVariant(id: string): Promise<void> {
+  const res = await apiFetch(`/hunt/resume-variants/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 409
+        ? "This résumé is attached to one or more applications, so it can’t be deleted. Retire it instead; retired variants remain available for comparison."
+        : res.status === 404
+          ? "That résumé variant no longer exists."
+          : `Could not delete the résumé variant (${res.status})`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -331,6 +551,16 @@ export type SourceRunSummary = {
    * "succeeded but expired nothing" is a real state a person needs to be able to see.
    */
   counts_for_expiry: boolean;
+  /**
+   * Scopes — Greenhouse boards — this run enumerated completely, and how many it reached a
+   * verdict on at all. `0`/`0` for every source that is a single endpoint.
+   *
+   * `counts_for_expiry` is a boolean and a 485-board source is not: a run can advance
+   * disappearance counters for 484 boards and not the 485th, which is neither "expired" nor
+   * "didn't expire". These two are what lets the panel say which.
+   */
+  scopes_completed: number;
+  scopes_attempted: number;
   error: string | null;
 };
 
@@ -654,8 +884,10 @@ export async function answerRevisions(id: string): Promise<AnswerRevision[]> {
  *
  * **Nothing here is applied silently.** Rule 2: a misclassification must never rewrite the
  * tracker, so every email-driven change is a proposal carrying the email that caused it —
- * and that link is what makes a wrong call reversible. `subject` and `evidence` are shown
- * beside the change for exactly that reason: an audit trail nobody can read is not one.
+ * and that link is what makes a wrong call reversible. `from_address`, `subject`, and
+ * `evidence` are separate nullable fields shown beside the change for exactly that reason:
+ * an audit trail nobody can read is not one, and a subject must never be presented as a
+ * sender.
  */
 export type StatusProposal = {
   id: string;
@@ -666,9 +898,19 @@ export type StatusProposal = {
   to_status: string;
   /** True only if the confidence threshold was configured AND the move was forward and non-terminal. */
   applied_automatically: boolean;
+  from_address: string | null;
   subject: string | null;
   evidence: string | null;
   confidence: number | null;
+  /**
+   * Whether the verdict and message this proposal came from still resolve.
+   *
+   * `false` with all four fields above null means the chain is broken, not that the email was
+   * terse — and those deserve very different treatment when the question on screen is "should I
+   * apply this to my application". Before the joins were widened, such a proposal was not
+   * listed at all.
+   */
+  evidence_available: boolean;
   created_at: string;
 };
 

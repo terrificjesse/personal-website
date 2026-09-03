@@ -190,7 +190,8 @@ fn configured_context(client: PoliteClient) -> SourceContext {
             Ok(cap) => {
                 println!(
                     "internships: capped at {cap} boards per run — capped sources report \
-                     Partial and will never expire postings"
+                     Partial. Unscoped ones then expire nothing; a scoped one still expires \
+                     within the boards it polled, and never beyond them"
                 );
                 ctx.max_boards_per_run = cap;
             }

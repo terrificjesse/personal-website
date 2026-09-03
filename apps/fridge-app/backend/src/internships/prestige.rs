@@ -94,20 +94,31 @@ impl CompanyTiers {
     /// degrading to derived-only is a worse ranking, not a broken app, and the fridge and blog
     /// tabs have nothing to do with any of this.
     pub fn load() -> Self {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("data/internships/company-tiers.json");
+        let candidates = Self::candidate_paths();
 
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!(
-                    "internships: no company tier file at {} ({err}) — prestige will be \
-                     derived-only",
-                    path.display()
-                );
-                return Self::default();
-            }
+        let found = candidates
+            .iter()
+            .find_map(|path| std::fs::read_to_string(path).ok().map(|text| (path, text)));
+
+        let Some((path, text)) = found else {
+            // Loud on purpose. The alert predicate reads this file, so losing it means
+            // tier-1/2 postings stop raising notifications — and "no notifications" is
+            // indistinguishable from a quiet job market. This line is the only evidence.
+            eprintln!(
+                "internships: NO COMPANY TIER FILE — prestige will be derived-only and \
+                 tier-based alerts will not fire. Looked in: {}. Set \
+                 INTERNSHIP_COMPANY_TIERS to the file's path.",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Self::default();
         };
+        // Positive confirmation at boot. The failure here is silence, so "which file did it
+        // actually read" should not require inference from the absence of a warning.
+        eprintln!("internships: company tiers loaded from {}", path.display());
 
         match serde_json::from_str::<TierFile>(&text) {
             Ok(file) => Self::from_entries(file.companies),
@@ -119,6 +130,40 @@ impl CompanyTiers {
                 Self::default()
             }
         }
+    }
+
+    /// Where the tier file may be, in the order tried.
+    ///
+    /// **`CARGO_MANIFEST_DIR` is the last resort, not the first.** It is the path the binary
+    /// was *built* in, baked in at compile time, so it made the deployed directory layout
+    /// load-bearing: a release directory that is later pruned or renamed leaves it dangling,
+    /// prestige silently degrades to derived-only, and tier-1/2 alerts stop firing with no
+    /// symptom but one startup log line. Kept as a fallback because it is what makes
+    /// `cargo run` and `cargo test` work from a checkout.
+    ///
+    /// 1. `INTERNSHIP_COMPANY_TIERS`, for a deployment that puts the file somewhere of its own.
+    /// 2. Beside the executable, which survives any layout that ships the binary and its data
+    ///    together.
+    /// 3. The build directory.
+    fn candidate_paths() -> Vec<std::path::PathBuf> {
+        const RELATIVE: &str = "data/internships/company-tiers.json";
+        let mut candidates = Vec::new();
+
+        if let Ok(configured) = std::env::var("INTERNSHIP_COMPANY_TIERS") {
+            let configured = configured.trim();
+            if !configured.is_empty() {
+                candidates.push(std::path::PathBuf::from(configured));
+            }
+        }
+
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join(RELATIVE));
+        }
+
+        candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(RELATIVE));
+        candidates
     }
 
     fn from_entries(entries: Vec<TierEntry>) -> Self {
@@ -357,5 +402,39 @@ mod tests {
             TierEntry { tier: 1, name: "X again".into(), keys: vec!["x".into()] },
         ]);
         assert_eq!(tiers.tier("x"), Some(1));
+    }
+
+    // ---- where the tier file is looked for ----
+
+    /// The build path must be the LAST resort, not the first.
+    ///
+    /// It is baked in at compile time, so when it was the only candidate the deployed
+    /// directory layout was load-bearing: prune or rename the directory the binary was built
+    /// in and prestige silently degrades to derived-only, which stops tier-1/2 alerts firing.
+    #[test]
+    fn the_configured_path_is_tried_before_the_build_path() {
+        // SAFETY: single-threaded test process for env mutation is not guaranteed, so this
+        // asserts on the ordering of candidates rather than on load() itself.
+        let build_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/internships/company-tiers.json");
+        let candidates = CompanyTiers::candidate_paths();
+
+        assert_eq!(
+            candidates.last(),
+            Some(&build_path),
+            "the compiled-in build path must be the fallback of last resort"
+        );
+        assert!(
+            candidates.len() >= 2,
+            "there must be at least one candidate that does not depend on where this was built"
+        );
+    }
+
+    /// A missing file is a degraded ranking, never a panic — the fridge and blog tabs have
+    /// nothing to do with any of this.
+    #[test]
+    fn an_absent_file_yields_an_empty_set_rather_than_failing() {
+        let tiers = CompanyTiers::from_entries(Vec::new());
+        assert_eq!(tiers.tier("anyone at all"), None);
     }
 }

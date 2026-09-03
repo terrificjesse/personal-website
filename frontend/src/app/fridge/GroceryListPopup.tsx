@@ -15,7 +15,6 @@ export function GroceryListPopup() {
     if (!open) return;
 
     let cancelled = false;
-    setLoading(true);
 
     fetchShoppingList()
       .then((data) => {
@@ -73,7 +72,10 @@ export function GroceryListPopup() {
       )}
 
       <button
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (!open) setLoading(true);
+          setOpen((value) => !value);
+        }}
         className="rounded-full bg-yellow-300 px-4 py-2 text-sm font-medium shadow-lg hover:bg-yellow-400 dark:bg-yellow-400 dark:hover:bg-yellow-500"
       >
         {open ? "Close list" : "📝 List"}

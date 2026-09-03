@@ -33,6 +33,8 @@
 //!    `posting_sightings.consecutive_misses` in migration `0012`.
 
 pub mod alerts;
+pub mod application_events;
+pub mod company_match;
 pub mod collector;
 pub mod dedup;
 pub mod expiry;
@@ -40,6 +42,9 @@ pub mod http;
 pub mod models;
 pub mod normalize;
 pub mod prestige;
+pub mod orphans;
+pub mod rekey;
+pub mod scope_backfill;
 pub mod rank;
 pub mod sources;
 pub mod store;

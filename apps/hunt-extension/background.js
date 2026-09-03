@@ -59,7 +59,10 @@ const DEFAULT_SETTINGS = {
   siteUrl: "http://localhost:3000",
   // Firefox will not schedule an alarm more often than once a minute.
   pollMinutes: 5,
-  kinds: { posting: true, email: true },
+  // Every kind the backend can produce. A kind missing from a user's stored settings is
+  // treated as ENABLED — see `kindEnabled` — so adding one here does not silently mute it for
+  // anybody who saved settings before it existed.
+  kinds: { posting: true, email: true, nudge: true },
   // A cold database, or a week with Firefox closed, can leave hundreds of events waiting.
   // Past this many, the rest arrive as one summary notification instead of hundreds.
   maxNotificationsPerPoll: 3,
@@ -81,6 +84,22 @@ async function getSettings() {
 /** Trailing slashes are the classic way to end up requesting `//hunt/events`. */
 function apiUrl(settings, path) {
   return `${settings.backendUrl.replace(/\/+$/, "")}${path}`;
+}
+
+/**
+ * Whether a kind may raise a notification.
+ *
+ * **An unknown kind is ENABLED**, and that is the deliberate direction. Settings saved before a
+ * producer existed have no key for it, and a new producer that ships and silently raises
+ * nothing is the failure this project keeps re-learning — the same shape as a scraper that
+ * returns zero and a classifier that disregards everything. One unwanted notification is
+ * cheaper than a missed OA, and the user can switch it off in one click.
+ *
+ * Written as a named function rather than left as `!== false` inline, so the rule is something
+ * you can read rather than something you have to notice.
+ */
+function kindEnabled(settings, kind) {
+  return settings.kinds[kind] !== false;
 }
 
 /**
@@ -186,7 +205,7 @@ async function raise(events, settings) {
 
   const alreadyNotified = await loadNotified();
   const fresh = events.filter(
-    (event) => settings.kinds[event.kind] !== false && !alreadyNotified.has(event.id)
+    (event) => kindEnabled(settings, event.kind) && !alreadyNotified.has(event.id)
   );
 
   const individually = fresh.slice(0, Math.max(1, settings.maxNotificationsPerPoll));

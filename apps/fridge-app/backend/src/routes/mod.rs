@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod auth;
 pub mod blog;
 pub mod health;
@@ -23,6 +24,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::GoogleOAuthConfig;
 use crate::foodkeeper::Catalog;
+use crate::rate_limit::RateLimits;
 use crate::themealdb::Catalog as RecipeCatalog;
 
 #[derive(Clone)]
@@ -32,6 +34,7 @@ pub struct AppState {
     pub recipe_catalog: Arc<RecipeCatalog>,
     // App information for fetching from Google API, which is an optional sign-in option:
     pub google_oauth: Option<GoogleOAuthConfig>,
+    pub rate_limits: RateLimits,
 }
 
 // Lets a handler obtain a cheap copy of the pool rather than the whole AppState
@@ -56,6 +59,12 @@ impl FromRef<AppState> for Arc<RecipeCatalog> {
 impl FromRef<AppState> for Option<GoogleOAuthConfig> {
     fn from_ref(state: &AppState) -> Self {
         state.google_oauth.clone()
+    }
+}
+
+impl FromRef<AppState> for RateLimits {
+    fn from_ref(state: &AppState) -> Self {
+        state.rate_limits.clone()
     }
 }
 
@@ -109,8 +118,8 @@ const FIREFOX_EXTENSION_SCHEME: &str = "moz-extension://";
 /// documented decision rather than a convenience.
 ///
 /// **This is a local development posture.** Before deploying anywhere reachable from the
-/// internet, revisit it alongside the other three items in `docs/PLAN.md` § After Phase 5
-/// (`COOKIE_SECURE`, `SameSite`, rate limiting).
+/// internet, revisit it alongside `COOKIE_SECURE` and `SameSite`. Login and review throttling
+/// now live in `rate_limit`; they do not make a broad extension-origin policy safe by itself.
 fn is_allowed_origin(configured: &[HeaderValue], origin: &HeaderValue) -> bool {
     if configured.iter().any(|allowed| allowed == origin) {
         return true;
@@ -190,6 +199,7 @@ pub fn build_router(state: AppState) -> Router {
             "/internships/applications",
             get(internships::list_applications).post(internships::create_application),
         )
+        .route("/hunt/analytics", get(analytics::analytics))
         .route("/hunt/events", get(hunt::list_events))
         .route("/hunt/events/{id}/ack", post(hunt::ack_event))
         .route(
@@ -220,6 +230,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/hunt/answers/{id}/revisions", get(hunt::answer_revisions))
         .route("/hunt/answers/{id}/used", post(hunt::use_answer))
+        .route(
+            "/hunt/resume-variants",
+            get(hunt::list_variants).post(hunt::create_variant),
+        )
+        .route(
+            "/hunt/resume-variants/{id}",
+            patch(hunt::edit_variant).delete(hunt::delete_variant),
+        )
         .route("/internships", get(internships::list_postings))
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))

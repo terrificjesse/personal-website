@@ -33,14 +33,26 @@ use uuid::Uuid;
 pub enum EventKind {
     Posting,
     Email,
+    /// A follow-up: an application that has had no response for long enough to be worth
+    /// chasing. Phase 11e. A third *producer* on this table, not a second pipeline.
+    Nudge,
+    /// A due date approaching — an OA closing, an interview to confirm. Phase 11f.
+    ///
+    /// Its own kind rather than a nudge, because the extension mutes by kind and the checkbox
+    /// that silences chatty follow-ups must not also silence the one alert whose whole purpose
+    /// is that missing it costs the opportunity.
+    Deadline,
 }
 
 impl EventKind {
-    /// The stored spelling. Matches migration `0014`'s CHECK constraint.
+    /// The stored spelling. Matches the CHECK constraint, which migration `0022` widened from
+    /// migration `0014`'s original two kinds.
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::Posting => "posting",
             EventKind::Email => "email",
+            EventKind::Nudge => "nudge",
+            EventKind::Deadline => "deadline",
         }
     }
 }
@@ -508,4 +520,207 @@ mod tests {
         assert_eq!(events[0].payload, serde_json::Value::Null);
         assert_eq!(events[0].title, "about p1");
     }
+
 }
+
+#[cfg(test)]
+mod hunt_event_rebuild_tests {
+    //! Migration `0022` rebuilds this table to widen one CHECK constraint, and a rebuild is the
+    //! one migration shape that can lose data while reporting success.
+    //!
+    //! These build the PRE-0022 table by hand, run the migration's own SQL against it, and
+    //! check what came out the other side — so they test the file that will actually run, not
+    //! a description of it.
+
+    use sqlx::{Connection, SqliteConnection, Row};
+    use uuid::Uuid;
+
+    const MIGRATION: &str = include_str!("../../migrations/0022_widen_hunt_event_kinds.sql");
+    /// The second rebuild, applied on top of the first — the order they run in production.
+    const MIGRATION_0023: &str =
+        include_str!("../../migrations/0023_create_application_deadlines.sql");
+
+    /// Migration `0014`'s table, verbatim in shape, plus the one table it references.
+    ///
+    /// `users` has to exist: the rebuild's INSERT is checked against
+    /// `user_id REFERENCES users (id)`, and sqlx turns `PRAGMA foreign_keys` on per connection.
+    const ORIGINAL: &str = "
+        CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL);
+        CREATE TABLE hunt_events (
+            id TEXT PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('posting', 'email')),
+            user_id TEXT,
+            subject_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            url TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            acked_at TEXT,
+            UNIQUE (kind, subject_id)
+        );
+        CREATE INDEX idx_hunt_events_unacked ON hunt_events (created_at) WHERE acked_at IS NULL;
+        CREATE INDEX idx_hunt_events_created ON hunt_events (created_at);
+    ";
+
+    async fn rebuilt_from_seeded() -> SqliteConnection {
+        let path = std::env::temp_dir().join(format!("rebuild-{}.db", Uuid::new_v4()));
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::raw_sql(ORIGINAL).execute(&mut conn).await.unwrap();
+
+        // Three events, two of them already delivered.
+        for (id, kind, subject, acked) in [
+            ("e1", "posting", "posting-1", Some("2026-09-01T00:00:00Z")),
+            ("e2", "posting", "posting-2", Some("2026-09-01T00:05:00Z")),
+            ("e3", "email", "gmail-1", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO hunt_events
+                     (id, kind, user_id, subject_id, title, body, url, payload_json,
+                      created_at, acked_at)
+                 VALUES (?1, ?2, NULL, ?3, 't', 'b', NULL, '{}', '2026-09-01T00:00:00Z', ?4)",
+            )
+            .bind(id).bind(kind).bind(subject).bind(acked)
+            .execute(&mut conn).await.unwrap();
+        }
+
+        sqlx::raw_sql(MIGRATION).execute(&mut conn).await.unwrap();
+        conn
+    }
+
+    /// Both rebuilds in sequence, which is what a real database sees.
+    async fn rebuilt_twice() -> SqliteConnection {
+        let mut conn = rebuilt_from_seeded().await;
+        // 0023 also creates a table referencing `internship_applications`, which this fixture
+        // does not have — only the hunt_events half is under test here.
+        let hunt_events_half = MIGRATION_0023
+            .split("-- What was extracted, and from where")
+            .next()
+            .unwrap();
+        sqlx::raw_sql(hunt_events_half).execute(&mut conn).await.unwrap();
+        conn
+    }
+
+    /// The same guarantees as 0022, for the migration that repeats it.
+    #[tokio::test]
+    async fn the_second_rebuild_keeps_every_row_receipt_index_and_constraint() {
+        let mut conn = rebuilt_twice().await;
+
+        let row = sqlx::query("SELECT COUNT(*) AS rows, COUNT(acked_at) AS acked FROM hunt_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("rows"), 3, "rows lost in the second rebuild");
+        assert_eq!(row.get::<i64, _>("acked"), 2, "receipts lost in the second rebuild");
+
+        let duplicate = sqlx::query(
+            "INSERT INTO hunt_events
+                 (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+             VALUES ('dup', 'posting', NULL, 'posting-1', 't', 'b', NULL, '{}', 'now')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(duplicate.is_err(), "UNIQUE (kind, subject_id) did not survive 0023");
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'hunt_events'
+              AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(indexes, vec!["idx_hunt_events_created", "idx_hunt_events_unacked"]);
+    }
+
+    #[tokio::test]
+    async fn the_fourth_kind_is_accepted_and_a_typo_is_still_refused() {
+        let mut conn = rebuilt_twice().await;
+
+        let insert = |kind: &'static str, subject: &'static str| {
+            sqlx::query(
+                "INSERT INTO hunt_events
+                     (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+                 VALUES (?1, ?2, NULL, ?3, 't', 'b', NULL, '{}', '2026-09-02T00:00:00Z')",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(kind)
+            .bind(subject)
+        };
+
+        insert("deadline", "deadline-1:24").execute(&mut conn).await.expect("deadline accepted");
+        insert("nudge", "app-1:14").execute(&mut conn).await.expect("nudge still accepted");
+        assert!(insert("deadlines", "typo").execute(&mut conn).await.is_err());
+    }
+
+    /// The failure this migration could cause, and the one it must not.
+    ///
+    /// Losing `acked_at` re-raises every historical alert the next time the extension polls —
+    /// an MV3 background page remembers nothing across restarts, so the server's receipt is
+    /// the only thing standing between a rebuild and 60 notifications at once.
+    #[tokio::test]
+    async fn every_row_and_every_delivery_receipt_survives_the_rebuild() {
+        let mut conn = rebuilt_from_seeded().await;
+
+        let row = sqlx::query("SELECT COUNT(*) AS rows, COUNT(acked_at) AS acked FROM hunt_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("rows"), 3, "rows lost in the rebuild");
+        assert_eq!(row.get::<i64, _>("acked"), 2, "delivery receipts lost in the rebuild");
+
+        // Columns carried across by name, not by position.
+        let kind: String = sqlx::query_scalar("SELECT kind FROM hunt_events WHERE id = 'e3'")
+            .fetch_one(&mut conn).await.unwrap();
+        assert_eq!(kind, "email");
+    }
+
+    #[tokio::test]
+    async fn the_new_kind_is_accepted_and_an_unknown_one_is_still_refused() {
+        let mut conn = rebuilt_from_seeded().await;
+
+        let insert = |kind: &'static str, subject: &'static str| {
+            sqlx::query(
+                "INSERT INTO hunt_events
+                     (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+                 VALUES (?1, ?2, NULL, ?3, 't', 'b', NULL, '{}', '2026-09-02T00:00:00Z')",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(kind)
+            .bind(subject)
+        };
+
+        insert("nudge", "app-1:14").execute(&mut conn).await.expect("nudge must be accepted");
+        assert!(
+            insert("bogus", "whatever").execute(&mut conn).await.is_err(),
+            "the CHECK was widened, not removed — a typo'd kind must still fail loudly"
+        );
+    }
+
+    /// A rebuild that drops the UNIQUE turns structural dedup back into a convention, and the
+    /// symptom is a duplicate notification months later.
+    #[tokio::test]
+    async fn the_unique_constraint_and_both_indexes_come_back() {
+        let mut conn = rebuilt_from_seeded().await;
+
+        let duplicate = sqlx::query(
+            "INSERT INTO hunt_events
+                 (id, kind, user_id, subject_id, title, body, url, payload_json, created_at)
+             VALUES ('dup', 'posting', NULL, 'posting-1', 't', 'b', NULL, '{}', 'now')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(duplicate.is_err(), "UNIQUE (kind, subject_id) did not survive");
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'hunt_events'
+              AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(indexes, vec!["idx_hunt_events_created", "idx_hunt_events_unacked"]);
+    }
+}
+

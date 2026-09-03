@@ -9,6 +9,7 @@ mod internships;
 mod models;
 mod nlp;
 mod purchase_history;
+mod rate_limit;
 mod recommend;
 mod recommend_recipes;
 mod rerank;
@@ -33,8 +34,12 @@ async fn main() -> anyhow::Result<()> {
     // that exports and grades a labelling sheet has no business spawning a blog watcher or a
     // collector run. See `inbox::labelset` — it is 8b's measurement, not part of the pipeline.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("labelset") {
-        return inbox::labelset::main(&pool, &args[1..]).await;
+    match args.first().map(String::as_str) {
+        Some("labelset") => return inbox::labelset::main(&pool, &args[1..]).await,
+        Some("application-events") => {
+            return internships::application_events::main(&pool, &args[1..]).await;
+        }
+        _ => {}
     }
 
     // Checks for expired sessions in the session table and purges them
@@ -92,12 +97,20 @@ async fn main() -> anyhow::Result<()> {
     // server binding its port. Placed here because it needs the Google config above.
     inbox::sync::spawn(pool.clone(), google_oauth.clone());
 
+    // The follow-up sweep. Reads applications and writes `hunt_events`; never called from a
+    // request handler, and disabled cleanly with `HUNT_NUDGE_INTERVAL_SECS=0`.
+    hunt::nudge::spawn(pool.clone());
+
+    // Deadline warnings. Reads what the inbox agent extracted; raises alerts and nothing else.
+    hunt::deadline::spawn(pool.clone());
+
     // Sets up the router so the server is ready to handle HTTP requests from the frontend when the listening socket is set up
     let app = routes::build_router(routes::AppState {
         pool,
         catalog,
         recipe_catalog,
         google_oauth,
+        rate_limits: rate_limit::RateLimits::default(),
     });
 
     // Sets up a socket listening connection address. The port is configurable so a second
@@ -112,7 +125,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Awaits a connection from the frontend
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

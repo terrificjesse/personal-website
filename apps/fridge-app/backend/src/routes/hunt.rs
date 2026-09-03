@@ -32,6 +32,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::hunt::variants;
 use crate::hunt::events::{self, AckOutcome, EventQuery, HuntEvent};
 use crate::hunt::answers::{self, Answer, NewAnswer, Suggestion};
 use crate::hunt::profile::{self, CvProfile};
@@ -520,6 +521,70 @@ pub async fn delete_answer(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// Résumé variants (Phase 12f) — which résumé went with which application
+// ------------------------------------------------------------------------------------------
+
+/// Turn a refusal into the status that says what happened.
+///
+/// A 409 on delete is the load-bearing one: it is what stops a tidy-up from deleting the
+/// attribution, and a 500 there would read as a bug rather than as a rule.
+fn refused(refusal: variants::Refused) -> StatusCode {
+    match refusal {
+        variants::Refused::BadLabel => StatusCode::BAD_REQUEST,
+        variants::Refused::DuplicateLabel | variants::Refused::InUse => StatusCode::CONFLICT,
+    }
+}
+
+pub async fn list_variants(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<Vec<variants::ResumeVariant>>, StatusCode> {
+    variants::list(&pool, &user.id)
+        .await
+        .map(Json)
+        .map_err(internal("listing resume variants"))
+}
+
+pub async fn create_variant(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<variants::NewVariant>,
+) -> Result<(StatusCode, Json<variants::ResumeVariant>), StatusCode> {
+    variants::create(&pool, &user.id, body, Utc::now())
+        .await
+        .map_err(internal("creating a resume variant"))?
+        .map(|variant| (StatusCode::CREATED, Json(variant)))
+        .map_err(refused)
+}
+
+pub async fn edit_variant(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Json(body): Json<variants::EditVariant>,
+) -> Result<Json<variants::ResumeVariant>, StatusCode> {
+    variants::edit(&pool, &user.id, &id, body, Utc::now())
+        .await
+        .map_err(internal("editing a resume variant"))?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .map(Json)
+        .map_err(refused)
+}
+
+pub async fn delete_variant(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    variants::delete(&pool, &user.id, &id)
+        .await
+        .map_err(internal("deleting a resume variant"))?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(refused)
 }
 
 /// The seam between `popup.js` and these handlers — 8g's loop, at the HTTP layer.

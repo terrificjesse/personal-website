@@ -18,6 +18,8 @@
     "http://127.0.0.1:8080/*"
   ],
 
+  "optional_host_permissions": ["https://*/*"],
+
   "content_scripts": [
     {
       "matches": [

@@ -73,7 +73,8 @@ called out three subsystems they want to implement themselves with minimal help:
 
 1. **Authentication** (Phase 5 — password auth + Google OAuth)
 2. **Natural language processing** — fuzzy/typo-tolerant item matching (Phase 1 — "tomato"
-   vs "tomatoes" vs "tomatoe" resolving to the same fridge item)
+   vs "tomatoes" vs "tomatoe" resolving to the same fridge item). **Scoped to the fridge app
+   only, since 2026-09-03** — see the exception below.
 3. **Recommendation algorithms** — shopping list suggestions (Phase 2), recipe matching /
    recommendation logic (Phase 3), and the like/dislike-weighted re-ranking system
    (Phase 4)
@@ -115,11 +116,21 @@ deliberate, explicit exception the user made on 2026-08-20, so do not "correct" 
 normalization, dedup, filters, ranking, the applied tracker, and the expiry sweep are all
 written fully.
 
-The one thing still to confirm when you reach it: **dedup needs fuzzy company/title matching**,
-which is the NLP learning area's shape. Prefer reusing the existing `[learn]` `src/nlp.rs`
-rather than writing a second matcher. If it doesn't fit, **ask** before writing a new one —
-that is a new NLP implementation, and Phase 7's `[gen]` exception was granted for the ranking,
-not for NLP.
+**Fuzzy company/title matching for the internship tab is `[gen]` too, decided 2026-09-03.**
+The owner lifted it explicitly: NLP is a learning area because of the *fridge app*, and for this
+tab the goal is results. So an agent may design and write matching logic under
+`src/internships/**` without asking, including a second matcher — which is what
+`src/internships/company_match.rs` is.
+
+Two things this exception does **not** cover:
+
+- **`src/nlp.rs` itself is still off-limits without asking**, and now for a different reason:
+  blast radius, not pedagogy. It is live fridge behaviour with its own tests and its own users,
+  and `docs/INTERNSHIP_SCRAPING.md` § C measured that its bands are tuned for one- and two-word
+  grocery names and break on job titles. Retuning it to serve the internship corpus would
+  degrade the fridge. If a change there is genuinely the cleanest option, make the case first.
+- **The other three learning areas are untouched.** Auth, recommendations and expiration
+  estimation are exactly as reserved as they were.
 
 ### Never edit a `[learn]` file
 
@@ -193,9 +204,29 @@ agent's copy is a rule the other agent will violate while being helpful.
 Lane C is written by whoever finishes first; it is never a *concurrent* lane, because two
 agents appending to `docs/PLAN.md` at once conflict on every line of it.
 
-**3. Migration numbers are reserved, not discovered.** Lane A owns `0021–0029`. An agent that
-picks the next free number by looking at the directory will pick the same one as the agent in
-the other worktree, and the conflict surfaces at `sqlx migrate run`, not at merge.
+**3. Migration numbers are reserved, not discovered.** An agent that picks the next free number
+by looking at the directory will pick the same one as the agent in the other worktree, and the
+conflict surfaces at `sqlx migrate run`, not at merge.
+
+| Block | Reserved for | Status |
+|---|---|---|
+| `0021–0029` | Lane A | **exhausted** — `0029` taken 2026-09-03 |
+| `0030–0059` | **Claude Code** | in use |
+| `0060–0089` | **Codex** | free |
+| `0090+` | unreserved | claim a block here before using one |
+
+**Reserved per agent, not per lane, since 2026-09-03.** The original scheme gave the block to
+Lane A, which stopped working the moment both agents started doing backend work: two agents
+inside one reserved block collide exactly as if there were no rule. The unit of reservation has
+to be whoever is holding the pen.
+
+**Exhaustion has a protocol, because the first block ran out with none.** When your block is
+down to its **last two numbers**, reserve the next one *in this file* before you spend them.
+Discovering there is no free number in the middle of writing a migration is what happened on
+2026-09-03, and it blocked the work rather than the other way round.
+
+Whatever the table says, the rule underneath it does not change: **never pick a number because
+it looks free.**
 
 **4. Cross-seam work is contract-first.** The backend↔client seam is in two languages and
 invisible to both compilers — it is what `f17d983` spent a whole commit closing by hand. A

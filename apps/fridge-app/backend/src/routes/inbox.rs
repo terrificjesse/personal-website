@@ -6,6 +6,12 @@
 //! the network to someone else's service, so it runs on an explicit trigger, never inline in a
 //! read. `GET /hunt/inbox/status` reports what the last run recorded and makes no network call
 //! at all.
+//!
+//! # Proposal audit contract
+//!
+//! `GET /hunt/proposals` returns the triggering email's `from_address` and `subject` as
+//! separate nullable fields. The reviewer needs both to check a proposed status change; the
+//! subject is evidence about what happened, but it is never a substitute for who sent it.
 
 use axum::{
     Json,
@@ -21,6 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::GoogleOAuthConfig;
 use crate::inbox::{oauth, sync};
+use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 use crate::routes::auth::CurrentUser;
 
@@ -250,6 +257,7 @@ pub async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     /// The bug this file shipped with, pinned as behaviour rather than as a comment.
     ///
@@ -281,6 +289,130 @@ mod tests {
         assert_ne!(GMAIL_STATE_COOKIE, "fridge_session");
         assert_ne!(GMAIL_STATE_COOKIE, "oauth_state");
     }
+
+    #[tokio::test]
+    async fn proposals_keep_the_sender_and_subject_separate() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+
+        sqlx::query(
+            "INSERT INTO users (id, email, created_at)
+             VALUES ('user-1', 'reviewer@example.com', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("user");
+        sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, company_name, title, url, snapshot_json, snapshot_at, status,
+                 applied_at, status_changed_at, created_at, updated_at)
+             VALUES
+                ('application-1', 'user-1', 'Example Co', 'Engineer', 'https://example.com/job',
+                 '{}', '2026-09-02T00:00:00Z', 'applied', '2026-09-02T00:00:00Z',
+                 '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("application");
+        sqlx::query(
+            "INSERT INTO email_messages
+                (id, user_id, gmail_message_id, from_address, subject, created_at)
+             VALUES
+                ('message-1', 'user-1', 'gmail-1', 'recruiter@example.com',
+                 'Your interview', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("message");
+        sqlx::query(
+            "INSERT INTO email_verdicts
+                (id, message_id, category, confidence, matched_application_id, classifier,
+                 evidence, created_at)
+             VALUES
+                ('verdict-1', 'message-1', 'interview', 0.9, 'application-1', 'rules',
+                 'interview', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("verdict");
+        sqlx::query(
+            "INSERT INTO status_proposals
+                (id, application_id, verdict_id, from_status, to_status, created_at)
+             VALUES
+                ('proposal-1', 'application-1', 'verdict-1', 'applied', 'interview',
+                 '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("proposal");
+
+        let proposals = fetch_proposals(&pool, "user-1")
+            .await
+            .expect("proposal query");
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].from_address.as_deref(), Some("recruiter@example.com"));
+        assert_eq!(proposals[0].subject.as_deref(), Some("Your interview"));
+        assert!(
+            proposals[0].evidence_available,
+            "the whole chain resolves, so the panel may show the mail behind this"
+        );
+
+        // ---- and the same queue, with the evidence chain broken ----
+        //
+        // The live database has exactly one `status_proposals` row and its `verdict_id`
+        // resolves to nothing — `PRAGMA foreign_key_check` flags it. Under the inner joins this
+        // query used to have, such a proposal was **not listed at all**: a status change
+        // waiting for review, silently absent from the queue that exists to review it.
+        //
+        // Foreign keys have to be switched off to *create* this state, because sqlx turns them
+        // on per connection — which is the point: the application cannot write this row, and
+        // the one in the live database got there by some other route (a restore, or a manual
+        // session). The read path still has to survive finding it, and that is what broke.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .expect("relax the constraint to build a state the app cannot write");
+        sqlx::query(
+            "INSERT INTO status_proposals
+                (id, application_id, verdict_id, from_status, to_status, created_at)
+             VALUES
+                ('proposal-2', 'application-1', 'verdict-that-is-gone', 'applied', 'oa',
+                 '2026-09-02T01:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a proposal whose verdict does not exist");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .expect("and put it back, so nothing after this runs relaxed");
+
+        let proposals = fetch_proposals(&pool, "user-1")
+            .await
+            .expect("proposal query");
+
+        assert_eq!(proposals.len(), 2, "the orphaned proposal must still be listed");
+        let orphan = proposals
+            .iter()
+            .find(|p| p.id == "proposal-2")
+            .expect("the orphaned proposal is in the queue");
+        assert!(
+            !orphan.evidence_available,
+            "and it must say the mail behind it cannot be shown, rather than looking terse"
+        );
+        assert_eq!(orphan.from_address, None);
+        assert_eq!(orphan.subject, None);
+        assert_eq!(orphan.evidence, None);
+        assert_eq!(orphan.to_status, "oa", "the proposal itself is intact and reviewable");
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -297,9 +429,17 @@ pub struct Proposal {
     pub to_status: String,
     pub applied_automatically: bool,
     /// The email that caused it. **This link is what makes a bad call reversible** — rule 2.
+    pub from_address: Option<String>,
     pub subject: Option<String>,
     pub evidence: Option<String>,
     pub confidence: Option<f64>,
+    /// Whether the verdict and message this proposal was derived from still resolve.
+    ///
+    /// `false` and all four fields above `None` mean the chain is broken, not that the mail was
+    /// terse. Those are very different things to be told when the question on screen is "should
+    /// I apply this change", so the panel is given the difference rather than left to infer it
+    /// from four nulls.
+    pub evidence_available: bool,
     pub created_at: String,
 }
 
@@ -308,25 +448,44 @@ pub async fn proposals(
     State(pool): State<SqlitePool>,
     CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<Proposal>>, StatusCode> {
+    fetch_proposals(&pool, &user.id)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("inbox: listing proposals failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn fetch_proposals(pool: &SqlitePool, user_id: &str) -> Result<Vec<Proposal>, sqlx::Error> {
     sqlx::query_as::<_, Proposal>(
+        // LEFT JOIN to the evidence, and INNER only to the application.
+        //
+        // These were all inner joins, and a proposal whose verdict or message no longer
+        // resolves was therefore **dropped from the queue entirely** — the silent-drop failure
+        // this codebase designs against everywhere else (`QcOutcome` has no "dropped" variant;
+        // `source_runs` counts filtered and rejected separately for exactly this reason). The
+        // live database has such a row, flagged by `PRAGMA foreign_key_check`, and it would
+        // simply not have been listed.
+        //
+        // The application join stays INNER on purpose: a proposal for an application that does
+        // not exist has nothing to be applied *to*, and `a.user_id` is what scopes the query to
+        // the caller. Widening that one would leak other people's rows.
         "SELECT p.id, p.application_id, a.company_name, a.title,
                 p.from_status, p.to_status, p.applied_automatically,
-                m.subject, v.evidence, v.confidence, p.created_at
+                m.from_address, m.subject, v.evidence, v.confidence,
+                (v.id IS NOT NULL AND m.id IS NOT NULL) AS evidence_available,
+                p.created_at
            FROM status_proposals p
            JOIN internship_applications a ON a.id = p.application_id
-           JOIN email_verdicts v ON v.id = p.verdict_id
-           JOIN email_messages m ON m.id = v.message_id
+           LEFT JOIN email_verdicts v ON v.id = p.verdict_id
+           LEFT JOIN email_messages m ON m.id = v.message_id
           WHERE a.user_id = ? AND p.reviewed_at IS NULL
           ORDER BY p.created_at DESC",
     )
-    .bind(&user.id)
-    .fetch_all(&pool)
+    .bind(user_id)
+    .fetch_all(pool)
     .await
-    .map(Json)
-    .map_err(|err| {
-        eprintln!("inbox: listing proposals failed: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
 }
 
 /// Accept a proposal: apply the status change and mark it reviewed.
@@ -353,80 +512,528 @@ async fn decide(
     id: &str,
     accept: bool,
 ) -> Result<StatusCode, StatusCode> {
-    let row: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT p.application_id, p.to_status, p.applied_automatically
+    // **One transaction, because this decision is two writes.** The tracker moves and the
+    // proposal is marked reviewed, and a half of that is worse than neither: a reviewed
+    // proposal whose status change never landed reads as settled while the application sits
+    // at the old stage, and nothing anywhere records that the two disagree. Rule 2 says an
+    // email-driven change must stay reversible, which it cannot be if the audit row and the
+    // change it describes can come apart.
+    let mut tx = crate::db::begin_write(pool).await.map_err(|err| {
+        eprintln!("inbox: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // `from_status` is read here rather than in a second query on the undo path below. It is
+    // needed inside this transaction, and the read it replaces ended in `.ok().flatten()` —
+    // so a failing lookup was indistinguishable from a proposal that had no previous status,
+    // and the undo silently did nothing.
+    let row: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT p.application_id, p.from_status, p.to_status, p.applied_automatically
            FROM status_proposals p
            JOIN internship_applications a ON a.id = p.application_id
           WHERE p.id = ? AND a.user_id = ? AND p.reviewed_at IS NULL",
     )
     .bind(id)
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|err| {
         eprintln!("inbox: reading a proposal failed: {err:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let Some((application_id, to_status, was_auto)) = row else {
+    let Some((application_id, from_status, to_status, was_auto)) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
     let now = Utc::now();
 
-    if accept {
-        // Applying an already-auto-applied proposal again is a no-op on the status, which is
-        // why this is safe to press twice.
+    // What this decision leaves the application at, if it moves it at all. Accepting applies
+    // the proposal — a no-op on the status when it was already auto-applied, which is why
+    // pressing accept twice is safe. Rejecting undoes it, but only if it was auto-applied:
+    // otherwise "reject" would only mean "stop showing me this", and the tracker would keep
+    // the change the user just said was wrong.
+    // `(where it ends up, where it came from)` — the second is what the event records as
+    // `from_status`. Accepting moves it to the proposal's `to_status`; undoing puts it back,
+    // so the pair is reversed.
+    let next = if accept {
         if ApplicationStatus::parse(&to_status).is_none() {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let _ = sqlx::query(
+        Some((to_status, from_status))
+    } else if was_auto == 1 {
+        Some((from_status, to_status))
+    } else {
+        None
+    };
+
+    if let Some((next, previous)) = next {
+        let moved = sqlx::query(
             "UPDATE internship_applications
                 SET status = ?1, status_changed_at = ?2, updated_at = ?2
               WHERE id = ?3 AND user_id = ?4",
         )
-        .bind(&to_status)
+        .bind(&next)
         .bind(now.to_rfc3339())
         .bind(&application_id)
         .bind(user_id)
-        .execute(pool)
-        .await;
-    } else if was_auto == 1 {
-        // Rejecting a proposal that was already applied has to UNDO it. Without this, "reject"
-        // would only mean "stop showing me this", and the tracker would keep the change the
-        // user just said was wrong — which is the whole failure rule 2 exists to prevent.
-        let previous: Option<String> = sqlx::query_scalar(
-            "SELECT from_status FROM status_proposals WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(pool)
+        .execute(&mut *tx)
         .await
-        .ok()
-        .flatten();
-        if let Some(previous) = previous {
-            let _ = sqlx::query(
-                "UPDATE internship_applications
-                    SET status = ?1, status_changed_at = ?2, updated_at = ?2
-                  WHERE id = ?3 AND user_id = ?4",
-            )
-            .bind(previous)
-            .bind(now.to_rfc3339())
-            .bind(&application_id)
-            .bind(user_id)
-            .execute(pool)
-            .await;
+        .map_err(|err| {
+            eprintln!("inbox: applying a proposal to the application failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // The SELECT above joined on this row, so it exists and belongs to this user. Zero
+        // rows here therefore means something changed underneath us — worth failing on rather
+        // than reviewing a proposal whose change did not happen.
+        if moved.rows_affected() != 1 {
+            eprintln!(
+                "inbox: applying proposal {id} matched {} application rows, expected 1",
+                moved.rows_affected()
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+
+        // Parsed *after* the write, deliberately. The applications table's CHECK has just
+        // accepted this value, so it is in the enum by construction — but "cannot fail" is a
+        // claim about a constraint in another file, and the undo path reaches here with a
+        // status this code never validated. A 500 rolls the whole decision back; an `unwrap`
+        // would take the process with it.
+        let (Some(to_status), from_status) = (
+            ApplicationStatus::parse(&next),
+            ApplicationStatus::parse(&previous),
+        ) else {
+            eprintln!("inbox: proposal {id} applied status {next:?}, which does not parse");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
+        // Actor `manual`, not `email`: the cause is an email and `cause_id` records it, but a
+        // person clicked. Collapsing the two would make "how often do I accept what the
+        // classifier proposes" unanswerable, which is the number 13e needs.
+        //
+        // Accepting a proposal that was ALREADY auto-applied hits the same
+        // (application, cause, to_status) key the email actor wrote and returns
+        // `AlreadyRecorded` — a normal outcome, and the reason `to_status` is in that key is
+        // the undo below, which differs from it.
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id: &application_id,
+                from_status,
+                to_status,
+                actor: Actor::Manual,
+                cause: Some(Cause::StatusProposal(id)),
+                at: now,
+                note: None,
+            },
+        )
+        .await
+        .map_err(|err| {
+            eprintln!("inbox: recording a reviewed proposal failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     }
 
     sqlx::query("UPDATE status_proposals SET reviewed_at = ?1, accepted = ?2 WHERE id = ?3")
         .bind(now.to_rfc3339())
         .bind(i64::from(accept))
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| {
             eprintln!("inbox: recording a review failed: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    tx.commit().await.map_err(|err| {
+        eprintln!("inbox: committing a proposal decision failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod decide_tests {
+    //! The proposal decision is two writes, and these hold them together.
+    //!
+    //! Before Phase 10 this path updated the application and the proposal as separate
+    //! statements outside any transaction, and discarded the `Result` of the first with
+    //! `let _ =`. A failed status change therefore left the proposal marked reviewed and
+    //! accepted while the tracker never moved — the proposal claiming a change that did not
+    //! happen, which is exactly the state rule 2 exists to make impossible.
+
+    use super::*;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("inbox-decide-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    async fn user(pool: &SqlitePool) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(format!("{id}@example.com"))
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn application(pool: &SqlitePool, user_id: &str, status: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, company_name, title, url, snapshot_json, snapshot_at,
+                 status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1, ?2, 'Jump Trading', 'SWE Intern', 'https://example.com/j',
+                     '{}', ?3, ?4, ?3, ?3, ?3, ?3)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(&now)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A proposal needs a verdict, which needs a message: `status_proposals.verdict_id` is a
+    /// real foreign key and sqlx turns `PRAGMA foreign_keys` on per connection.
+    async fn proposal(
+        pool: &SqlitePool,
+        user_id: &str,
+        application_id: &str,
+        from_status: &str,
+        to_status: &str,
+        auto: i64,
+    ) -> String {
+        let now = Utc::now().to_rfc3339();
+        let message_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO email_messages (id, user_id, gmail_message_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&message_id)
+        .bind(user_id)
+        .bind(Uuid::new_v4().to_string())
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let verdict_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO email_verdicts (id, message_id, category, classifier, created_at)
+             VALUES (?1, ?2, 'oa', 'rules', ?3)",
+        )
+        .bind(&verdict_id)
+        .bind(&message_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO status_proposals
+                (id, application_id, verdict_id, from_status, to_status,
+                 applied_automatically, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&id)
+        .bind(application_id)
+        .bind(&verdict_id)
+        .bind(from_status)
+        .bind(to_status)
+        .bind(auto)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn status_of(pool: &SqlitePool, application_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM internship_applications WHERE id = ?")
+            .bind(application_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn reviewed_at(pool: &SqlitePool, proposal_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT reviewed_at FROM status_proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The regression this transaction exists for.
+    ///
+    /// `from_status` has no CHECK on `status_proposals` but `status` does on
+    /// `internship_applications`, so a proposal carrying a status the applications table will
+    /// not accept makes the undo fail for real — a database error on the first of the two
+    /// writes, which is the shape the old code swallowed.
+    #[tokio::test]
+    async fn a_failed_undo_leaves_the_proposal_unreviewed() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "hired", "oa", 1).await;
+
+        let outcome = decide(&pool, &user_id, &proposal_id, false).await;
+
+        assert_eq!(outcome, Err(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            reviewed_at(&pool, &proposal_id).await,
+            None,
+            "the proposal must not read as settled when its status change did not land"
+        );
+        assert_eq!(status_of(&pool, &app_id).await, "oa", "nothing moved");
+    }
+
+    #[tokio::test]
+    async fn rejecting_an_auto_applied_proposal_restores_the_previous_status() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+
+        assert_eq!(
+            decide(&pool, &user_id, &proposal_id, false).await,
+            Ok(StatusCode::NO_CONTENT)
+        );
+        assert_eq!(status_of(&pool, &app_id).await, "applied", "the undo landed");
+        assert!(reviewed_at(&pool, &proposal_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn accepting_the_same_proposal_twice_changes_nothing_the_second_time() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        assert_eq!(
+            decide(&pool, &user_id, &proposal_id, true).await,
+            Ok(StatusCode::NO_CONTENT)
+        );
+        assert_eq!(status_of(&pool, &app_id).await, "oa");
+
+        // Reviewed proposals are invisible to the SELECT, so the second press is a 404 rather
+        // than a second application of the same change.
+        assert_eq!(
+            decide(&pool, &user_id, &proposal_id, true).await,
+            Err(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(status_of(&pool, &app_id).await, "oa");
+    }
+
+    /// The pool settings the transactions above depend on.
+    ///
+    /// Holding a write transaction across two statements is only safe because SQLite is in WAL
+    /// mode with a busy timeout — readers do not block, and a competing writer waits instead of
+    /// failing instantly with SQLITE_BUSY. Both are sqlx defaults rather than anything this
+    /// project sets, which is exactly why they are worth pinning: a future `init_pool` that
+    /// builds `SqliteConnectOptions` by hand could drop either one, and the symptom would be
+    /// intermittent 500s under concurrency rather than a compile error.
+    #[tokio::test]
+    async fn the_pool_is_wal_with_a_busy_timeout() {
+        let pool = pool().await;
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(timeout > 0, "a zero busy timeout fails instantly under contention");
+    }
+
+    /// Eight decisions at once, on one pool, all of which now open write transactions.
+    #[tokio::test]
+    async fn concurrent_decisions_do_not_collide() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+
+        let mut proposals = Vec::new();
+        for _ in 0..8 {
+            let app_id = application(&pool, &user_id, "applied").await;
+            proposals.push((
+                proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await,
+                app_id,
+            ));
+        }
+
+        let mut handles = Vec::new();
+        for (proposal_id, app_id) in proposals {
+            let pool = pool.clone();
+            let user_id = user_id.clone();
+            handles.push(tokio::spawn(async move {
+                let outcome = decide(&pool, &user_id, &proposal_id, true).await;
+                (outcome, app_id)
+            }));
+        }
+
+        for handle in handles {
+            let (outcome, app_id) = handle.await.unwrap();
+            assert_eq!(outcome, Ok(StatusCode::NO_CONTENT));
+            assert_eq!(status_of(&pool, &app_id).await, "oa");
+        }
+    }
+
+    // ---- 10e part 2: what each decision records ----
+
+    #[derive(Debug, sqlx::FromRow, PartialEq, Eq)]
+    struct EventRow {
+        from_status: Option<String>,
+        to_status: String,
+        actor: String,
+        cause_kind: Option<String>,
+        cause_id: Option<String>,
+    }
+
+    async fn events_for(pool: &SqlitePool, application_id: &str) -> Vec<EventRow> {
+        sqlx::query_as::<_, EventRow>(
+            "SELECT from_status, to_status, actor, cause_kind, cause_id
+               FROM application_events WHERE application_id = ?
+              ORDER BY at ASC, created_at ASC, id ASC",
+        )
+        .bind(application_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The email actor's row, written the way `propose_status` writes it when it auto-applies.
+    async fn record_auto_apply(
+        pool: &SqlitePool,
+        application_id: &str,
+        proposal_id: &str,
+        from: ApplicationStatus,
+        to: ApplicationStatus,
+    ) {
+        let mut tx = crate::db::begin_write(pool).await.unwrap();
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id,
+                from_status: Some(from),
+                to_status: to,
+                actor: Actor::Email,
+                cause: Some(Cause::StatusProposal(proposal_id)),
+                at: Utc::now(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepting_a_proposal_records_one_manual_event() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        decide(&pool, &user_id, &proposal_id, true).await.unwrap();
+
+        assert_eq!(
+            events_for(&pool, &app_id).await,
+            vec![EventRow {
+                from_status: Some("applied".into()),
+                to_status: "oa".into(),
+                // The cause is an email; the actor is the person who clicked.
+                actor: "manual".into(),
+                cause_kind: Some("status_proposal".into()),
+                cause_id: Some(proposal_id),
+            }]
+        );
+    }
+
+    /// Where the UNIQUE key earns its place.
+    ///
+    /// The email actor already recorded (application, status_proposal, p, oa) when it
+    /// auto-applied. A human accepting the same proposal afterwards produces the identical
+    /// key, and `record` returns `AlreadyRecorded` — which is a normal outcome, not an error.
+    /// Asserting the COUNT is the point: asserting the call succeeded would pass either way.
+    #[tokio::test]
+    async fn accepting_an_already_auto_applied_proposal_records_no_second_event() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+        record_auto_apply(
+            &pool,
+            &app_id,
+            &proposal_id,
+            ApplicationStatus::Applied,
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        decide(&pool, &user_id, &proposal_id, true).await.unwrap();
+
+        let events = events_for(&pool, &app_id).await;
+        assert_eq!(events.len(), 1, "the email actor's row, and nothing on top of it");
+        assert_eq!(events[0].actor, "email");
+    }
+
+    /// Rejecting something that was never applied changes no status, so there is no transition
+    /// to record. An event here would make the fold disagree with the column immediately.
+    #[tokio::test]
+    async fn rejecting_a_proposal_that_never_applied_records_nothing() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        decide(&pool, &user_id, &proposal_id, false).await.unwrap();
+
+        assert!(events_for(&pool, &app_id).await.is_empty());
+        assert_eq!(status_of(&pool, &app_id).await, "applied");
+    }
+
+    /// The undo shares its cause with the event that applied it and differs only in
+    /// `to_status` — which is exactly why `to_status` is in the UNIQUE key.
+    #[tokio::test]
+    async fn undoing_an_auto_applied_proposal_records_the_reverse_transition() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+        record_auto_apply(
+            &pool,
+            &app_id,
+            &proposal_id,
+            ApplicationStatus::Applied,
+            ApplicationStatus::Oa,
+        )
+        .await;
+
+        decide(&pool, &user_id, &proposal_id, false).await.unwrap();
+
+        let events = events_for(&pool, &app_id).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].to_status, "applied", "back where it came from");
+        assert_eq!(events[1].from_status.as_deref(), Some("oa"));
+        assert_eq!(events[1].actor, "manual");
+        assert_eq!(events[1].cause_id.as_deref(), Some(proposal_id.as_str()));
+        assert_eq!(status_of(&pool, &app_id).await, "applied");
+    }
 }

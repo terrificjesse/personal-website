@@ -1,0 +1,42 @@
+# One origin, two upstreams. Install to /etc/caddy/Caddyfile.
+#
+# Caddy over nginx+certbot for one reason: automatic HTTPS with no renewal cron to forget.
+# If the host already runs nginx, docs/DEPLOY.md § Reverse proxy says what changes.
+#
+# THE ORDER OF THESE ROUTES MATTERS. `/api/*` is matched first; everything else falls through
+# to Next. Reversing them serves the SPA for API calls, which arrives at the browser as JSON
+# parse errors rather than as a 404.
+
+hunt.example.com {
+	encode zstd gzip
+
+	# The backend, path-stripped: /api/health -> /health upstream.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8080 {
+			# These two lines are load-bearing, not boilerplate. The backend's rate limiter
+			# trusts X-Forwarded-For only when the TCP peer is loopback — which behind this
+			# proxy it always is — and takes the LAST hop. Without them every caller on the
+			# internet would share one login bucket, and an attacker could lock the real user
+			# out by exhausting it.
+			#
+			# `header_up` SETS rather than appends, so a header forged by a remote client does
+			# not survive the hop. Swapping this proxy for one that appends keeps the last-hop
+			# rule working, but check that assumption rather than inheriting it.
+			#
+			# (Until 2026-09-02 the limiter ignored the header entirely and this comment said
+			# so. See docs/DEPLOY.md § The rate limiter behind a proxy.)
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# The backend logs to the journal; this is the access log.
+	log {
+		output file /var/log/caddy/hunt.log
+		format json
+	}
+}

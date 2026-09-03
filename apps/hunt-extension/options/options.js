@@ -33,7 +33,7 @@ const DEFAULTS = {
   token: "",
   siteUrl: "http://localhost:3000",
   pollMinutes: 5,
-  kinds: { posting: true, email: true },
+  kinds: { posting: true, email: true, nudge: true },
   maxNotificationsPerPoll: 3,
 };
 
@@ -55,6 +55,9 @@ async function load() {
   }
   document.getElementById("kind-posting").checked = settings.kinds.posting !== false;
   document.getElementById("kind-email").checked = settings.kinds.email !== false;
+  // `!== false` and not a truthiness check: a kind absent from stored settings is enabled,
+  // which is what `background.js`'s `kindEnabled` does with it too.
+  document.getElementById("kind-nudge").checked = settings.kinds.nudge !== false;
 }
 
 function fromForm() {
@@ -70,6 +73,7 @@ function fromForm() {
     kinds: {
       posting: document.getElementById("kind-posting").checked,
       email: document.getElementById("kind-email").checked,
+      nudge: document.getElementById("kind-nudge").checked,
     },
   };
 }
@@ -89,11 +93,24 @@ document.getElementById("test").addEventListener("click", async () => {
   const base = settings.backendUrl.replace(/\/+$/, "");
   say("Testing…");
 
-  let origin;
+  let url;
   try {
-    origin = new URL(base).origin;
+    url = new URL(base);
   } catch {
     return say(`${settings.backendUrl} is not a valid URL.`, "bad");
+  }
+  const origin = url.origin;
+
+  // A bearer token on every poll, over cleartext, to a host that is not this machine — the
+  // same mistake COOKIE_SECURE exists to prevent, one layer up. Loopback is exempt because
+  // that traffic never leaves the machine, and it is the whole local-dev setup.
+  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  if (url.protocol !== "https:" && !loopback) {
+    return say(
+      `${origin} is not https. Every poll carries your access token, and this extension will ` +
+        `not send it in the clear to a remote host. Use https, or run the backend locally.`,
+      "bad",
+    );
   }
 
   // Asked first, because without it the fetch below fails in a way that looks exactly like
@@ -107,8 +124,9 @@ document.getElementById("test").addEventListener("click", async () => {
       permitted = await browser.permissions.request(wanted);
     } catch (err) {
       return say(
-        `${origin} is not one of this extension's host_permissions, so it cannot be ` +
-          `granted at runtime. Add it to manifest.json and reload the extension. (${err})`,
+        `${origin} cannot be granted at runtime. The manifest allows any https origin to be ` +
+          `requested here (plus localhost for development), so this usually means the URL is ` +
+          `something else — an http host, or an extension or file URL. (${err})`,
         "bad",
       );
     }

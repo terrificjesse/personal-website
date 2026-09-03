@@ -7,7 +7,9 @@
 //! 1. **Primary — the canonical ATS triple `(ats, board_slug, job_id)`**, recovered from the
 //!    posting URL. It is an exact key needing no fuzzy matching, and it works because the
 //!    GitHub aggregator lists link *directly at the ATS* — so both sides of the join carry the
-//!    same identity. Covers 73% of Simplify listings (58% of active ones).
+//!    same identity. The source/host census projected 73% coverage (58% of active listings),
+//!    but the Phase 7 run measured ~35% before the three parsers added below; Task 12b owns
+//!    the independent post-change measurement.
 //! 2. **Fallback — `(company_key, title_key)`** for everything not on a pollable ATS.
 //!
 //! **Location is deliberately not in either key.** § C measured 1,409 Simplify records listing
@@ -22,19 +24,28 @@
 //! Lever appends `/apply` (579 records), Ashby appends `/application`, 544 records carry
 //! `?gh_jid=`, 574 `?mobile=`, 339 `?ats=`, and Greenhouse serves the same board from **two
 //! hosts** (`job-boards.greenhouse.io`, 1,244 records; `boards.greenhouse.io`, 179).
+//! The 2026-09-02 corpus added three more concrete URL families: Workable's
+//! `/{account}/j/{id}[/apply]`, Rippling's `/[locale/]{company}/jobs/{uuid}`, and Workday's
+//! two host/path layouts. Their parsers preserve every identity component the URL exposes;
+//! where Workday's route suffix is ambiguous, they deliberately under-merge rather than
+//! manufacture a stronger identity than the URL proves.
 //!
 //! # What this module deliberately does not do
 //!
-//! **No fuzzy matching.** § C measured 18 groups of company-name variants collapsing within
-//! Simplify alone — `KLA` / `KLA Corporation`, `WhatNot` / `Whatnot`, `Moog` / `Moog ` — and
-//! notes that parent/subsidiary pairs ("Google" / "Alphabet") are not string problems at all.
-//! Fuzzy company/title matching is the NLP learning area, reserved for the repo owner; § C
-//! also concludes `src/nlp.rs` is the wrong shape to reuse here (it is a ranked typeahead, not
-//! a pairwise identity test, and its substring band would fire on "Engineer" across most of
-//! the corpus).
+//! **No fuzzy TITLE matching**, and that part is unchanged: "Engineer" is a substring of a
+//! large fraction of the corpus, and a rule loose enough to merge "SWE Intern" with "Software
+//! Engineer Intern" is loose enough to merge two different roles at one company. Under-merging
+//! shows a duplicate; over-merging destroys a posting.
 //!
-//! [`FuzzyMatcher`] is the seam that work plugs into. Until something implements it, dedup is
-//! exact-key only, which **under-merges** — the safer failure, per § C.
+//! **Company names are canonicalized, since 2026-09-03**, but not here — by
+//! `normalize::company_key`, before this module ever sees the key. That keeps "one real job is
+//! one row" a storage guarantee enforced by `dedup_key`'s UNIQUE index rather than a pairwise
+//! test a future upsert could forget to run. See [`company_match`](super::company_match), which
+//! also records why it is a reviewed table and not a string metric: `citadel` /
+//! `citadel securities` are two employers and `jump trading` / `jump trading group` is one, one
+//! descriptive token apart either way.
+//!
+//! **No parent/subsidiary knowledge.** "Google" / "Alphabet" is not a string problem.
 
 use crate::internships::models::{NormalizedPosting, Season};
 
@@ -191,6 +202,38 @@ pub fn ats_identity(url: &str) -> Option<AtsIdentity> {
             }
             _ => return None,
         },
+        // apply.workable.com/{account}/j/{id}[/apply]
+        //
+        // `canonical_url` has already removed the optional trailing `/apply`. Keep the job
+        // id's case: the real corpus uses uppercase hexadecimal ids, but Workable has not
+        // documented that case folding is safe.
+        "apply.workable.com" => match segments.as_slice() {
+            [account, "j", id] => {
+                return Some(AtsIdentity {
+                    ats: "workable".to_string(),
+                    board_slug: (*account).to_string(),
+                    job_id: (*id).to_string(),
+                });
+            }
+            _ => return None,
+        },
+        // ats.rippling.com/[locale/]{company}/jobs/{uuid}
+        //
+        // Locale removal is centralized in `canonical_url`, so both the localized and bare
+        // forms arrive here as exactly three segments.
+        "ats.rippling.com" => match segments.as_slice() {
+            [company, "jobs", id] => {
+                return Some(AtsIdentity {
+                    ats: "rippling".to_string(),
+                    board_slug: (*company).to_string(),
+                    job_id: (*id).to_string(),
+                });
+            }
+            _ => return None,
+        },
+        _ if host.ends_with(".myworkdayjobs.com") || host.ends_with(".myworkdaysite.com") => {
+            return workday_identity(host, &segments);
+        }
         // Not an ATS host. A Greenhouse job id in the query string still identifies the
         // job — see `greenhouse_job_id_param`.
         _ => return greenhouse_job_id_param(url).map(job_id_identity),
@@ -208,6 +251,73 @@ pub fn ats_identity(url: &str) -> Option<AtsIdentity> {
         board_slug: identity.0.to_string(),
         job_id: identity.1.to_string(),
     })
+}
+
+/// Recover a Workday identity from either public career-site layout.
+///
+/// The real corpus contains both:
+///
+/// - `{tenant}.wd{N}.myworkdayjobs.com/[locale/]{site}/job/.../{slug}_{id}`
+/// - `wd{N}.myworkdaysite.com/[locale/]recruiting/{tenant}/{site}/job/.../{slug}_{id}`
+///
+/// The board slug retains the shard (`tenant.wdN`). A tenant can move shards, so this may
+/// under-merge two URLs for one requisition; dropping the shard would assert an equivalence
+/// the URL corpus does not prove, and over-merging loses a posting. For the bare-shard
+/// `myworkdaysite.com` form, `sources::simplify::board_of` still derives the wrong tenant from
+/// the host; that board-discovery gap is separate from the identity parsed here.
+fn workday_identity(host: &str, segments: &[&str]) -> Option<AtsIdentity> {
+    let labels: Vec<&str> = host.split('.').collect();
+
+    let (tenant, shard, external_path) = match labels.as_slice() {
+        // `{tenant}.wd{N}.myworkdayjobs.com/{site}/job/.../{slug}_{id}` and the less common
+        // tenant-hosted `myworkdaysite.com` variant documented by board discovery.
+        [tenant, shard, domain, "com"]
+            if (*domain == "myworkdayjobs" || *domain == "myworkdaysite")
+                && is_workday_shard(shard) =>
+        {
+            match segments {
+                [_site, "job", external_path @ ..] if !external_path.is_empty() => {
+                    (*tenant, *shard, *external_path.last()?)
+                }
+                _ => return None,
+            }
+        }
+        // The real `myworkdaysite.com` corpus puts the tenant in the recruiting path, not
+        // the host: `wd3.myworkdaysite.com/recruiting/magna/Magna/job/...`.
+        [shard, "myworkdaysite", "com"] if is_workday_shard(shard) => match segments {
+            ["recruiting", tenant, _site, "job", external_path @ ..]
+                if !external_path.is_empty() =>
+            {
+                (*tenant, *shard, *external_path.last()?)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    // Workday separates its display slug from its external-path identity with the first
+    // underscore. The identity itself can contain underscores (`R_12318`,
+    // `REQ_0000080335-1`), so splitting at the last underscore would silently discard part
+    // of a real requisition id. Preserve a trailing `-1`/`-2`: same-title URLs in the corpus
+    // suggest it is sometimes route disambiguation, but URL-only parsing cannot distinguish
+    // that from a requisition id that genuinely ends the same way. The conservative result is
+    // an under-merge, never two distinct jobs collapsed together.
+    let (_, job_id) = external_path.split_once('_')?;
+    if job_id.is_empty() {
+        return None;
+    }
+
+    Some(AtsIdentity {
+        ats: "workday".to_string(),
+        board_slug: format!("{tenant}.{shard}"),
+        job_id: job_id.to_string(),
+    })
+}
+
+fn is_workday_shard(label: &str) -> bool {
+    label
+        .strip_prefix("wd")
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Identity for a Greenhouse job known only by its id, with no board slug available.
@@ -370,21 +480,18 @@ fn season_str(season: Season) -> &'static str {
     }
 }
 
-/// The seam for fuzzy company/title matching.
-///
-/// **Deliberately unimplemented.** Fuzzy matching is the NLP learning area and belongs to the
-/// repo owner; see this module's header and `docs/INTERNSHIP_SCRAPING.md` § C, which concludes
-/// `src/nlp.rs` cannot be reused as-is (wrong output shape, and its substring band would fire
-/// on "Engineer" across most of the corpus) and that generalizing it would mean *editing* a
-/// `[learn]` file.
-///
-/// Until something implements this, [`dedup_key`] is exact-only and under-merges: the same job
-/// listed as `KLA` on one source and `KLA Corporation` on another becomes two rows. That is
-/// visible and recoverable. Over-merging — collapsing two genuinely different jobs — is not.
-pub trait FuzzyMatcher: Send + Sync {
-    /// Whether these two postings are the same job, given the exact keys already disagreed.
-    fn same_posting(&self, left: &NormalizedPosting, right: &NormalizedPosting) -> bool;
-}
+// The `FuzzyMatcher` seam was removed on 2026-09-03, when the thing it was reserved for got
+// built and turned out not to need it.
+//
+// It was a pairwise predicate — "are these two postings the same job?" — to be consulted after
+// the exact keys disagreed. What company canonicalization actually needs is for the two
+// postings to compute the **same key in the first place**, which `normalize::company_key` now
+// does by mapping a reviewed alias table. That keeps "one real job is one row" a storage
+// guarantee enforced by `dedup_key`'s UNIQUE index, rather than application logic a future
+// upsert could forget to call — which is the property this module's header claims and which a
+// pairwise matcher would have quietly weakened.
+//
+// See `company_match`, and `docs/INTERNSHIP_SCRAPING.md` § C.
 
 #[cfg(test)]
 mod tests {
@@ -560,6 +667,129 @@ mod tests {
     }
 
     #[test]
+    fn workable_uses_the_account_and_job_token_from_real_urls() {
+        // The same Pony.ai job appeared in the real corpus both with and without Workable's
+        // trailing action segment.
+        let bare = ats_identity("https://apply.workable.com/pony-dot-ai/j/BA5FFDBC71/")
+            .expect("bare Workable URL should be recognized");
+        let apply = ats_identity("https://apply.workable.com/pony-dot-ai/j/BA5FFDBC71/apply")
+            .expect("Workable apply URL should be recognized");
+        assert_eq!(bare, apply);
+        assert_eq!(bare.ats, "workable");
+        assert_eq!(bare.board_slug, "pony-dot-ai");
+        assert_eq!(bare.job_id, "BA5FFDBC71");
+
+        let other = ats_identity("https://apply.workable.com/altom-transport/j/9FC654F05E/apply")
+            .expect("second real Workable URL should be recognized");
+        assert_ne!(bare, other);
+    }
+
+    #[test]
+    fn rippling_removes_locale_but_keeps_company_and_uuid() {
+        // Both forms for this exact SpreeAI job occur in the real corpus.
+        let localized = ats_identity(
+            "https://ats.rippling.com/en-GB/spreeai/jobs/c52472cb-2671-45d7-b666-17196dc3df25",
+        )
+        .expect("localized Rippling URL should be recognized");
+        let bare = ats_identity(
+            "https://ats.rippling.com/spreeai/jobs/c52472cb-2671-45d7-b666-17196dc3df25",
+        )
+        .expect("bare Rippling URL should be recognized");
+        assert_eq!(localized, bare);
+        assert_eq!(bare.ats, "rippling");
+        assert_eq!(bare.board_slug, "spreeai");
+        assert_eq!(bare.job_id, "c52472cb-2671-45d7-b666-17196dc3df25");
+
+        let other = ats_identity(
+            "https://ats.rippling.com/spreeai/jobs/d34aed29-7a11-4e37-b5bc-e9317f82f0b1",
+        )
+        .expect("second real Rippling URL should be recognized");
+        assert_ne!(bare, other);
+    }
+
+    #[test]
+    fn workday_recognizes_both_real_host_and_path_layouts() {
+        let hosted = ats_identity("https://oxy.wd5.myworkdayjobs.com/Corporate/job/_JR100413")
+            .expect("tenant-hosted Workday URL should be recognized");
+        assert_eq!(hosted.ats, "workday");
+        assert_eq!(hosted.board_slug, "oxy.wd5");
+        assert_eq!(hosted.job_id, "JR100413");
+
+        let site = ats_identity(
+            "https://wd3.myworkdaysite.com/recruiting/magna/Magna/job/Grand-Rapids-Michigan-US/Product-Engineering-Intern_R00243272",
+        )
+        .expect("recruiting-path Workday URL should be recognized");
+        assert_eq!(site.ats, "workday");
+        assert_eq!(site.board_slug, "magna.wd3");
+        assert_eq!(site.job_id, "R00243272");
+
+        let localized_site = ats_identity(
+            "https://wd5.myworkdaysite.com/en-US/recruiting/devonenergy/Careers/job/Oklahoma-City-OK/Technology-Summer-Intern-2027_R26264-1",
+        )
+        .expect("localized recruiting-path Workday URL should be recognized");
+        assert_eq!(localized_site.board_slug, "devonenergy.wd5");
+        assert_eq!(localized_site.job_id, "R26264-1");
+    }
+
+    #[test]
+    fn workday_locale_does_not_split_a_real_duplicate() {
+        let bare = ats_identity(
+            "https://coreandmain.wd1.myworkdayjobs.com/coreandmain/job/Saint-Louis-MO-63146/Intern---Data-Engineering----Corp_45804",
+        )
+        .unwrap();
+        let localized = ats_identity(
+            "https://coreandmain.wd1.myworkdayjobs.com/en-US/coreandmain/job/Saint-Louis-MO-63146/Intern---Data-Engineering----Corp_45804",
+        )
+        .unwrap();
+        assert_eq!(bare, localized);
+    }
+
+    #[test]
+    fn workday_identity_keeps_internal_underscores_and_route_suffixes() {
+        // These are real URL shapes. Workday's visible page identifies the former as
+        // `R_12318`; splitting at the final underscore would reduce three distinct prefixes
+        // (`R_`, `REQ_`, and a bare number) to the same numeric tail.
+        let embedded = ats_identity(
+            "https://aoins.wd5.myworkdayjobs.com/AutoOwners/job/Lansing-MI/Data-Engineering-Internship---Summer-2026_R_12318",
+        )
+        .expect("Workday id containing an underscore should be recognized");
+        assert_eq!(embedded.job_id, "R_12318");
+
+        let req = ats_identity(
+            "https://psu.wd1.myworkdayjobs.com/PSU_Staff/job/Penn-State-University-Park/Research-Engineering-Interns_REQ_0000080335-1",
+        )
+        .expect("Workday REQ id should be recognized");
+        assert_eq!(req.job_id, "REQ_0000080335-1");
+
+        // `-1` is sometimes Workday route disambiguation, but the URL alone cannot prove it
+        // is not part of the requisition id. Keep the two keys distinct: this can show a
+        // duplicate, while stripping it could destroy a genuinely separate job.
+        let plain = ats_identity(
+            "https://medtronic.wd1.myworkdayjobs.com/redeploymentmedtroniccareers/job/Fridley-Minnesota-United-States-of-America/Software-Engineering-Intern---Summer-2027_R73630",
+        )
+        .unwrap();
+        let suffixed = ats_identity(
+            "https://medtronic.wd1.myworkdayjobs.com/redeploymentmedtroniccareers/job/Fridley-Minnesota-United-States-of-America/Software-Engineering-Intern---Summer-2027_R73630-1",
+        )
+        .unwrap();
+        assert_ne!(plain, suffixed);
+    }
+
+    #[test]
+    fn ats_like_but_non_job_paths_do_not_get_an_identity() {
+        for url in [
+            "https://apply.workable.com/pony-dot-ai/jobs/BA5FFDBC71",
+            "https://ats.rippling.com/spreeai/job/c52472cb-2671-45d7-b666-17196dc3df25",
+            "https://oxy.wd5.myworkdayjobs.com/Corporate",
+            "https://oxy.wd5.myworkdayjobs.com/Corporate/job/Software-Engineer",
+            "https://wd3.myworkdaysite.com/recruiting/magna/Magna",
+            "https://notworkdayjobs.com/Corporate/job/Role_JR100413",
+        ] {
+            assert_eq!(ats_identity(url), None, "{url} must not create an ATS key");
+        }
+    }
+
+    #[test]
     fn the_same_id_on_different_boards_stays_distinct() {
         let a = posting("acme", "SWE Intern", "https://jobs.lever.co/acme/uuid-1");
         let b = posting("other", "SWE Intern", "https://jobs.lever.co/other/uuid-1");
@@ -709,5 +939,125 @@ mod tests {
         let a = posting("acme", "Director, US International Tax", "https://acme.com/1");
         let b = posting("acme", "Internal Communications Manager", "https://acme.com/2");
         assert_ne!(dedup_key(&a), dedup_key(&b));
+    }
+
+    /// Task 12b's reproducible, read-only blast-radius report.
+    ///
+    /// This is ignored because the fixture is deliberately a copy of the real database, not
+    /// a committed test database. `docs/INTERNSHIP_SCRAPING.md` § C gives the exact copy and
+    /// invocation. The author of the key does not run the measurement.
+    #[tokio::test]
+    #[ignore = "12b runs this against /tmp/fridge-12b-copy.db"]
+    async fn report_new_ats_key_merge_and_split_candidates() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::PathBuf;
+
+        #[derive(sqlx::FromRow)]
+        struct Sighting {
+            posting_id: String,
+            old_key: String,
+            source: String,
+            url: String,
+        }
+
+        let fixture = PathBuf::from(
+            std::env::var("REKEY_FIXTURE_DB")
+                .expect("set REKEY_FIXTURE_DB to the documented database copy"),
+        );
+        assert_ne!(
+            fixture.file_name().and_then(|name| name.to_str()),
+            Some("fridge.db"),
+            "refusing the live database path; make the documented copy first"
+        );
+
+        let options = SqliteConnectOptions::new()
+            .filename(&fixture)
+            .read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open the fixture read-only");
+        let sightings = sqlx::query_as::<_, Sighting>(
+            r#"
+            SELECT
+                p.id AS posting_id,
+                p.dedup_key AS old_key,
+                s.source,
+                s.url
+            FROM posting_sightings AS s
+            JOIN internship_postings AS p ON p.id = s.posting_id
+            ORDER BY p.id, s.source, s.external_id
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read posting sightings");
+
+        let mut identities: BTreeMap<String, Vec<&Sighting>> = BTreeMap::new();
+        let mut identities_by_posting: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for sighting in &sightings {
+            match ats_identity(&sighting.url) {
+                Some(identity)
+                    if matches!(identity.ats.as_str(), "workday" | "workable" | "rippling") =>
+                {
+                    let key = identity.key();
+                    identities.entry(key.clone()).or_default().push(sighting);
+                    identities_by_posting
+                        .entry(&sighting.posting_id)
+                        .or_default()
+                        .insert(key);
+                }
+                _ => {
+                    // A sighting outside the three new parsers keeps the key its stored row
+                    // had before 12a. Including that unchanged side is essential: a row with
+                    // one Workday sighting and one company-careers-page sighting will split
+                    // after re-keying even though only one of its URLs gained an ATS identity.
+                    identities_by_posting
+                        .entry(&sighting.posting_id)
+                        .or_default()
+                        .insert(sighting.old_key.clone());
+                }
+            }
+        }
+
+        let merge_groups: Vec<_> = identities
+            .iter()
+            .filter(|(_, group)| {
+                group
+                    .iter()
+                    .map(|row| row.posting_id.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > 1
+            })
+            .collect();
+        let split_groups: Vec<_> = identities_by_posting
+            .iter()
+            .filter(|(_, keys)| keys.len() > 1)
+            .collect();
+
+        println!("new-ATS identity keys: {}", identities.len());
+        println!(
+            "merge candidates (one new key, multiple stored rows): {}",
+            merge_groups.len()
+        );
+        for (key, group) in merge_groups {
+            println!("MERGE {key}");
+            for row in group {
+                println!(
+                    "  posting={} old_key={} source={} url={}",
+                    row.posting_id, row.old_key, row.source, row.url
+                );
+            }
+        }
+        println!(
+            "split candidates (one stored row, multiple new keys): {}",
+            split_groups.len()
+        );
+        for (posting_id, keys) in split_groups {
+            println!("SPLIT posting={posting_id} keys={keys:?}");
+        }
     }
 }

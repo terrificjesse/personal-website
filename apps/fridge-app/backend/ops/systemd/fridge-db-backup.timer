@@ -1,0 +1,13 @@
+# Daily, persistent across downtime, and slightly jittered so restarts do not make backup I/O
+# compete with every other midnight/boot job on the host.
+[Unit]
+Description=Schedule verified fridge.db backups
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=fridge-db-backup.service
+
+[Install]
+WantedBy=timers.target
