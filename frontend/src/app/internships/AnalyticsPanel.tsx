@@ -7,6 +7,8 @@
  * and no-response stay visibly separate: rejection overlaps `responded`, while live/dead
  * silence partition applications that have never received a response. Combining those bars
  * into a generic "closed" outcome would make the hunt look healthier than it is.
+ * Résumé attribution follows stable variant ids on the backend: renamed and archived variants
+ * remain reportable, while pre-12f applications stay in the explicit "No variant" bucket.
  *
  * The initial window covers the last 90 UTC dates and ends at tomorrow's midnight because the
  * backend's `to` boundary is exclusive. This frontend default should be copied into HUNT.md by
@@ -236,7 +238,7 @@ export function AnalyticsPanel() {
             rejection or a combined &ldquo;closed&rdquo; bar.
           </p>
 
-          <div className="grid gap-4 xl:grid-cols-3">
+          <div className="grid gap-4 xl:grid-cols-2">
             <BreakdownChart
               title="By source"
               rows={data.by_source}
@@ -251,6 +253,11 @@ export function AnalyticsPanel() {
               title="By application month"
               rows={data.by_month}
               labelForKey={monthLabel}
+            />
+            <BreakdownChart
+              title="By résumé variant"
+              rows={data.by_variant}
+              labelForKey={variantLabel}
             />
           </div>
         </div>
@@ -299,8 +306,8 @@ function BreakdownChart({
         <p className="mt-3 text-xs text-neutral-500">No applications in this window.</p>
       ) : (
         <div className="mt-3 space-y-5">
-          {rows.map((row) => (
-            <div key={row.key}>
+          {rows.map((row, index) => (
+            <div key={`${row.key}:${index}`}>
               <div className="flex items-baseline justify-between gap-2 text-sm">
                 <span className="font-medium">{labelForKey(row.key)}</span>
                 <span className="text-xs tabular-nums text-neutral-500">
@@ -375,4 +382,8 @@ function monthLabel(key: string): string {
   // month for users west of Greenwich.
   const month = new Date(Number(match[1]), Number(match[2]) - 1, 1);
   return month.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+}
+
+function variantLabel(key: string): string {
+  return key === "" ? "No variant" : key;
 }

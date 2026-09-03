@@ -10,6 +10,7 @@ import { InboxPanel } from "./InboxPanel";
 import { CvProfileEditor } from "./CvProfileEditor";
 import { ExtensionAccess } from "./ExtensionAccess";
 import { AnalyticsPanel } from "./AnalyticsPanel";
+import { ResumeVariantsPanel } from "./ResumeVariantsPanel";
 import { useApiError } from "@/lib/useApiError";
 import {
   createApplication,
@@ -314,6 +315,7 @@ function InternshipsPageContent() {
         <InboxPanel />
         <ExtensionAccess />
         <CvProfileEditor />
+        <ResumeVariantsPanel />
         <AnswerLibrary />
       </div>
 

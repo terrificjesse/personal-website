@@ -303,6 +303,8 @@ export type HuntAnalyticsResponse = {
   by_source: HuntAnalyticsBreakdown[];
   by_tier: HuntAnalyticsBreakdown[];
   by_month: HuntAnalyticsBreakdown[];
+  /** Includes an empty-key bucket for unattributed applications, rendered as “No variant”. */
+  by_variant: HuntAnalyticsBreakdown[];
 };
 
 export async function getHuntAnalytics(input: {
@@ -324,6 +326,98 @@ export async function getHuntAnalytics(input: {
     );
   }
   return res.json();
+}
+
+// ---------------------------------------------------------------------------------------
+// Résumé variants (Phase 12)
+// ---------------------------------------------------------------------------------------
+
+/** A label for a résumé kept outside this app; the file itself is never stored here. */
+export type ResumeVariant = {
+  id: string;
+  label: string;
+  notes: string | null;
+  created_at: string;
+  /** Non-null means retired, not hidden or deleted. */
+  archived_at: string | null;
+  /** Existing attribution makes DELETE return 409 so history cannot be erased. */
+  application_count: number;
+};
+
+export type CreateResumeVariantInput = {
+  label: string;
+  notes?: string;
+};
+
+export type UpdateResumeVariantInput = {
+  label?: string;
+  /** Send an empty string to clear existing notes. */
+  notes?: string;
+  archived?: boolean;
+};
+
+export async function listResumeVariants(): Promise<ResumeVariant[]> {
+  const res = await apiFetch("/hunt/resume-variants");
+  if (!res.ok) throw new Error(`Could not load résumé variants (${res.status})`);
+  return res.json();
+}
+
+export async function createResumeVariant(
+  input: CreateResumeVariantInput,
+): Promise<ResumeVariant> {
+  const res = await apiFetch("/hunt/resume-variants", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "Give the résumé variant a label between 1 and 120 characters."
+        : res.status === 409
+          ? "A résumé variant with that name already exists."
+          : `Could not create the résumé variant (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+export async function updateResumeVariant(
+  id: string,
+  input: UpdateResumeVariantInput,
+): Promise<ResumeVariant> {
+  const res = await apiFetch(`/hunt/resume-variants/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 400
+        ? "Give the résumé variant a label between 1 and 120 characters."
+        : res.status === 409
+          ? "A résumé variant with that name already exists."
+          : res.status === 404
+            ? "That résumé variant no longer exists."
+            : `Could not update the résumé variant (${res.status})`,
+    );
+  }
+  return res.json();
+}
+
+export async function deleteResumeVariant(id: string): Promise<void> {
+  const res = await apiFetch(`/hunt/resume-variants/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 409
+        ? "This résumé is attached to one or more applications, so it can’t be deleted. Retire it instead; retired variants remain available for comparison."
+        : res.status === 404
+          ? "That résumé variant no longer exists."
+          : `Could not delete the résumé variant (${res.status})`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------
