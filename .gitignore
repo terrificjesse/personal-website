@@ -2,3 +2,19 @@
 *.swp
 .vscode/
 .idea/
+
+# SQLite files anywhere outside the backend's own directory, which has its own rules for them.
+#
+# `DATABASE_URL` defaults to `sqlite://fridge.db?mode=rwc` — RELATIVE to the working directory.
+# Start the binary from anywhere but the backend directory and it silently creates an empty
+# database there and serves from it, which looks exactly like a database that lost all its rows.
+# That happened on 2026-09-03: a restart with the wrong working directory left a zero-byte
+# `fridge.db` at the repo root, and a `git add -A` committed it in 0c7c778.
+#
+# `deploy/preflight.sh` refuses a relative DATABASE_URL for the same reason. This is the same
+# failure one layer down, where the default is doing the choosing.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.*
