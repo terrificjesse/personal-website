@@ -1666,6 +1666,37 @@ immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. 
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
 
+### 12p — the deploy had no branch, and `main` had nothing
+
+Consolidation, plus the one finding that made it urgent rather than tidy.
+
+**`docs/DEPLOY.md` step 4 said "Clone to `/opt/personal-website`" and never said what to clone.**
+A bare `git clone` takes the default branch. On 2026-09-03 `main` was at `7dcc0fd` — the commit
+*before* Phase 10 began, 87 commits behind — and was missing `docs/DEPLOY.md`, every file in
+`deploy/`, and 11 of the 31 migrations. **The branch the runbook told you to clone did not
+contain the runbook, or one single artifact it installs.**
+
+The failure mode is the quiet kind: the clone succeeds, and step 5 fails on a file that does not
+exist, three commands into a first deploy on a fresh host, with nothing pointing at the cause.
+It would have been debugged on the host, which is the wrong place.
+
+Fixed by making the runbook correct under either decision — merge to `main` and deploy `main`,
+or clone a named branch and make `Redeploy` pull that same one — and by adding a one-line
+`test -f deploy/preflight.sh` at step 4, which turns a confusing failure at step 5 into an
+obvious one at step 4. `Rollback` also now says that `checkout <sha>` leaves a detached HEAD and
+the next `pull` will refuse, which is correct behaviour and better expected than debugged.
+
+**The merge itself was uneventful, which is the point.** The five Claude branches were a linear
+chain and already contained; Codex's lane came across with no conflicts, as it has every time.
+880 tests, clippy 37, `tsc` and `eslint` clean, all 31 migrations applying on a boot against a
+copy.
+
+**Codex's `1cced20` reviewed under rule 7 and it is correct.** `application-events verify` now
+bails when applications exist and all are exempt — the guard is `covered == 0 && exempt > 0`, so
+a database with no applications stays green and a fresh install does not fail its first check.
+Both edges have tests rather than resting on a database state the backfill has since changed,
+and nothing automated calls `verify`, so the new non-zero exit cannot break a passing path.
+
 ### 12n — the first production expiry, reconstructed after the fact
 
 A startup collection ran at `2026-09-03T04:32:33`. Nothing was watching it. It is where the

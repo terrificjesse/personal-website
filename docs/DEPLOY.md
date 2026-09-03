@@ -131,7 +131,14 @@ Ordered. The two gates are marked and are not optional.
    sudo useradd --system --home /opt/personal-website --shell /usr/sbin/nologin personal-website
    sudo install -d -o personal-website -g personal-website /opt/personal-website /var/lib/personal-website /etc/personal-website
    ```
-4. Clone to `/opt/personal-website` as `hunt`.
+4. Clone to `/opt/personal-website` — **and name what you are cloning.** See
+   "Which branch gets deployed" directly below; a bare `git clone` takes the default branch,
+   which on 2026-09-03 was 87 commits behind and contained none of this. Then, before going
+   further:
+   ```bash
+   test -f /opt/personal-website/deploy/preflight.sh || echo "WRONG CHECKOUT — see step 4"
+   ```
+   One line, and it turns a confusing failure at step 5 into an obvious one at step 4.
 5. `sudo install -m 600 -o personal-website -g personal-website deploy/env.production.example /etc/personal-website/backend.env`,
    then fill it in. Read the comments; each one names the failure that value causes when wrong.
 6. **Run the preflight before anything else starts:**
@@ -163,11 +170,37 @@ Ordered. The two gates are marked and are not optional.
    `redirect_uri_mismatch`.
 10. Sign in, connect Gmail, and confirm the checks under **Is it alive?** below.
 
+## Which branch gets deployed
+
+**Decide this before the first clone.** It is one decision and it has bitten once already.
+
+On 2026-09-03 `main` sat at `7dcc0fd`, the commit *before* Phase 10 began — 87 commits behind,
+and missing `docs/DEPLOY.md`, every file in `deploy/`, and 11 of the 31 migrations. The runbook
+said "clone" and nothing else, so the branch it told you to clone did not contain the runbook or
+a single artifact it installs. The clone would have succeeded and step 5 would have failed on a
+missing file, three commands into a first deploy, with nothing pointing at the cause.
+
+Two answers, both fine, and the rest of this file works under either:
+
+- **Merge to `main` and deploy `main`.** Step 4 is a plain `git clone`, `Redeploy`'s `git pull`
+  is right as written, and there is nothing to remember. This is the simplest option and the one
+  to take unless there is a reason not to.
+- **Deploy a named branch or tag.** Then step 4 must be
+  `git clone --branch <name> <url> /opt/personal-website`, and `Redeploy` must pull that same
+  branch rather than whatever the clone happened to track.
+
+**Whichever you choose, the trap is the same one:** a clone takes the *default* branch, and this
+repo's default branch has been stale for the entire period the deploy has been planned. Nothing
+warns you. The `test -f` in step 4 is the whole defence and it costs a line.
+
 ## Redeploy
 
 ```bash
 sudo -u personal-website git -C /opt/personal-website pull
 ```
+**This pulls whatever branch the clone tracked.** If you deployed a named branch rather than
+`main`, say so here in your own copy — a `pull` that silently tracks the wrong branch is the
+same failure as step 4, arriving later and with a running service on top of it.
 Then rebuild both halves exactly as in step 7 — **the frontend must be rebuilt, not just
 restarted**, whenever `NEXT_PUBLIC_FRIDGE_API_URL` or any frontend code changes — re-run the
 preflight, and `sudo systemctl restart personal-website-backend personal-website-frontend`.
@@ -181,8 +214,11 @@ modified`. If that appears after a pull, the fix is a new migration, never an ed
 ```bash
 sudo -u personal-website git -C /opt/personal-website checkout <previous-sha>
 ```
-then rebuild and restart. **Rolling back code does not roll back a migration**, and this
-project has no down-migrations. If the bad deploy added one, restore the database from the
+then rebuild and restart. Note that this leaves the checkout in **detached HEAD**, so the next
+`Redeploy` step's `git pull` will refuse until you check the branch back out — which is the
+correct behaviour and worth expecting rather than debugging.
+
+**Rolling back code does not roll back a migration**, and this project has no down-migrations. If the bad deploy added one, restore the database from the
 backup taken before the deploy (gate 2) — which is why that gate exists.
 
 ## Where the database lives
