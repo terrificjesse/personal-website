@@ -184,16 +184,31 @@ are not defaults to be re-weighed per source.
   agreed in `docs/PLAN.md`.
 - When in doubt about whether something falls under "Learning Mode," ask rather than assume.
 
-## Working with two coding agents (added 2026-09-02)
+## Working with two coding agents (added 2026-09-02, amended 2026-09-03)
 
 From Phase 10 the repo is worked by **two agents — Claude Code and Codex — against two
 separate weekly credit budgets**. That is a throughput decision, and it introduces failure
 modes a single agent does not have. These rules are binding on both.
 
+> **Amended 2026-09-03: Claude Code took over Codex's queue, and the repo is on one agent.**
+> Rules written for two agents do not all survive that, and one of them — rule 7 — became
+> literally unsatisfiable. Each rule below now says what it means with one agent and what it
+> assumed with two, because **a rule nobody can satisfy is worse than no rule**: it lets
+> "reviewed" be written into `docs/` when nothing independent happened, which is the exact
+> class of untrue claim the rest of this file exists to prevent.
+>
+> Nothing here is deleted. If a second agent resumes, the two-agent reading is still the one
+> to use, and it is still correct.
+
 **1. One rules file, symlinked.** See the top of this file. A rule that lives in only one
 agent's copy is a rule the other agent will violate while being helpful.
 
 **2. Lanes, and a worktree each.** Never run both agents on the same working tree.
+
+*With one agent the worktree rule is moot and the lane table is not.* The lanes stopped being
+about who works where and became **what a commit is allowed to touch at once** — which is the
+half that was doing the useful work anyway. A diff spanning A and B is a diff crossing the
+seam, and rule 4 still applies to it.
 
 | Lane | Owns | Typical work |
 |---|---|---|
@@ -211,9 +226,13 @@ conflict surfaces at `sqlx migrate run`, not at merge.
 | Block | Reserved for | Status |
 |---|---|---|
 | `0021–0029` | Lane A | **exhausted** — `0029` taken 2026-09-03 |
-| `0030–0059` | **Claude Code** | in use |
-| `0060–0089` | **Codex** | free |
+| `0030–0059` | **Claude Code** | in use — `0030`, `0031` taken |
+| `0060–0089` | **Codex** | held open, unused |
 | `0090+` | unreserved | claim a block here before using one |
+
+Codex's block stays reserved rather than being reclaimed. It costs nothing — numbers are free
+— and collapsing it would mean renumbering if a second agent ever resumes, which is the one
+operation this table exists to avoid.
 
 **Reserved per agent, not per lane, since 2026-09-03.** The original scheme gave the block to
 Lane A, which stopped working the moment both agents started doing backend work: two agents
@@ -246,10 +265,41 @@ other takes the queue — so write the spec before starting, not after. The genu
 non-swappable work is named in each phase and is almost always `[you]`: labelling mail,
 loading the extension in Firefox, holding the deploy secrets, and the `[learn]` boundary calls.
 
+*With one agent this rule paid off rather than expired.* Codex's queue transferred on
+2026-09-03 with one asterisk (rule 7, below) and no rewriting, because the specs were in
+`docs/` as this rule required. **Keep writing them that way.** The other agent a spec is
+written for is now future-you with none of today's context, which is a harder reader, not an
+easier one.
+
 **7. The agent that wrote a diff does not review it.** Hand it to the other one. This repo's
 history is a catalogue of defects that hundreds of green tests did not catch; two models miss
 different things, and a review pass costs a fraction of an implementation pass.
 
+*With one agent there is no other one, so this rule cannot be followed as written.* Deleting it
+would be the wrong repair — the reason for it does not go away just because the mechanism does.
+What replaces it:
+
+- **A self-review is labelled a self-review**, in the commit and in `docs/`. Never "reviewed".
+  A reader in a month has to be able to tell it apart from what Codex did to `12f`, and cannot
+  if both say the same word.
+- **Review against artifacts, not against reasoning.** Re-reading your own argument re-derives
+  your own conclusions; it is the weakest thing you can do and it feels like the strongest.
+  What still works when author and reviewer are the same person: regenerate what was generated
+  and diff it, re-run every number a commit message asserts, check invariants against live data
+  rather than against their own tests, and grep for claims naming a test that does not exist.
+  **This is not theoretical.** On 2026-09-03 a claim that Greenhouse "can almost never expire
+  anything" had survived five documents and two module docs written by the same agent that was
+  re-reading them. One query — 8 successes in 16 runs — killed it.
+- **The user is the remaining independent reader.** Rule 8 is what protects that, and it stops
+  being a budget note and starts being the whole mechanism.
+
 **8. Review capacity is the real budget.** Two agents double the code produced and do not
 double the hours the user has to read it. The "small, reviewable commits" convention above
 gets *stricter* here, not looser.
+
+*With one agent this is more true, not less.* Output halves; the user's reading time does not
+double to compensate, and rule 7's independent check is gone. The user is now the only reader
+who did not write the code. **Spend that on the diffs that can lose data** — migrations, the
+expiry sweep, anything that deletes or merges rows — and be willing to answer "what should I
+do next" with *nothing, stop* when the honest answer is that the backlog of unread work is the
+biggest risk in the project.
