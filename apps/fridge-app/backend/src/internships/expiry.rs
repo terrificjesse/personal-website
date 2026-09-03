@@ -44,7 +44,11 @@
 //!   *partial* run those do not advance. A sighting is tagged the next time it is **seen** —
 //!   so this clears for everything still listed, and never for a sighting whose job is already
 //!   gone. That one cannot be seen, therefore is never tagged, therefore never advances on a
-//!   partial run; and Greenhouse is partial nearly always.
+//!   partial run; and Greenhouse is partial on about half its runs — 9 of 17 as of 2026-09-03.
+//!   ("Nearly always" is what this line said until 12r. It is the same single-observation
+//!   inference the correction fifteen lines above this one exists to retract, and it survived
+//!   that correction because the correction was made by grepping for the *number*, not for
+//!   the claim. Grep for the claim.)
 //!
 //!   Measured rather than assumed (2026-09-02, `docs/PLAN.md` § 12j): of 42 legacy sightings on
 //!   100 completely-enumerated boards, 37 were tagged and **5 were already dead and stayed
@@ -53,6 +57,19 @@
 //!   nothing at all, so those 5 were equally stuck — but it means scoped expiry is
 //!   **forward-looking only**: it expires what disappears after it starts watching, and does
 //!   nothing for what had already gone before its sighting was tagged.
+//!
+//!   **Lever and Ashby joined the scoped sources in 12r with no backfill migration, and that
+//!   was measured rather than assumed.** Greenhouse needed `0028` because it is `Partial` on
+//!   half its runs, so its untagged rows were frozen. These two are not: Lever succeeds on 17
+//!   of 21 runs and Ashby on 15 of 19, and on a `Success` run the scoped path advances untagged
+//!   sightings exactly as the unscoped path did — `source_fully_enumerated()` is the branch
+//!   that says so. Their untagged population on 2026-09-03 was 89 Lever and 151 Ashby, and it
+//!   splits cleanly: 205 sit at 0 misses (live, and tagged by the next `Success` run), and 34
+//!   sit at or past the 3-miss threshold, of which 31 belong to postings that are **already
+//!   expired** and 3 are held alive by a live sighting on another source, which no scope tag
+//!   can override — the sweep expires a posting only when *every* sighting is at threshold. So
+//!   a backfill would have changed the fate of zero rows. Re-measure before assuming this still
+//!   holds; if either source's success rate falls, the Greenhouse argument starts applying.
 //! - A slug dropped from [`BoardDirectory`](super::sources::BoardDirectory) produces no
 //!   completed scope, so its sightings stop advancing entirely. This is a strict improvement:
 //!   that type's doc warns that pruning a slug makes its postings expire together,
@@ -330,18 +347,20 @@ pub async fn settle_source_run(
     for scope in &result.scopes {
         sqlx::query(
             "INSERT INTO source_run_scopes
-                 (source_run_id, scope, outcome, fetched_count, error)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                 (source_run_id, scope, outcome, fetched_count, error, gone)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (source_run_id, scope) DO UPDATE SET
                  outcome = excluded.outcome,
                  fetched_count = excluded.fetched_count,
-                 error = excluded.error",
+                 error = excluded.error,
+                 gone = excluded.gone",
         )
         .bind(&scope_run_id)
         .bind(&scope.scope)
         .bind(scope.outcome.as_str())
         .bind(scope.fetched)
         .bind(scope.error.as_deref())
+        .bind(i64::from(scope.gone))
         .execute(&mut *tx)
         .await?;
     }
@@ -355,10 +374,11 @@ pub async fn settle_source_run(
         // than merely stop climbing, or a posting that flickers in and out across many runs
         // eventually crosses the threshold while never having been absent twice running.
         if result.scopes.is_empty() {
-            // The unscoped path: every source that is a single endpoint, which is all of them
-            // but Greenhouse. Byte for byte what this did before scopes existed, and kept as
-            // its own branch rather than as a degenerate case of the scoped one so that
-            // "nothing changed for these sources" is visible instead of argued.
+            // The unscoped path: every source that genuinely is a single endpoint — Simplify,
+            // vanshb03, weworkremotely and the best-effort three. Byte for byte what this did
+            // before scopes existed, and kept as its own branch rather than as a degenerate
+            // case of the scoped one so that "nothing changed for these sources" is visible
+            // instead of argued.
             sqlx::query(
                 "UPDATE posting_sightings
                  SET consecutive_misses = consecutive_misses + 1
@@ -677,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_partial_run_reporting_no_scopes_is_judged_exactly_as_before() {
-        // Every source but Greenhouse takes this path, and it must reach the same verdict the
+        // Every single-endpoint source takes this path, and it must reach the same verdict the
         // source-level rule does.
         for outcome in [
             SourceOutcome::Success,
@@ -875,6 +895,62 @@ mod tests {
             misses_of(&pool, "greenhouse", "on-broken-c").await,
             0,
             "a board that could not be read proves nothing about what is on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gone_scope_is_a_completed_scope_for_every_expiry_purpose() {
+        // The invariant migration 0032 preserves, and the reason `gone` is a flag beside the
+        // outcome rather than a third `ScopeOutcome`. Every expiry decision keys off
+        // `outcome = 'completed'`; a third enum value would have quietly removed 404'd boards
+        // from expiry, which is the exact opposite of what 0026 was built to do.
+        //
+        // So: two empty boards, one recorded as gone and one merely empty, must move their
+        // sightings identically. The only difference the flag may make is to what a human can
+        // read back afterwards.
+        let pool = scoped_pool().await;
+        let now = Utc::now();
+        let run_id = open_run(&pool, now).await;
+
+        seed(&pool, "greenhouse", "on-an-empty-board", Some("empty"), 1).await;
+        seed(&pool, "greenhouse", "on-a-dead-board", Some("dead"), 1).await;
+
+        let result = greenhouse_run(
+            vec![ScopeRun::completed("empty", Vec::new()), ScopeRun::gone("dead")],
+            SourceOutcome::Partial,
+            0,
+        );
+
+        let verdict = settle_source_run(&pool, &run_id, &Uuid::new_v4().to_string(), &result, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            verdict,
+            ExpiryEligibility::EligibleForScopes {
+                completed: 2,
+                attempted: 2
+            },
+            "a gone scope counts as a completed one when the run's eligibility is decided"
+        );
+
+        assert_eq!(misses_of(&pool, "greenhouse", "on-an-empty-board").await, 2);
+        assert_eq!(
+            misses_of(&pool, "greenhouse", "on-a-dead-board").await,
+            2,
+            "gone must advance exactly as empty-but-alive does"
+        );
+
+        // And the distinction the flag exists for survives into the row, which is the half
+        // that did not exist before 0032.
+        let gone: Vec<(String, i64)> =
+            sqlx::query_as("SELECT scope, gone FROM source_run_scopes ORDER BY scope")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            gone,
+            vec![("dead".to_string(), 1), ("empty".to_string(), 0)],
+            "the database can now tell a deleted board from an empty one"
         );
     }
 

@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         Some("application-events") => {
             return internships::application_events::main(&pool, &args[1..]).await;
         }
+        Some("boards") => return internships::board_retirement::main(&pool, &args[1..]).await,
         _ => {}
     }
 

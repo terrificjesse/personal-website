@@ -164,6 +164,23 @@ pub struct ScopeRun {
     /// per-scope rows are the only place a run's 400th failure is legible, since the
     /// source-level error string shows three and a count.
     pub error: Option<String>,
+    /// The scope does not exist any more: its list endpoint answered a definitive 404, and the
+    /// slug should be retired from the board directory.
+    ///
+    /// **Orthogonal to `outcome`, deliberately, and this is the invariant to preserve.** A gone
+    /// scope is `Completed` — "no such board" is an unambiguous statement that it offers
+    /// nothing, so absence from it is evidence and its sightings must advance. Making it a
+    /// third `ScopeOutcome` would have put that conclusion at the mercy of every
+    /// `outcome = 'completed'` filter in the expiry path; a flag beside the outcome cannot
+    /// change expiry eligibility by accident, whatever is later done with it.
+    ///
+    /// What it buys is the thing the outcome column cannot say. Before 12r, a board that had
+    /// been deleted and a board that enumerated fine with zero internships were the same row.
+    /// `docs/INTERNSHIP_SCRAPING.md` and this repo's scraping rules both require a source
+    /// returning zero to be distinguishable from a source that genuinely had zero; that held at
+    /// the source level and was violated one level down, where the only trace of a dead board
+    /// was a `println!` that scrolled away.
+    pub gone: bool,
 }
 
 impl ScopeRun {
@@ -174,6 +191,19 @@ impl ScopeRun {
             fetched: external_ids.len() as i64,
             external_ids,
             error: None,
+            gone: false,
+        }
+    }
+
+    /// A scope whose list endpoint answered a definitive 404.
+    ///
+    /// Identical to `completed(scope, [])` for every purpose expiry has — which is the point,
+    /// and is asserted in `a_gone_scope_is_a_completed_scope_for_every_expiry_purpose`. The
+    /// only difference is that this one leaves a record saying *why* it was empty.
+    pub fn gone(scope: impl Into<String>) -> Self {
+        ScopeRun {
+            gone: true,
+            ..ScopeRun::completed(scope, Vec::new())
         }
     }
 
@@ -184,6 +214,9 @@ impl ScopeRun {
             external_ids: Vec::new(),
             fetched: 0,
             error: Some(error.into()),
+            // A failed read proves nothing, least of all that the board is gone. The database
+            // CHECK enforces the same thing from the other side.
+            gone: false,
         }
     }
 

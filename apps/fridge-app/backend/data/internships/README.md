@@ -61,6 +61,22 @@ must be **stable across runs**. Drop a slug and every posting on that board goes
 then expires together after the miss threshold, indistinguishable from the board genuinely
 closing. Grow this file; do not prune it on the strength of one quiet run.
 
+**A slug that 404s is the one exception, and even that takes evidence.** A 404 on a board's list
+endpoint is unambiguous — "no such board", so it offers nothing — and since 12r each one is
+recorded in `source_run_scopes.gone` rather than only printed. On the first run under migration
+`0032` (2026-09-03) that was **37 dead slugs: 22 greenhouse, 13 ashby, 2 lever**. They are still
+in this file, deliberately. A 404 can be a deploy, a rename in flight, or a CDN with an opinion,
+and retiring a live board costs exactly what the paragraph above describes. Ask for candidates
+instead, from `apps/fridge-app/backend/`:
+
+```
+cargo run --release -- boards retire
+```
+
+It names only slugs whose last three verdicts were all 404 with no answer in between, and says
+how far from full that window is when it cannot answer yet. Retiring is still a hand edit to
+this file; record in the commit which runs the slug was absent on.
+
 ### `fixtures/` — offline test data
 
 All five are **real responses**, trimmed. Trimming is only ever deletion (whole records

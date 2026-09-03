@@ -627,10 +627,11 @@ pub struct SourceRunSummary {
     ///
     /// Since migration 0026 this means "trusted for at least one scope", which for every
     /// single-endpoint source is the same statement it always made. The two fields below are
-    /// what keeps the Greenhouse case from reading as either extreme.
+    /// what keeps a board source's 484-of-485 case from reading as either extreme.
     pub counts_for_expiry: bool,
-    /// Scopes — Greenhouse boards — this run enumerated completely. `0` for a source that has
-    /// no scopes, which is every source but Greenhouse.
+    /// Scopes — ATS boards — this run enumerated completely. `0` for a source that has no
+    /// scopes, which since 12r means a source that genuinely is one endpoint rather than one
+    /// that has not been taught to report them.
     pub scopes_completed: i64,
     /// Scopes this run reached a verdict on at all. `scopes_completed < scopes_attempted` is
     /// the 484-of-485 case: real expiry happened, and not for everything.

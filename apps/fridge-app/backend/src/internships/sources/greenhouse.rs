@@ -155,7 +155,7 @@ impl Source for GreenhouseSource {
                     // board's postings could only expire on a run where all 485 succeeded.
                     Err(error) if error.is_not_found() => {
                         retired.push(slug.clone());
-                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
+                        scopes.push(ScopeRun::gone(slug.as_str()));
                         enumerated += 1;
                     }
                     Err(error) => {
@@ -245,6 +245,25 @@ fn summarize(failures: &[String]) -> String {
     )
 }
 
+/// The verdict for a board that was completely enumerated, built from the postings that
+/// enumeration produced.
+///
+/// Shared with Lever and Ashby for the same reason [`finish`] is: the invariant is that a
+/// completed scope's ids are **exactly** the ids of the postings that board returned on this
+/// run, and three copies of it are three chances for one to drift. Drift here is not cosmetic.
+/// `expiry::settle_source_run` resets `consecutive_misses` for the ids named here and advances
+/// it for every other sighting tagged to the scope, so an id missing from this list is a
+/// posting marching toward expiry while sitting in plain view in the run's own postings.
+///
+/// It takes the board's own postings rather than the run's accumulated vector, so there is no
+/// filtering step to get wrong.
+pub(crate) fn completed_scope(slug: &str, board: &[RawPosting]) -> ScopeRun {
+    ScopeRun::completed(
+        slug,
+        board.iter().map(|job| job.external_id.clone()).collect(),
+    )
+}
+
 /// One enumerated board: its postings and its scope verdict, from a **single** parse.
 ///
 /// Returning both together is the point. The scope says "absence from this board is evidence",
@@ -255,8 +274,8 @@ fn summarize(failures: &[String]) -> String {
 /// the other.
 fn board_result(slug: &str, body: &Value) -> (Vec<RawPosting>, ScopeRun) {
     let postings = parse_board(slug, body);
-    let ids = postings.iter().map(|job| job.external_id.clone()).collect();
-    (postings, ScopeRun::completed(slug, ids))
+    let scope = completed_scope(slug, &postings);
+    (postings, scope)
 }
 
 /// Turn one board response into raw postings. Pure, so it is tested offline against the

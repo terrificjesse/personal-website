@@ -56,9 +56,13 @@
 //! A source may therefore also report [`ScopeRun`]s: per-scope verdicts, attached with
 //! [`SourceFetch::with_scopes`], where a scope is a sub-unit it can enumerate completely on its
 //! own. The source-level outcome is unchanged and still means what it always meant — scopes are
-//! additive, and a source that reports none behaves exactly as it did before. Greenhouse is the
-//! only scoped source today; Lever and Ashby are the obvious next candidates and need only the
-//! adapter half, the rest of the mechanism being source-agnostic.
+//! additive, and a source that reports none behaves exactly as it did before.
+//!
+//! **All three board sources report scopes as of 12r** — Greenhouse (485 boards), Lever (157)
+//! and Ashby (297). Each needed only its adapter half; the rest of the mechanism was already
+//! source-agnostic, which is the claim 12i made and 12r is the test of it. What remains
+//! unscoped is every source that genuinely is one endpoint: Simplify, vanshb03,
+//! weworkremotely, and the three best-effort adapters.
 
 pub mod ashby;
 pub mod best_effort;
