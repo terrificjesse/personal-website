@@ -1059,14 +1059,19 @@ tool running unattended on a host that stays up.
 | 10a ✅ | Reconcile `PLAN.md` + `HUNT.md` with what actually shipped in `c001445`, `f911f46`, `f17d983` | `[gen]` | C | Claude Code | ✅ | 1–2h |
 | 10b | `AGENTS.md` unification — **done 2026-09-02** | `[gen]` | C | — | — | — |
 | 10c ✅ | Write the `application_events` schema + emit contract into `docs/HUNT.md` **before any code** | `[gen]` | C | Claude Code | ✅ | 1–2h |
-| 10d ⬜ | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
+| 10d ✅ | Migration `0021_create_application_events.sql` + backfill from existing tables | `[gen]` | A | Codex | ✅ | 3–4h |
 | 10e ✅ | Every writer emits: proposal accept/reject, auto-apply, extension "track this application", expiry sweep, manual edits | `[gen]` | A | Claude Code | ✅ | 3–4h |
-| 10f ⬜ | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
+| 10f ✅ | Invariant test: `status == fold(events)` for every application, over a copy of the live DB | `[gen]` | A | Codex | ✅ | 1–2h |
 | 10g ✅ | `InboxPanel` shows the sender under `from:` and the subject under `subject:` | `[gen]` | B | Codex | ✅ | 30m |
 | 10h ◐ | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
 | 10i ✅ | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
 | 10j ✅ | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
 | 10k ⬜ | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
+
+**Board corrected 2026-09-03.** 10d and 10f were still marked not-started and had both
+shipped — `migrations/0021_create_application_events.sql` exists, and `verify_invariant` plus
+its ignored over-a-copy test landed in `e3f6c28`. Two ticks nobody applied is how a board stops
+being read, and this one is the only shared picture of what is left.
 
 **Progress — 2026-09-02.** ✅ done · ◐ part done · ⬜ not started. **`phase-10-hardening` is
 merged into `phase-10-spec`**, which was deploy gate 1. The combined suite is 758 passing —
