@@ -1666,6 +1666,40 @@ immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. 
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
 
+### 12m — the QC findings, fixed
+
+A QC pass on 2026-09-03 turned up three things. All three are closed.
+
+**A proposal whose evidence was missing vanished from the review queue.**
+`fetch_proposals` inner-joined `status_proposals` → `email_verdicts` → `email_messages`, so a
+proposal whose verdict no longer resolved was not listed at all — a status change waiting for
+review, silently absent from the queue that exists to review it. The live database has exactly
+one such row, and it drove the only status change in the database. Joins to the evidence are now
+LEFT; the join to the application stays INNER, because `a.user_id` is what scopes the query to
+the caller and widening it would leak other people's rows.
+
+Widening the join alone would have been dishonest: all four evidence fields were *already*
+nullable on both sides of the seam, so a degraded row would have rendered as three missing lines
+and looked exactly like a terse email. The response carries `evidence_available` and the panel
+says outright that there is nothing to check against. Both buttons stay enabled — refusing to
+let such a proposal be accepted would decide for the reader that it is wrong, which the panel
+does not know.
+
+**Migration `0030` deletes the alert 0025 orphaned.** 0025 guarded its DELETE on
+`internship_applications` only, and `hunt_events.subject_id` is a soft reference rather than a
+declared foreign key, so neither it nor `PRAGMA foreign_keys` noticed. Deleted rather than
+repointed: the merge survivor already carries its own alert and `UNIQUE (kind, subject_id)`
+would refuse the collision. No date cutoff, unlike 0027 — `emit_posting_alert` runs after
+`upsert_posting` returns a stored id, so "an alert whose posting does not exist" was never a
+legitimate intermediate state.
+
+**Migration numbers are now reserved per agent.** The old scheme gave a block to Lane A, which
+stopped working the moment both agents did backend work — two agents inside one block collide
+exactly as if there were no rule. Claude Code holds `0030–0059`, Codex `0060–0089`, and
+exhaustion now has a protocol: at two numbers remaining, reserve the next block *before*
+spending them. The first block ran out with no protocol at all, which is how it blocked a task
+rather than the other way round.
+
 ### 12d + 12e — built, and the payoff is not the one the task was for
 
 **The rule changed first.** On 2026-09-03 the owner lifted Learning Mode for this tab: NLP is a

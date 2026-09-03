@@ -1,5 +1,6 @@
-//! Tests for migration `0027`, which deletes the postings nothing points at and nothing can
-//! ever expire.
+//! Tests for the two orphan-cleanup migrations: `0027`, which deletes postings nothing points
+//! at and nothing can ever expire, and `0030`, which deletes the `posting` alerts that
+//! migration 0025 left pointing at rows it had deleted.
 //!
 //! Two jobs, as for `rekey`: assert the **shape** the DELETE must keep — a guard dropped in a
 //! later edit is a posting deleted out from under an application or an alert — and run the real
@@ -123,6 +124,61 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(alive, 1);
+    }
+
+    // ---- 0030, the alerts 0025 orphaned ----
+
+    const ALERTS: &str = include_str!("../../migrations/0030_delete_orphaned_posting_alerts.sql");
+
+    #[test]
+    fn the_alert_cleanup_is_scoped_to_the_one_kind_that_holds_a_posting_id() {
+        // `nudge` and `deadline` are keyed on applications and `email` on a Gmail message id,
+        // so a predicate that forgot to scope by kind would find no matching posting for ANY of
+        // them and delete every alert in the database.
+        assert!(
+            ALERTS.contains("kind = 'posting'"),
+            "0030 must only touch the kind whose subject_id is a posting id"
+        );
+        assert!(
+            ALERTS.contains("NOT EXISTS"),
+            "0030 must delete only alerts whose posting is genuinely gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_alert_whose_posting_vanished_is_deleted() {
+        let path = std::env::temp_dir().join(format!("alerts-{}.db", uuid::Uuid::new_v4()));
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TABLE internship_postings (id TEXT PRIMARY KEY);
+             CREATE TABLE hunt_events (id TEXT PRIMARY KEY, kind TEXT NOT NULL, subject_id TEXT NOT NULL);
+             INSERT INTO internship_postings (id) VALUES ('live');
+             INSERT INTO hunt_events (id, kind, subject_id) VALUES
+                 ('keep-live',     'posting',  'live'),
+                 ('drop-orphan',   'posting',  'deleted-by-0025'),
+                 ('keep-nudge',    'nudge',    'some-application'),
+                 ('keep-deadline', 'deadline', 'some-application'),
+                 ('keep-email',    'email',    'gmail-message-id');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(ALERTS).execute(&mut conn).await.unwrap();
+
+        let survivors: Vec<String> = sqlx::query_scalar("SELECT id FROM hunt_events ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            survivors,
+            vec!["keep-deadline", "keep-email", "keep-live", "keep-nudge"],
+            "only the posting alert whose posting is gone may go; the other kinds hold ids that \
+             are not postings at all and would every one of them look orphaned"
+        );
     }
 
     #[tokio::test]
