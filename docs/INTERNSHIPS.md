@@ -116,6 +116,21 @@ CHECK constraints, not conventions: `pay_min` requires both `pay_currency` and `
 `posted_at_is_estimated` sits beside `posted_at` because a date we inferred and a date the
 source stated are different evidence.
 
+**`expired_at` is a snapshot, not a running total.** `upsert_posting` clears it — and
+`expiry_reason` with it — whenever a posting is seen again, because a re-listed posting is live.
+So `COUNT(expired_at IS NOT NULL)` answers "how many are closed right now", never "how many have
+ever closed", and the two diverge every time something comes back. Observed 2026-09-03: 5 rows
+resurrected in one run, one of which had previously expired as `vanished_from_sources`.
+
+This matters most when **comparing two backups**, which is the natural way to audit what a run
+did. The change in the expired count is not the number that expired:
+
+```
+expired_after = expired_before + newly_expired − resurrected − (expired rows deleted)
+```
+
+Getting that wrong makes a run look like it expired fewer postings than it did.
+
 ## Sources
 
 `registry()` in `src/internships/sources/mod.rs`. Adding a source is one file plus one line

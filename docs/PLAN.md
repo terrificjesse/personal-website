@@ -1666,6 +1666,73 @@ immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. 
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
 
+### 12n — the first production expiry, reconstructed after the fact
+
+A startup collection ran at `2026-09-03T04:32:33`. Nothing was watching it. It is where the
+whole 12i → 12j → 12k arc finally acted on the real database, and the evidence for that is
+weaker than for anything else in this phase — which is the first thing to say.
+
+**This is forensic reconstruction from a backup, not an experiment.** 12j and 12k each wrote a
+falsifiable prediction *before* running, and 12k's held in all six clauses. Nothing was predicted
+here, because by the time anyone looked it had already happened. A prediction written now would
+be a postdiction, and the write-ups in this file are worth something precisely because they were
+not. What that costs: the run cannot be re-run, the "before" is whatever
+`fridge-20260903T002827Z.db` happens to contain, and anything the backup does not capture is
+simply unavailable.
+
+**Greenhouse was `success` for the first time ever** — 485 of 485 scopes completed. On 12c one
+board of 485 failed, the whole source was disqualified, and that is the finding this entire arc
+started from. Five sources counted for expiry, the most in any run so far.
+
+#### The arithmetic, verified against the backup rather than taken on trust
+
+| | |
+|---|---|
+| postings | 1,841 → 1,868 |
+| created | 28 |
+| deleted | 1 (migration 0029's merge, not the run) |
+| **newly expired** | **36** — 35 `source_marked_closed`, **1 `vanished_from_sources`** |
+| un-expired | 5 — 4 `source_marked_closed`, 1 `vanished_from_sources` |
+
+`202 + 36 − 5 − 0 = 233`, which is the expired count after. It closes exactly.
+
+#### The one posting that vanished is the one 12k named
+
+`e7346e4f` — Astranis, "Avionics Engineer Intern (Fall 2026)", expired `04:41:41`. Its only
+sighting is `greenhouse / 4597413006 / scope=astranis / misses=3`, last seen 2026-09-01. The
+external id is the same one written into 12k's prediction file two days ago.
+
+The chain, end to end and every link checked:
+
+1. That sighting **could never have been tagged by observation** — the job was already gone from
+   the board, so no run could see it. Migration `0028` backfilled `scope = 'astranis'` from the
+   sighting's own URL. This is the case 12j's Finding 1 said scoped expiry could not reach and
+   0028 existed to reach.
+2. The `astranis` board **completed** in this run, fetching 81 postings. `4597413006` was not
+   among them.
+3. Its counter went 2 → 3, the threshold.
+4. Its posting had no other sighting, so the sweep took it.
+
+#### What this run did *not* test, said plainly
+
+**No board failed.** 12i's named over-expiry risk is a job migrating from a board that completes
+to one that fails, and a run with 485 of 485 completing cannot exercise that path at all.
+Reporting "no over-expiry observed" would imply the path was tested. It was not.
+
+What the run *does* demonstrate is the sweep's all-sightings rule at scale, which had only ever
+been seen in a single case: **267 sightings are at or past the threshold, and of the live
+postings holding one, all 15 are protected by a second sighting below it.** Not one expired on
+partial evidence.
+
+#### `expired_at` is not a running total, and that is why the naive diff did not balance
+
+`upsert_posting` clears `expired_at` and `expiry_reason` when a posting is seen again — 5 rows
+in this run, one of which had previously `vanished_from_sources` and came back. That is correct:
+a re-listed posting is live. But it means **`COUNT(expired_at IS NOT NULL)` is a snapshot of what
+is closed now, never a count of what has ever closed**, and comparing two backups without
+accounting for resurrection produces a number that is simply wrong. Recorded in
+`docs/INTERNSHIPS.md` beside the column itself.
+
 ### 12m — the QC findings, fixed
 
 A QC pass on 2026-09-03 turned up three things. All three are closed.

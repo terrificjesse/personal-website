@@ -866,6 +866,33 @@ as a collision-free wire key — a real variant may be named `no variant`, but l
 empty — and the site renders that key as **No variant**. Tests pin both the explicit bucket and
 the sum of all variant buckets equalling the report's application total.
 
+### Should a collection run raise an alert? Asked 2026-09-03, answered no
+
+The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first
+posting this system has ever closed by disappearance. Nothing told anyone. It was found two
+hours later by someone querying the database for an unrelated reason.
+
+`hunt_events` exists for exactly "something happened that you would want to know about", so the
+question is fair. The answer is still no, for three reasons that are worth writing down so it is
+not re-asked:
+
+- **Per-posting is obviously wrong.** 36 alerts for one run, and the kind checkbox that muted
+  the noise would be the same control that mutes a `deadline` — an OA closing in 24 hours is the
+  single thing this tool exists to prevent losing. That is the reasoning migration `0023` used
+  to give `deadline` its own kind, and it applies with more force here.
+- **A per-run summary alert has no action attached.** Every other kind answers "you should do
+  something": a posting worth applying to, an email that moved an application, a follow-up gone
+  cold, a deadline approaching. "A run happened" asks the reader to go and look, which is what
+  the run-health panel is already for.
+- **The panel already carries it**, and since 12i it carries it at board granularity —
+  per-source outcomes, counts, `counts_for_expiry`, and `expired N/M boards`. What was missing on
+  2026-09-03 was not the record but a reason to open the page.
+
+**What would change the answer:** an expiry that closes a posting the user has *applied to*. That
+is not "a run happened", it is "the job you are waiting on is gone", it has an obvious action,
+and it is one alert rather than 36. It is not built, and it is not urgent while the applied
+tracker holds two rows — but it is the version of this idea that would earn a kind of its own.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
