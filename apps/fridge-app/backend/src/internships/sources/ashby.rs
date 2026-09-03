@@ -28,6 +28,17 @@
 //! every `Intern` posting carried an empty `summaryComponents` while the board overall had
 //! plenty. Expect absence, and never read it as zero.
 //!
+//! # Scopes, added in 12r
+//!
+//! One `source_runs` row covers 297 orgs. Before scopes, one unreachable org made the whole
+//! source `Partial`, and none of the other 296 complete enumerations counted for expiry —
+//! 4 runs of 19 lost that way. This adapter now reports a [`ScopeRun`] per org, built from the
+//! same parse that produced the board's postings so the ids cannot drift from the rows.
+//!
+//! A 404 org is `Completed` with no ids, not `Failed`: "no such org" says it offers nothing,
+//! which is evidence, whereas a failed read is evidence of nothing. That distinction is the
+//! whole of scoped expiry in one line.
+//!
 //! # `robots.txt`
 //!
 //! `api.ashbyhq.com/robots.txt` answers **401**, not 200 or 404. Under RFC 9309 § 2.3.1.3 a 4xx
@@ -36,10 +47,11 @@
 
 use serde_json::Value;
 
-use super::super::models::RawPosting;
+use super::super::models::{RawPosting, ScopeRun};
 use super::{
-    BoxFuture, Source, SourceContext, SourceFetch, first_string, greenhouse::finish, id_string,
-    join_locations,
+    BoxFuture, Source, SourceContext, SourceFetch, first_string,
+    greenhouse::{completed_scope, finish},
+    id_string, join_locations,
 };
 
 /// The ATS key in [`BoardDirectory`](super::BoardDirectory).
@@ -100,26 +112,45 @@ impl Source for AshbySource {
             let mut enumerated = 0usize;
             let mut retired = Vec::new();
             let mut failures = Vec::new();
+            // One verdict per board. Boards the budget never reached get no entry: absence of
+            // a row is the honest record of "no verdict", and inventing a `Failed` one would
+            // claim we looked.
+            let mut scopes: Vec<ScopeRun> = Vec::new();
 
             for slug in slugs {
                 let url = board_url(slug);
                 match ctx.http.get(&url).await {
                     Ok(response) => match response.json() {
                         Ok(body) => {
-                            postings.extend(parse_board(slug, &body));
+                            let (board, scope) = board_result(slug, &body);
+                            scopes.push(scope);
+                            postings.extend(board);
                             enumerated += 1;
                         }
-                        Err(error) => failures.push(format!("{slug}: {error}")),
+                        Err(error) => {
+                            failures.push(format!("{slug}: {error}"));
+                            scopes.push(ScopeRun::failed(slug.as_str(), error.to_string()));
+                        }
                     },
+                    // One refusal covers the host, so every remaining board is refused too.
+                    // Report no scopes with it: `Skipped` means we did not fetch this source,
+                    // and per-board verdicts would contradict that.
                     Err(error) if error.is_refusal() => {
                         return SourceFetch::skipped(error.to_string());
                     }
-                    // No such org. A definitive zero, not a failed read.
+                    // No such org. A definitive zero, not a failed read — so as a scope it is
+                    // `Completed` with no ids, and anything still tagged to it advances toward
+                    // expiry. That is new for this source: before scopes, a dead org's
+                    // postings could only expire on a run where all 297 boards succeeded.
                     Err(error) if error.is_not_found() => {
                         retired.push(slug.clone());
+                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
                         enumerated += 1;
                     }
-                    Err(error) => failures.push(format!("{slug}: {error}")),
+                    Err(error) => {
+                        failures.push(format!("{slug}: {error}"));
+                        scopes.push(ScopeRun::failed(slug.as_str(), error.to_string()));
+                    }
                 }
             }
 
@@ -140,8 +171,20 @@ impl Source for AshbySource {
                 truncated,
                 &failures,
             )
+            .with_scopes(scopes)
         })
     }
+}
+
+/// One enumerated board: its postings and its scope verdict, from a **single** parse.
+///
+/// The same shape as Greenhouse's, and for the same reason — see [`completed_scope`]. Re-deriving
+/// the ids by filtering the run's accumulated postings on the slug would work today and break
+/// the first time two orgs share a posting.
+fn board_result(slug: &str, body: &Value) -> (Vec<RawPosting>, ScopeRun) {
+    let postings = parse_board(slug, body);
+    let scope = completed_scope(slug, &postings);
+    (postings, scope)
 }
 
 /// Turn one board response into raw postings. Pure, tested offline against the committed
@@ -521,5 +564,45 @@ mod tests {
         // say so, or a board that genuinely emptied could never expire its postings.
         let fetch = finish("Ashby", Vec::new(), 1, 1, 1, false, &[]);
         assert_eq!(fetch.outcome(), SourceOutcome::Success);
+    }
+
+    // ---- scopes ----
+
+    #[test]
+    fn a_boards_scope_ids_are_exactly_the_postings_it_returned() {
+        // The invariant scoped expiry rests on: a `Completed` scope claims "absence from this
+        // list is evidence", so an id missing from it is a live posting marching toward expiry
+        // while sitting in plain view in the same run's postings.
+        let (postings, scope) = board_result("Etched", &fixture());
+
+        assert!(scope.is_completed());
+        assert!(!postings.is_empty());
+        assert_eq!(scope.fetched, postings.len() as i64);
+        let ids: Vec<String> = postings.iter().map(|job| job.external_id.clone()).collect();
+        assert_eq!(scope.external_ids, ids);
+    }
+
+    #[test]
+    fn a_board_that_does_not_exist_is_a_completed_scope_with_nothing_in_it() {
+        // A 404 org offers zero postings, so absence from it is evidence and anything still
+        // tagged to it must advance. Recording it as `Failed` instead would be the bug 12i
+        // fixed for Greenhouse: one dead org out of 297 freezing expiry for all of them.
+        let scope = ScopeRun::completed("no-such-org", Vec::new());
+        assert!(scope.is_completed());
+        assert_eq!(scope.fetched, 0);
+        assert!(scope.external_ids.is_empty());
+    }
+
+    #[test]
+    fn a_reshaped_board_yields_a_completed_scope_with_no_ids_which_is_the_hazard() {
+        // Worth stating rather than discovering. `parse_board` answers "no postings" both for
+        // a genuinely empty board and for one whose shape changed, and this adapter cannot
+        // tell them apart from a 200 response — so a mass reshape would read as a mass
+        // closure. What stops it is not here: `expiry::scoped_eligibility` refuses a run whose
+        // source-level fetch count collapsed to zero, whatever its scopes claim.
+        let (postings, scope) = board_result("Etched", &serde_json::json!({ "jobs": "not a list" }));
+        assert!(postings.is_empty());
+        assert!(scope.is_completed());
+        assert!(scope.external_ids.is_empty());
     }
 }

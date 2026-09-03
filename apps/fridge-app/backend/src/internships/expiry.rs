@@ -44,7 +44,11 @@
 //!   *partial* run those do not advance. A sighting is tagged the next time it is **seen** —
 //!   so this clears for everything still listed, and never for a sighting whose job is already
 //!   gone. That one cannot be seen, therefore is never tagged, therefore never advances on a
-//!   partial run; and Greenhouse is partial nearly always.
+//!   partial run; and Greenhouse is partial on about half its runs — 9 of 17 as of 2026-09-03.
+//!   ("Nearly always" is what this line said until 12r. It is the same single-observation
+//!   inference the correction fifteen lines above this one exists to retract, and it survived
+//!   that correction because the correction was made by grepping for the *number*, not for
+//!   the claim. Grep for the claim.)
 //!
 //!   Measured rather than assumed (2026-09-02, `docs/PLAN.md` § 12j): of 42 legacy sightings on
 //!   100 completely-enumerated boards, 37 were tagged and **5 were already dead and stayed
@@ -53,6 +57,19 @@
 //!   nothing at all, so those 5 were equally stuck — but it means scoped expiry is
 //!   **forward-looking only**: it expires what disappears after it starts watching, and does
 //!   nothing for what had already gone before its sighting was tagged.
+//!
+//!   **Lever and Ashby joined the scoped sources in 12r with no backfill migration, and that
+//!   was measured rather than assumed.** Greenhouse needed `0028` because it is `Partial` on
+//!   half its runs, so its untagged rows were frozen. These two are not: Lever succeeds on 17
+//!   of 21 runs and Ashby on 15 of 19, and on a `Success` run the scoped path advances untagged
+//!   sightings exactly as the unscoped path did — `source_fully_enumerated()` is the branch
+//!   that says so. Their untagged population on 2026-09-03 was 89 Lever and 151 Ashby, and it
+//!   splits cleanly: 205 sit at 0 misses (live, and tagged by the next `Success` run), and 34
+//!   sit at or past the 3-miss threshold, of which 31 belong to postings that are **already
+//!   expired** and 3 are held alive by a live sighting on another source, which no scope tag
+//!   can override — the sweep expires a posting only when *every* sighting is at threshold. So
+//!   a backfill would have changed the fate of zero rows. Re-measure before assuming this still
+//!   holds; if either source's success rate falls, the Greenhouse argument starts applying.
 //! - A slug dropped from [`BoardDirectory`](super::sources::BoardDirectory) produces no
 //!   completed scope, so its sightings stop advancing entirely. This is a strict improvement:
 //!   that type's doc warns that pruning a slug makes its postings expire together,
@@ -355,10 +372,11 @@ pub async fn settle_source_run(
         // than merely stop climbing, or a posting that flickers in and out across many runs
         // eventually crosses the threshold while never having been absent twice running.
         if result.scopes.is_empty() {
-            // The unscoped path: every source that is a single endpoint, which is all of them
-            // but Greenhouse. Byte for byte what this did before scopes existed, and kept as
-            // its own branch rather than as a degenerate case of the scoped one so that
-            // "nothing changed for these sources" is visible instead of argued.
+            // The unscoped path: every source that genuinely is a single endpoint — Simplify,
+            // vanshb03, weworkremotely and the best-effort three. Byte for byte what this did
+            // before scopes existed, and kept as its own branch rather than as a degenerate
+            // case of the scoped one so that "nothing changed for these sources" is visible
+            // instead of argued.
             sqlx::query(
                 "UPDATE posting_sightings
                  SET consecutive_misses = consecutive_misses + 1
@@ -677,7 +695,7 @@ mod tests {
 
     #[test]
     fn a_partial_run_reporting_no_scopes_is_judged_exactly_as_before() {
-        // Every source but Greenhouse takes this path, and it must reach the same verdict the
+        // Every single-endpoint source takes this path, and it must reach the same verdict the
         // source-level rule does.
         for outcome in [
             SourceOutcome::Success,

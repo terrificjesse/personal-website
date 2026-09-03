@@ -26,6 +26,19 @@
 //!
 //! # Paging, and why it is explicit
 //!
+//! # Scopes, added in 12r
+//!
+//! One `source_runs` row covers 157 boards, so before scopes a single unreachable board made
+//! the whole source `Partial` and not one of the other 156 complete enumerations counted for
+//! expiry. Measured over this source's history that cost 4 runs of 21 — smaller than
+//! Greenhouse's half, because Lever's boards fail less often, and the same defect.
+//!
+//! This adapter therefore reports a [`ScopeRun`] per board. The source-level rules are
+//! untouched; the boards that *were* fully enumerated now say so individually. The verdict is
+//! the return value of [`read_board`] rather than a push at each `continue`, because a paged
+//! source has four ways for a board's read to end and forgetting one of them is a board that
+//! silently gets no scope row while the rest of the source advances around it.
+//!
 //! § A.1 records `skip`/`limit` paging without recording what an unparameterized request
 //! returns. An implicit server-side cap would silently truncate a large board while looking
 //! like a complete fetch — and a complete-looking truncated fetch is precisely what makes
@@ -35,10 +48,11 @@
 
 use serde_json::Value;
 
-use super::super::models::RawPosting;
+use super::super::models::{RawPosting, ScopeRun};
 use super::{
-    BoxFuture, Source, SourceContext, SourceFetch, first_string, greenhouse::finish, id_string,
-    join_locations,
+    BoxFuture, Source, SourceContext, SourceFetch, first_string,
+    greenhouse::{completed_scope, finish},
+    id_string, join_locations,
 };
 
 /// The ATS key in [`BoardDirectory`](super::BoardDirectory).
@@ -98,68 +112,36 @@ impl Source for LeverSource {
             let mut enumerated = 0usize;
             let mut retired = Vec::new();
             let mut failures = Vec::new();
+            // One verdict per board. Boards the budget never reached get no entry: absence of
+            // a row is the honest record of "no verdict", and inventing a `Failed` one would
+            // claim we looked.
+            let mut scopes: Vec<ScopeRun> = Vec::new();
 
-            'boards: for slug in slugs {
-                let mut skip = 0usize;
-                let mut pages = 0usize;
-                let mut board_postings = Vec::new();
-
-                loop {
-                    let url = board_url(slug, skip);
-                    let page = match ctx.http.get(&url).await {
-                        Ok(response) => match response.json() {
-                            Ok(Value::Array(page)) => page,
-                            Ok(_) => {
-                                failures.push(format!(
-                                    "{slug}: response root is not the documented bare array"
-                                ));
-                                continue 'boards;
-                            }
-                            Err(error) => {
-                                failures.push(format!("{slug}: {error}"));
-                                continue 'boards;
-                            }
-                        },
-                        // One robots refusal covers the host, so every remaining board is
-                        // refused too. Stop rather than making the requests anyway.
-                        Err(error) if error.is_refusal() => {
-                            return SourceFetch::skipped(error.to_string());
-                        }
-                        // "Not on Lever." A definitive zero, not a failed read.
-                        Err(error) if error.is_not_found() && skip == 0 => {
-                            retired.push(slug.clone());
-                            enumerated += 1;
-                            continue 'boards;
-                        }
-                        Err(error) => {
-                            failures.push(format!("{slug}: {error}"));
-                            continue 'boards;
-                        }
-                    };
-
-                    let short_page = page.len() < PAGE_SIZE;
-                    board_postings.extend(parse_board(slug, &page));
-                    pages += 1;
-
-                    // A short page is a *verifiable* end of board. This is the only exit that
-                    // counts the board as enumerated.
-                    if short_page {
-                        postings.append(&mut board_postings);
+            for slug in slugs {
+                match read_board(ctx, slug).await {
+                    BoardRead::Enumerated(board) => {
+                        scopes.push(completed_scope(slug, &board));
+                        postings.extend(board);
                         enumerated += 1;
-                        continue 'boards;
                     }
-
-                    if pages >= MAX_PAGES {
-                        // Keep the rows; do not claim the board was enumerated.
-                        postings.append(&mut board_postings);
-                        failures.push(format!(
-                            "{slug}: still returning full pages after {MAX_PAGES} pages, so the \
-                             board was not fully read"
-                        ));
-                        continue 'boards;
+                    // A definitive "not on Lever". The board offers zero postings, so as a
+                    // scope it is `Completed` with no ids and anything still tagged to it
+                    // advances toward expiry — which is correct, and is new for this source.
+                    BoardRead::Gone => {
+                        retired.push(slug.clone());
+                        scopes.push(ScopeRun::completed(slug.as_str(), Vec::new()));
+                        enumerated += 1;
                     }
-
-                    skip += PAGE_SIZE;
+                    BoardRead::Incomplete { kept, error } => {
+                        postings.extend(kept);
+                        failures.push(format!("{slug}: {error}"));
+                        scopes.push(ScopeRun::failed(slug.as_str(), error));
+                    }
+                    // One robots refusal covers the host, so every remaining board is refused
+                    // too. Stop rather than making the requests anyway — and report no scopes,
+                    // because `Skipped` means we did not fetch this source at all, and
+                    // per-board verdicts would contradict that.
+                    BoardRead::Refused(error) => return SourceFetch::skipped(error),
                 }
             }
 
@@ -180,7 +162,92 @@ impl Source for LeverSource {
                 truncated,
                 &failures,
             )
+            .with_scopes(scopes)
         })
+    }
+}
+
+/// What one board's read produced.
+///
+/// Every exit from [`read_board`] is one of these, and that is the point of the type. Before
+/// scopes this loop had four `continue 'boards` sites, each of which now also owes the run a
+/// per-board verdict; a fifth exit added later would have to invent one, and the cost of
+/// forgetting is that the board silently gets no scope row while the rest of the source
+/// advances around it. Making the verdict the return value means the compiler asks.
+enum BoardRead {
+    /// Paged through to a verifiable end of board. Absence from these ids is evidence.
+    Enumerated(Vec<RawPosting>),
+    /// A definitive "not on Lever" — 404 on the first page. Zero postings, and the slug should
+    /// be retired. Distinct from a 200 with an empty array, which is a live board with nothing
+    /// posted; see the module doc, note 4.
+    Gone,
+    /// The read stopped early, so absence proves nothing about this board. `kept` is what it
+    /// is safe to keep: rows from a page budget that ran out, and **nothing** from a page that
+    /// failed to read. That asymmetry predates scopes and is preserved deliberately — either
+    /// way the board is not enumerated, so no sighting on it advances and dropping the rows
+    /// cannot expire anything.
+    Incomplete { kept: Vec<RawPosting>, error: String },
+    /// `robots.txt` refused the host. Not a fact about this board at all.
+    Refused(String),
+}
+
+/// Page one board to its end, or to the first thing that stops it.
+async fn read_board(ctx: &SourceContext, slug: &str) -> BoardRead {
+    let mut skip = 0usize;
+    let mut pages = 0usize;
+    let mut board_postings = Vec::new();
+
+    loop {
+        let url = board_url(slug, skip);
+        let page = match ctx.http.get(&url).await {
+            Ok(response) => match response.json() {
+                Ok(Value::Array(page)) => page,
+                Ok(_) => {
+                    return BoardRead::Incomplete {
+                        kept: Vec::new(),
+                        error: "response root is not the documented bare array".to_string(),
+                    };
+                }
+                Err(error) => {
+                    return BoardRead::Incomplete {
+                        kept: Vec::new(),
+                        error: error.to_string(),
+                    };
+                }
+            },
+            Err(error) if error.is_refusal() => return BoardRead::Refused(error.to_string()),
+            // Only on the first page. A 404 partway through paging is a failed read, not a
+            // board that does not exist — it answered once already.
+            Err(error) if error.is_not_found() && skip == 0 => return BoardRead::Gone,
+            Err(error) => {
+                return BoardRead::Incomplete {
+                    kept: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
+
+        let short_page = page.len() < PAGE_SIZE;
+        board_postings.extend(parse_board(slug, &page));
+        pages += 1;
+
+        // A short page is a *verifiable* end of board. This is the only exit that counts the
+        // board as enumerated, and therefore the only one that yields a completed scope.
+        if short_page {
+            return BoardRead::Enumerated(board_postings);
+        }
+
+        if pages >= MAX_PAGES {
+            return BoardRead::Incomplete {
+                kept: board_postings,
+                error: format!(
+                    "still returning full pages after {MAX_PAGES} pages, so the board was not \
+                     fully read"
+                ),
+            };
+        }
+
+        skip += PAGE_SIZE;
     }
 }
 
@@ -485,5 +552,75 @@ mod tests {
         assert_eq!(interval_words(None), None);
         assert_eq!(interval_words(Some("per-year-salary")), Some("per year"));
         assert_eq!(interval_words(Some("PER-MONTH-SALARY")), Some("per month"));
+    }
+
+    // ---- scopes ----
+
+    #[test]
+    fn a_boards_scope_ids_are_exactly_the_postings_it_returned() {
+        // The invariant the whole scoped-expiry mechanism rests on. A scope reported
+        // `Completed` says "absence from this list is evidence a posting closed", so an id
+        // missing from it is a live posting marching toward expiry.
+        let page = fixture();
+        let postings = parse_board("belvederetrading", &page);
+        let scope = completed_scope("belvederetrading", &postings);
+
+        assert!(scope.is_completed());
+        assert_eq!(scope.fetched, postings.len() as i64);
+        let ids: Vec<String> = postings.iter().map(|job| job.external_id.clone()).collect();
+        assert_eq!(scope.external_ids, ids);
+    }
+
+    #[test]
+    fn every_exit_from_reading_a_board_carries_a_verdict() {
+        // `BoardRead` exists so this cannot drift: the four ways a board's read can end each
+        // map onto exactly one scope verdict, and the mapping is what the fetch loop applies.
+        // Pinning it here is the closest a test can get to the loop without a fake HTTP layer.
+        let enumerated = BoardRead::Enumerated(parse_board("belvederetrading", &fixture()));
+        let gone = BoardRead::Gone;
+        let incomplete = BoardRead::Incomplete {
+            kept: Vec::new(),
+            error: "HTTP 500".to_string(),
+        };
+        let refused = BoardRead::Refused("robots.txt disallows it".to_string());
+
+        assert!(matches!(enumerated, BoardRead::Enumerated(ref board) if !board.is_empty()));
+        // Gone and Enumerated both count as enumerated and both yield a completed scope. The
+        // difference is only that one of them has no ids — which is the whole point: a board
+        // that does not exist offers nothing, so absence from it is evidence.
+        assert!(ScopeRun::completed("acceldata", Vec::new()).is_completed());
+        assert!(matches!(gone, BoardRead::Gone));
+        assert!(!ScopeRun::failed("acceldata", "HTTP 500").is_completed());
+        assert!(matches!(incomplete, BoardRead::Incomplete { .. }));
+        // A refusal is about the host, so it yields no scope at all rather than a failed one.
+        assert!(matches!(refused, BoardRead::Refused(_)));
+    }
+
+    #[test]
+    fn a_page_budget_that_runs_out_keeps_its_rows_but_not_its_verdict() {
+        // The asymmetry that predates scopes: rows read before a page *budget* ran out are
+        // kept, rows read before a page *failed* are dropped. Either way the board is not
+        // enumerated, so no sighting on it advances and the dropped rows cannot expire
+        // anything — which is why the asymmetry is survivable and worth pinning rather than
+        // quietly unifying.
+        let budget_ran_out = BoardRead::Incomplete {
+            kept: parse_board("belvederetrading", &fixture()),
+            error: format!("still returning full pages after {MAX_PAGES} pages"),
+        };
+        let page_failed = BoardRead::Incomplete {
+            kept: Vec::new(),
+            error: "HTTP 500".to_string(),
+        };
+
+        match (budget_ran_out, page_failed) {
+            (
+                BoardRead::Incomplete { kept: budget, .. },
+                BoardRead::Incomplete { kept: failed, .. },
+            ) => {
+                assert!(!budget.is_empty(), "a spent budget keeps what it read");
+                assert!(failed.is_empty(), "a failed page keeps nothing");
+            }
+            _ => panic!("both are Incomplete"),
+        }
     }
 }
