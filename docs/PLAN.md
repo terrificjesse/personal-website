@@ -1306,6 +1306,10 @@ that is actually about *you* rather than about the market.
 | 12j ✅ | 0026 watched during a real collection; migration `0027` deletes the immortal rows 12c found | `[gen]` | A | Claude Code | ✅ | 3–4h |
 | 12k ✅ | Migration `0028` backfills the scope tags 0026 can only earn forward, generated from `dedup::ats_identity` | `[gen]` | A | Claude Code | ✅ | 3h |
 | 12l ✅ | Collapse the five-branch stack onto one integration branch; review Codex's variants work | `[gen]` | C | Claude Code | ✅ | 2h |
+| 12m ✅ | The QC findings: a proposal with missing evidence no longer vanishes from the review queue; migration `0030`; per-agent migration blocks | `[gen]` | A+B | Claude Code | ✅ | 3h |
+| 12n ✅ | The first production expiry, reconstructed from a backup; migration `0031` closes the inbox accounting | `[gen]` | A | Claude Code | ✅ | 3h |
+| 12o ✅ | Rehearse the deploy locally — six of eleven steps — and correct two stale claims about the rate limiter | `[gen]` | A | Claude Code | ✅ | 2h |
+| 12p ✅ | Consolidate; review Codex's `verify` fix; **name the deploy branch**, which `main` did not contain | `[gen]` | C | Claude Code | ✅ | 2h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
