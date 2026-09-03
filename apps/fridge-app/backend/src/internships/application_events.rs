@@ -28,6 +28,14 @@
 //! idempotency key. A proposal's forward transition and undo share a cause but have different
 //! target statuses. Events without a cause deliberately do not deduplicate in SQLite; the
 //! backfill is a one-shot command, and two manual edits must remain two events.
+//!
+//! # Verification coverage is part of the result
+//!
+//! Applications with no events remain correctly exempt from the fold invariant. But when the
+//! database has applications and **all** of them are exempt, `application-events verify` exits
+//! non-zero: `0 mismatches` then means no application was checked, not that the cache and log
+//! were proved consistent. The command prints `covered / total` before failing so automation
+//! can gate on the same population a human sees.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -200,6 +208,7 @@ application-events — rebuild the append-only application status history
 
   application-events verify
       Assert that every non-empty event history folds to its application's cached status.
+      Fails when applications exist but none has an event history to check.
 ";
 
 /// Dispatch for the `application-events` server-binary subcommand.
@@ -226,8 +235,9 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
         "verify" if args.len() == 1 => {
             let report = verify_invariant(pool).await?;
             println!(
-                "application-events invariant: {} covered, {} exempt, {} mismatches",
+                "application-events invariant: {}/{} covered, {} exempt, {} mismatches",
                 report.covered,
+                report.total(),
                 report.exempt,
                 report.mismatches.len(),
             );
@@ -239,7 +249,15 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
                     mismatch.folded_status.as_str(),
                 );
             }
-            if report.mismatches.is_empty() {
+            if report.covered == 0 && report.exempt > 0 {
+                bail!(
+                    "verification inconclusive: 0 of {} applications have events; all {} are \
+                     correctly exempt, so status == fold(events) was not checked for any \
+                     application. Run `application-events backfill` first",
+                    report.total(),
+                    report.exempt,
+                )
+            } else if report.mismatches.is_empty() {
                 Ok(())
             } else {
                 bail!(
@@ -294,6 +312,12 @@ pub struct InvariantReport {
     /// Applications with no events. The Phase 10 contract explicitly exempts these.
     pub exempt: u64,
     pub mismatches: Vec<FoldMismatch>,
+}
+
+impl InvariantReport {
+    pub fn total(&self) -> u64 {
+        self.covered + self.exempt
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -943,5 +967,35 @@ mod tests {
                 folded_status: ApplicationStatus::Oa,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn invariant_command_refuses_to_call_zero_coverage_verified() {
+        let pool = pool().await;
+        insert_user(&pool).await;
+        insert_application(
+            &pool,
+            "unbackfilled",
+            ApplicationStatus::Applied,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let error = main(&pool, &["verify".to_string()])
+            .await
+            .expect_err("an application table with zero covered rows is not a verification");
+        let message = error.to_string();
+        assert!(message.contains("verification inconclusive"), "{message}");
+        assert!(message.contains("0 of 1 applications have events"), "{message}");
+        assert!(message.contains("correctly exempt"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invariant_command_allows_a_database_with_no_applications() {
+        let pool = pool().await;
+
+        main(&pool, &["verify".to_string()])
+            .await
+            .expect("there is no uncovered application when there are no applications");
     }
 }
