@@ -1,0 +1,47 @@
+{
+  "_provenance": "Generated as candidates by company_match::propose over a copy of the live database on 2026-09-03, then reviewed by hand. Regenerate the candidates with the ignored test in src/internships/company_match.rs; the decisions below are NOT regenerable and must be re-reviewed if the corpus changes.",
+
+  "_aliases_doc": "alias company_key -> canonical company_key. Applied by normalize::company_key, so it affects both the fallback dedup key and how company_signals groups.",
+  "aliases": {
+    "anduril industries": "anduril",
+    "aquatic capital management": "aquatic capital",
+    "arlo technologies": "arlo",
+    "astera labs": "astera",
+    "drw university jobs": "drw",
+    "gritt robotics": "gritt",
+    "imc trading": "imc",
+    "jump trading group": "jump trading",
+    "nightwing intelligence solutions": "nightwing",
+    "palantir technologies": "palantir",
+    "perplexity ai": "perplexity",
+    "procter gamble p g": "procter gamble",
+    "smiths detection group": "smiths detection",
+    "susquehanna international group": "susquehanna",
+    "susquehanna international group sig": "susquehanna",
+    "susquehanna investment group": "susquehanna",
+    "teledyne technologies": "teledyne",
+    "tenstorrent university jobs": "tenstorrent",
+    "tmeic corporation americas": "tmeic",
+    "varda space industries": "varda space",
+    "voloridge investment management": "voloridge"
+  },
+
+  "_refused_doc": "Candidates the generator proposed and a human rejected. Kept in the file rather than deleted, because the next regeneration will propose them again and the reason not to merge is the part worth preserving. A test asserts nothing here appears in `aliases`.",
+  "refused": [
+    {
+      "candidate": "citadel securities",
+      "against": "citadel",
+      "reason": "Different employers. Citadel is the hedge fund, Citadel Securities the market maker; separate hiring processes and separate roles. The token `securities` is descriptive but distinguishing, which is why no trailing-token rule can decide this case."
+    },
+    {
+      "candidate": "rivian and volkswagen group technologies",
+      "against": "rivian",
+      "reason": "A joint venture, not a longer name for Rivian. It also carries 12 postings against Rivian's 1, so a merge would swamp the smaller signal with the larger."
+    },
+    {
+      "candidate": "internship list",
+      "against": "internship",
+      "reason": "Neither is a company. Both are junk company names that survived QC; merging them would tidy the symptom and hide the parsing defect."
+    }
+  ]
+}

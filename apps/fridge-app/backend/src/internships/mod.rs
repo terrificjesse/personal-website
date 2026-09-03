@@ -34,6 +34,7 @@
 
 pub mod alerts;
 pub mod application_events;
+pub mod company_match;
 pub mod collector;
 pub mod dedup;
 pub mod expiry;

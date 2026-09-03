@@ -586,11 +586,32 @@ and taking only `BAND_EXACT`/`BAND_PREFIX` results would work — though the fri
 fields on `Candidate` make it awkward, and it would not handle "Google"/"Alphabet", which is a
 knowledge problem rather than a string problem.
 
-**Important:** `src/nlp.rs` is a `[learn]` file. Generalizing it — making `Candidate` generic,
-adding a pairwise entry point, retuning the bands for long strings — would mean *editing* it,
-which is out of scope for Claude per `CLAUDE.md`. The right shape is a **separate matcher
-module for postings** that leaves `nlp.rs` untouched, optionally calling into it for the
-company-name case only.
+**Superseded in part, 2026-09-03.** The owner lifted the `[learn]` restriction for this tab, so
+"out of scope for Claude" no longer applies. The *engineering* conclusion above is unchanged and
+was the more important half: a separate matcher module for postings, leaving `nlp.rs` untouched.
+That is `src/internships/company_match.rs`.
+
+It does **not** call `nlp.rs`, and measuring the corpus is why. The company-name case looked like
+`nlp.rs`'s problem, and it is not a string problem at all:
+
+- **The examples above are already fixed.** `normalize::company_key` strips legal suffixes, so
+  `KLA` / `KLA Corporation`, `Moog` / `Moog `, and `WhatNot` / `Whatnot` are each one key today.
+  The variants that remain differ by *descriptive* tokens, not legal ones.
+- **No string rule can decide the remaining cases.** The corpus holds `citadel` /
+  `citadel securities` and `jump trading` / `jump trading group`. The first is two different
+  employers, the second is one company, and both differ by a single trailing descriptive token.
+  Edit distance, prefix bands and suffix lists all merge both or neither.
+
+So the module splits the problem: a **candidate generator** (strict token-prefix, nothing
+looser) proposes pairs, and `data/internships/company-aliases.json` records what a human decided
+— including the refusals and why, since the generator will propose them again next time.
+
+**Measured payoff, and it is not deduplication.** Twenty-one reviewed aliases merge exactly one
+duplicate posting. What they actually fix is `company_signals`, which groups by `company_key`:
+19 companies had their signal split across 2+ keys covering 130 postings, and 12 of those
+fragments carry no prestige at all, so their postings score at the neutral midpoint while the
+sibling key scores real. Migration `0029` is a ranking fix that merges a duplicate on the way
+past.
 
 ---
 

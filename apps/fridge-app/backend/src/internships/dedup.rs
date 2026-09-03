@@ -32,16 +32,20 @@
 //!
 //! # What this module deliberately does not do
 //!
-//! **No fuzzy matching.** § C measured 18 groups of company-name variants collapsing within
-//! Simplify alone — `KLA` / `KLA Corporation`, `WhatNot` / `Whatnot`, `Moog` / `Moog ` — and
-//! notes that parent/subsidiary pairs ("Google" / "Alphabet") are not string problems at all.
-//! Fuzzy company/title matching is the NLP learning area, reserved for the repo owner; § C
-//! also concludes `src/nlp.rs` is the wrong shape to reuse here (it is a ranked typeahead, not
-//! a pairwise identity test, and its substring band would fire on "Engineer" across most of
-//! the corpus).
+//! **No fuzzy TITLE matching**, and that part is unchanged: "Engineer" is a substring of a
+//! large fraction of the corpus, and a rule loose enough to merge "SWE Intern" with "Software
+//! Engineer Intern" is loose enough to merge two different roles at one company. Under-merging
+//! shows a duplicate; over-merging destroys a posting.
 //!
-//! [`FuzzyMatcher`] is the seam that work plugs into. Until something implements it, dedup is
-//! exact-key only, which **under-merges** — the safer failure, per § C.
+//! **Company names are canonicalized, since 2026-09-03**, but not here — by
+//! `normalize::company_key`, before this module ever sees the key. That keeps "one real job is
+//! one row" a storage guarantee enforced by `dedup_key`'s UNIQUE index rather than a pairwise
+//! test a future upsert could forget to run. See [`company_match`](super::company_match), which
+//! also records why it is a reviewed table and not a string metric: `citadel` /
+//! `citadel securities` are two employers and `jump trading` / `jump trading group` is one, one
+//! descriptive token apart either way.
+//!
+//! **No parent/subsidiary knowledge.** "Google" / "Alphabet" is not a string problem.
 
 use crate::internships::models::{NormalizedPosting, Season};
 
@@ -476,21 +480,18 @@ fn season_str(season: Season) -> &'static str {
     }
 }
 
-/// The seam for fuzzy company/title matching.
-///
-/// **Deliberately unimplemented.** Fuzzy matching is the NLP learning area and belongs to the
-/// repo owner; see this module's header and `docs/INTERNSHIP_SCRAPING.md` § C, which concludes
-/// `src/nlp.rs` cannot be reused as-is (wrong output shape, and its substring band would fire
-/// on "Engineer" across most of the corpus) and that generalizing it would mean *editing* a
-/// `[learn]` file.
-///
-/// Until something implements this, [`dedup_key`] is exact-only and under-merges: the same job
-/// listed as `KLA` on one source and `KLA Corporation` on another becomes two rows. That is
-/// visible and recoverable. Over-merging — collapsing two genuinely different jobs — is not.
-pub trait FuzzyMatcher: Send + Sync {
-    /// Whether these two postings are the same job, given the exact keys already disagreed.
-    fn same_posting(&self, left: &NormalizedPosting, right: &NormalizedPosting) -> bool;
-}
+// The `FuzzyMatcher` seam was removed on 2026-09-03, when the thing it was reserved for got
+// built and turned out not to need it.
+//
+// It was a pairwise predicate — "are these two postings the same job?" — to be consulted after
+// the exact keys disagreed. What company canonicalization actually needs is for the two
+// postings to compute the **same key in the first place**, which `normalize::company_key` now
+// does by mapping a reviewed alias table. That keeps "one real job is one row" a storage
+// guarantee enforced by `dedup_key`'s UNIQUE index, rather than application logic a future
+// upsert could forget to call — which is the property this module's header claims and which a
+// pairwise matcher would have quietly weakened.
+//
+// See `company_match`, and `docs/INTERNSHIP_SCRAPING.md` § C.
 
 #[cfg(test)]
 mod tests {

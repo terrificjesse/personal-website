@@ -711,7 +711,11 @@ pub fn company_key(company: &str) -> String {
         }
     }
 
-    tokens.join(" ")
+    // Canonicalize last, after the legal suffixes are gone, so the alias table is keyed on
+    // the form everything else in the pipeline sees. It maps twenty-one reviewed variants —
+    // `palantir technologies` -> `palantir` — and returns every other key unchanged. See
+    // `company_match` for why this is a curated table rather than a string metric.
+    super::company_match::canonical_company(&tokens.join(" "))
 }
 
 // ------------------------------------------------------------------------------------------

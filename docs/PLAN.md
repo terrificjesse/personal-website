@@ -1295,8 +1295,8 @@ that is actually about *you* rather than about the market.
 | 12a ✅ | `dedup::ats_identity` for Workday, `apply.workable.com`, `ats.rippling.com`; record all three in `INTERNSHIP_SCRAPING.md` | `[gen]` | A | Codex | ✅ given the URL corpus + test list | 5–7h |
 | 12b ✅ | Re-key safety measurement: does the new key **merge rows that were distinct**? Measured over a copy of the live DB | `[gen]` | A | Claude Code | ✅ | 2–3h |
 | 12c ✅ | The first **uncapped** collection run; measure expiry and pay coverage honestly | `[gen]`+`[you]` | A | You start it, either agent reads it | ⛔ it is a long real run against live sources | 1h + the run |
-| 12d ⬜ | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
-| 12e ⬜ | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
+| 12d ✅ | **Decision:** fuzzy company/title dedup — reuse `[learn]` `nlp.rs`, or write a second matcher | `[you]` | — | You | ⛔ it is a Learning Mode boundary call | 1h |
+| 12e ✅ | Fuzzy dedup implementation — conditional on 12d | `[gen]` **or** `[learn]` | A | depends on 12d | ⛔ until 12d | 3–5h |
 | 12f ✅ | Resume-variant attribution: variants table, the extension records which one was used at fill time, outcome by variant | `[gen]` | A+B | Claude Code | ✅ after the contract | 5–7h |
 | 12g ⬜ | Verify 8g in Firefox on **two live ATS forms** — `questions()`, `describePage()`, Save and Suggest | `[gen]`+`[you]` | B | You + Claude Code | ⛔ a human loads the extension and opens the forms | 3–4h |
 | 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
@@ -1663,6 +1663,69 @@ The run's own log printed *"capped sources report Partial and will never expire 
 immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. The binary
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
+
+### 12d + 12e — built, and the payoff is not the one the task was for
+
+**The rule changed first.** On 2026-09-03 the owner lifted Learning Mode for this tab: NLP is a
+learning area because of the *fridge app*, and here the goal is results. Four places said
+otherwise and all four moved in the same commit — `CLAUDE.md`, `INTERNSHIP_SCRAPING.md` § C,
+`dedup.rs`'s header, and the `FuzzyMatcher` doc. `src/nlp.rs` stays off-limits without asking,
+now for blast radius rather than pedagogy: it is live fridge behaviour, and § C measured that
+its bands break on job titles.
+
+**The premise was already stale.** 12d was raised because `KLA` and `KLA Corporation` were two
+rows. They are not, and have not been for some time: `normalize::company_key` strips legal
+suffixes, so every example § C names — KLA, Moog, WhatNot — is one key today. The variants that
+remain differ by *descriptive* tokens.
+
+**No string rule can decide the remaining cases**, which is the finding that shaped the design.
+The corpus holds `citadel` / `citadel securities` and `jump trading` / `jump trading group`. The
+first is two employers, the second is one company, and both differ by one trailing descriptive
+token. So the module splits the problem: a strict token-prefix **candidate generator** proposes,
+and `data/internships/company-aliases.json` records what a human **decided** — 21 aliases and 3
+refusals, each refusal carrying its reason, because the generator will propose them again.
+
+#### The measurement, and the reframing it forced
+
+| | |
+|---|---|
+| company keys in the corpus | 663 |
+| candidates the generator proposed | 25 |
+| merged after review | 22 |
+| refused | 3 — Citadel Securities, the Rivian/VW joint venture, and `internship list` (neither is a company) |
+| **duplicate postings this merges** | **1** |
+
+One posting. That would not justify a re-key over live data, and the honest answer would have
+been to stop. What justifies it is a second effect nobody was looking for:
+
+**`company_signals` groups by `company_key`, and 19 companies had their signal split across two
+or more keys — covering 130 postings.** Twelve of those fragments carry **no prestige at all**,
+so `rank.rs` imputes them to the neutral midpoint while the sibling key scores real:
+`jump trading group` beside `jump trading` at 1.0, `drw university jobs` beside `drw` at 0.88.
+Those postings were being ranked as an average company when the company is top-tier.
+
+So `0029` is a **ranking fix that merges a duplicate on the way past**, and 12d's original
+framing — deduplication — was the least valuable thing about it.
+
+#### Migration 0029, and the 0025 bug it does not repeat
+
+47 postings get a new `company_key`; 8 of those are fallback-keyed so their `dedup_key` moves
+too; 39 are ATS-keyed and cannot collide. One group merges, with no application and no alert on
+either row. Generated from the same committed table the runtime reads, so the file and the
+running code cannot disagree about what a company is called.
+
+The DELETE guards **all three** references — sightings, applications, and
+`hunt_events.subject_id`. That last one is the soft reference the 2026-09-03 QC pass caught 0025
+missing, and a repoint that would violate `UNIQUE (kind, subject_id)` drops the duplicate alert
+rather than failing the migration.
+
+Verified against a copy: 1,841 → 1,840, no aliased key left, no orphaned sighting, idempotent on
+a second application, and applying through `sqlx` on boot. `company_signals` converges on the
+next collection run's recompute; until then a posting already matches its canonical signal row,
+so the ranking fix takes effect immediately and the stale rows are inert.
+
+**Lane A's migration range is exhausted** — `0029` was the last of `0021–0029`. `CLAUDE.md`
+rule 3 now says so; reserve the next range before either agent writes another migration.
 
 ### 12l — the stack collapsed, and what is actually left
 
