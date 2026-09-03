@@ -1298,6 +1298,7 @@ that is actually about *you* rather than about the market.
 | 12i ✅ | **Scoped expiry** — per-board verdicts, so one dead board out of 485 stops disqualifying Greenhouse. Found by 12c | `[gen]` | A (+ the panel half) | Claude Code | ✅ | 4–5h |
 | 12j ✅ | 0026 watched during a real collection; migration `0027` deletes the immortal rows 12c found | `[gen]` | A | Claude Code | ✅ | 3–4h |
 | 12k ✅ | Migration `0028` backfills the scope tags 0026 can only earn forward, generated from `dedup::ats_identity` | `[gen]` | A | Claude Code | ✅ | 3h |
+| 12l ✅ | Collapse the five-branch stack onto one integration branch; review Codex's variants work | `[gen]` | C | Claude Code | ✅ | 2h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1657,6 +1658,69 @@ The run's own log printed *"capped sources report Partial and will never expire 
 immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. The binary
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
+
+### 12l — the stack collapsed, and what is actually left
+
+Five branches, none merged, `main` seventy commits behind. That is rule 8 going unpaid: two
+agents producing at twice the rate the user can read, on lanes that had diverged. Everything is
+now on **`phase-12-integration`**. Nothing is merged to `main` — that is a call for the user to
+make deliberately, not a side effect of a cleanup.
+
+**The merge was uneventful, which is the interesting part.** One file was touched by both lanes,
+`frontend/src/lib/internshipsApi.ts`, and it auto-merged. No migration numbers collided, because
+Lane A's 0021–0029 reservation meant Codex's 0024 and this lane's 0026–0028 were never competing
+for the same next-free number — the failure rule 3 exists to prevent surfaces at
+`sqlx migrate run`, not at merge, and it did not surface.
+
+Verified on the combined tree rather than on either half: **868 tests, clippy 38, `tsc` clean**,
+every migration through 0028 applying on a boot against a copy, and both panels rendering in one
+build — `expired within 100 boards` on the run-health page against a real scoped partial run,
+and the variants panel beside `By résumé variant` on the internships page.
+
+### Reviewing Codex's three commits (rule 7), and it is clean
+
+`8f7cc0d` analytics by variant, `578732d` the management panel, `a5813c8` the docs and loop.
+
+- **The loop closes end to end.** A variant created through the panel comes back from
+  `GET /hunt/resume-variants` with `archived_at: null` — which is exactly what the popup's
+  picker reads and what `is_attachable` requires. The empty state even names the loop: *"Create
+  one here and it will appear in the extension when you track an application."*
+- **The three refusals are distinct, and better than specified.** 409 is ambiguous in the
+  abstract but unambiguous per route — a 409 on create can only be a duplicate, a 409 on delete
+  can only be in-use — and the API layer maps each one to its own sentence. The delete message
+  goes further than asked and offers the alternative: retire it instead, retired variants stay
+  available for comparison. Confirmed live: creating a duplicate label shows *"A résumé variant
+  with that name already exists."*, not a generic failure.
+- **No predicate drift.** `by_variant` uses `application_events::HAS_RESPONDED`, the same
+  constant every other response question uses, rather than a second definition of "responded".
+- **n = 1 is not misleading**, because the breakdowns render counts rather than rates. A single
+  application shows as one, not as 100%.
+- **`docs/HUNT.md` matches the code**, including the wire decision `8f7cc0d`'s comment had
+  deferred: NULL variant serializes as the empty string, which label validation cannot store, so
+  a real variant named `no variant` cannot collide with the bucket.
+
+One thing worth naming rather than filing as a defect: `group_rows` calls `bail!` when an
+application has a `resume_variant_id` whose join found no label, which would take the whole
+analytics endpoint down. It is unreachable through the app — `is_attachable` rejects a variant
+that is not the caller's own, `delete` refuses while `application_count > 0`, and there is a real
+foreign key besides — so it is an invariant assertion rather than error handling, and a correct
+one. Recorded because "unreachable" is a claim that ages.
+
+### What is actually left, as of 2026-09-03
+
+**Phase 12 is complete except for three items, and every one of them is yours.** 12d is the
+fuzzy-dedup decision — a Learning Mode boundary call that no agent may make — and 12e is gated
+entirely on it. 12g is the Firefox verification of 8g on two live ATS forms, which needs a human
+loading the extension and opening the forms. 12f is now genuinely finished rather than
+nominally: it was shipped API-only, and Codex's panel is what made it reachable.
+
+**Phase 13 is blocked at its first two tasks, both `[you]`**: 13a exports the labelset, 13b
+hand-labels it, and 13c through 13g all read those labels. Nothing an agent can start.
+
+The other standing blockers are unchanged: deploy waits on the host, DNS, the Google OAuth
+client, the `INBOX_APPLY_LABELS` decision and a restore drill. And expiry needs two more
+uncapped runs before `swept_vanished` means anything at scale — 12c was the first of three, and
+0026–0028 change what the second one can conclude.
 
 ### 12k — migration `0028`, and a prediction that held in every clause
 
