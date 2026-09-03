@@ -360,6 +360,58 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].from_address.as_deref(), Some("recruiter@example.com"));
         assert_eq!(proposals[0].subject.as_deref(), Some("Your interview"));
+        assert!(
+            proposals[0].evidence_available,
+            "the whole chain resolves, so the panel may show the mail behind this"
+        );
+
+        // ---- and the same queue, with the evidence chain broken ----
+        //
+        // The live database has exactly one `status_proposals` row and its `verdict_id`
+        // resolves to nothing — `PRAGMA foreign_key_check` flags it. Under the inner joins this
+        // query used to have, such a proposal was **not listed at all**: a status change
+        // waiting for review, silently absent from the queue that exists to review it.
+        //
+        // Foreign keys have to be switched off to *create* this state, because sqlx turns them
+        // on per connection — which is the point: the application cannot write this row, and
+        // the one in the live database got there by some other route (a restore, or a manual
+        // session). The read path still has to survive finding it, and that is what broke.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .expect("relax the constraint to build a state the app cannot write");
+        sqlx::query(
+            "INSERT INTO status_proposals
+                (id, application_id, verdict_id, from_status, to_status, created_at)
+             VALUES
+                ('proposal-2', 'application-1', 'verdict-that-is-gone', 'applied', 'oa',
+                 '2026-09-02T01:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a proposal whose verdict does not exist");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .expect("and put it back, so nothing after this runs relaxed");
+
+        let proposals = fetch_proposals(&pool, "user-1")
+            .await
+            .expect("proposal query");
+
+        assert_eq!(proposals.len(), 2, "the orphaned proposal must still be listed");
+        let orphan = proposals
+            .iter()
+            .find(|p| p.id == "proposal-2")
+            .expect("the orphaned proposal is in the queue");
+        assert!(
+            !orphan.evidence_available,
+            "and it must say the mail behind it cannot be shown, rather than looking terse"
+        );
+        assert_eq!(orphan.from_address, None);
+        assert_eq!(orphan.subject, None);
+        assert_eq!(orphan.evidence, None);
+        assert_eq!(orphan.to_status, "oa", "the proposal itself is intact and reviewable");
     }
 }
 
@@ -381,6 +433,13 @@ pub struct Proposal {
     pub subject: Option<String>,
     pub evidence: Option<String>,
     pub confidence: Option<f64>,
+    /// Whether the verdict and message this proposal was derived from still resolve.
+    ///
+    /// `false` and all four fields above `None` mean the chain is broken, not that the mail was
+    /// terse. Those are very different things to be told when the question on screen is "should
+    /// I apply this change", so the panel is given the difference rather than left to infer it
+    /// from four nulls.
+    pub evidence_available: bool,
     pub created_at: String,
 }
 
@@ -400,13 +459,27 @@ pub async fn proposals(
 
 async fn fetch_proposals(pool: &SqlitePool, user_id: &str) -> Result<Vec<Proposal>, sqlx::Error> {
     sqlx::query_as::<_, Proposal>(
+        // LEFT JOIN to the evidence, and INNER only to the application.
+        //
+        // These were all inner joins, and a proposal whose verdict or message no longer
+        // resolves was therefore **dropped from the queue entirely** — the silent-drop failure
+        // this codebase designs against everywhere else (`QcOutcome` has no "dropped" variant;
+        // `source_runs` counts filtered and rejected separately for exactly this reason). The
+        // live database has such a row, flagged by `PRAGMA foreign_key_check`, and it would
+        // simply not have been listed.
+        //
+        // The application join stays INNER on purpose: a proposal for an application that does
+        // not exist has nothing to be applied *to*, and `a.user_id` is what scopes the query to
+        // the caller. Widening that one would leak other people's rows.
         "SELECT p.id, p.application_id, a.company_name, a.title,
                 p.from_status, p.to_status, p.applied_automatically,
-                m.from_address, m.subject, v.evidence, v.confidence, p.created_at
+                m.from_address, m.subject, v.evidence, v.confidence,
+                (v.id IS NOT NULL AND m.id IS NOT NULL) AS evidence_available,
+                p.created_at
            FROM status_proposals p
            JOIN internship_applications a ON a.id = p.application_id
-           JOIN email_verdicts v ON v.id = p.verdict_id
-           JOIN email_messages m ON m.id = v.message_id
+           LEFT JOIN email_verdicts v ON v.id = p.verdict_id
+           LEFT JOIN email_messages m ON m.id = v.message_id
           WHERE a.user_id = ? AND p.reviewed_at IS NULL
           ORDER BY p.created_at DESC",
     )

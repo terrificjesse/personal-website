@@ -170,11 +170,23 @@ export function InboxPanel() {
 
               {/* The email that caused it. Without this the panel asks you to approve a change
                   you have no way to check. */}
-              <div className="mt-1 text-xs text-neutral-500">
-                {proposal.from_address && <div>from: {proposal.from_address}</div>}
-                {proposal.subject && <div>subject: {proposal.subject}</div>}
-                {proposal.evidence && <div>matched: {proposal.evidence}</div>}
-              </div>
+              {proposal.evidence_available ? (
+                <div className="mt-1 text-xs text-neutral-500">
+                  {proposal.from_address && <div>from: {proposal.from_address}</div>}
+                  {proposal.subject && <div>subject: {proposal.subject}</div>}
+                  {proposal.evidence && <div>matched: {proposal.evidence}</div>}
+                </div>
+              ) : (
+                /* Said outright rather than left as three missing lines. A terse email and a
+                   missing one look identical otherwise, and only one of them means "you cannot
+                   check this". Both buttons stay enabled: the proposal itself is intact, and
+                   refusing to let it be accepted would decide for the reader that it is wrong,
+                   which is not something this panel knows. */
+                <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                  The email behind this proposal is no longer in the database, so there is
+                  nothing to check it against. The change itself is still described above.
+                </div>
+              )}
 
               <div className="mt-1 flex gap-2">
                 <button

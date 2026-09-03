@@ -902,6 +902,15 @@ export type StatusProposal = {
   subject: string | null;
   evidence: string | null;
   confidence: number | null;
+  /**
+   * Whether the verdict and message this proposal came from still resolve.
+   *
+   * `false` with all four fields above null means the chain is broken, not that the email was
+   * terse — and those deserve very different treatment when the question on screen is "should I
+   * apply this to my application". Before the joins were widened, such a proposal was not
+   * listed at all.
+   */
+  evidence_available: boolean;
   created_at: string;
 };
 
