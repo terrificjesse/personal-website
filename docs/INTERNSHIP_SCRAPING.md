@@ -683,6 +683,28 @@ Three properties worth knowing before touching this:
 `expiry.rs`'s module doc carries the soundness analysis, including the single narrow case where
 scoped expiry can over-expire where the source-level rule would not.
 
+**Scopes are forward-looking, and migration `0028` is what reaches backwards.** A sighting is
+tagged when a run *sees* it, so a sighting whose job is already gone can never be tagged — and
+an untagged sighting does not advance on a partial run. Measured in 12j: of 42 legacy sightings
+on 100 completely enumerated boards, 37 were tagged and the 5 that were not were already dead.
+
+`posting_sightings.url` already records the board, and `upsert_posting` rewrites it every time
+the sighting is seen, so its slug is the same fact the tag carries. 0028 backfills from it, and
+is **generated from `dedup::ats_identity`** rather than parsing URLs in SQL — that parser
+already knows Greenhouse's three host forms and its one case-foldable path, and a second
+implementation would diverge exactly where it hurts. The generator is
+`src/internships/scope_backfill.rs`; regenerate and re-review with:
+
+```
+sqlite3 fridge.db ".backup '/tmp/scope-backfill.db'"
+SCOPE_FIXTURE_DB=/tmp/scope-backfill.db SCOPE_BACKFILL_OUT=/tmp/0028_body.sql \
+  cargo test -p fridge_backend scope_backfill -- --ignored --nocapture
+```
+
+Two pseudo-slugs must never become scopes: `embed` (Greenhouse's embed form, which carries no
+board) and `gh_jid` (a job id in a query parameter on a company's own careers page). Neither is
+a board, neither is ever polled, and a sighting tagged with one would wait forever.
+
 ---
 
 ## E. Prestige signals

@@ -985,6 +985,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tagged_and_an_untagged_sighting_advance_together_on_a_full_run() {
+        // Migration 0028 backfills `scope` onto sightings that predate 0026, which moves a row
+        // from the "untagged, advances because the source was fully enumerated" branch to the
+        // "tagged, advances because its board completed" one. On a fully successful run every
+        // board is in the completed set, so the two branches must select the same rows — if
+        // they did not, backfilling would have quietly narrowed what a clean run can expire.
+        let pool = scoped_pool().await;
+        let now = Utc::now();
+        let run_id = open_run(&pool, now).await;
+
+        seed(&pool, "greenhouse", "untagged-gone", None, 0).await;
+        seed(&pool, "greenhouse", "tagged-gone", Some("boardA"), 0).await;
+
+        let result = greenhouse_run(
+            vec![
+                ScopeRun::completed("boardA", Vec::new()),
+                ScopeRun::completed("boardB", vec!["something-else".to_string()]),
+            ],
+            SourceOutcome::Success,
+            1,
+        );
+        settle_source_run(&pool, &run_id, &Uuid::new_v4().to_string(), &result, now)
+            .await
+            .unwrap();
+
+        assert_eq!(misses_of(&pool, "greenhouse", "untagged-gone").await, 1);
+        assert_eq!(
+            misses_of(&pool, "greenhouse", "tagged-gone").await,
+            1,
+            "a backfilled tag must not cost a row the advance it would have had untagged"
+        );
+    }
+
+    #[tokio::test]
     async fn a_sighting_is_retagged_with_the_board_that_reported_it() {
         // A job that moves between boards. The tag is "where we last saw it", and keeping it
         // current is what makes the next run's increment ask the right board about it.

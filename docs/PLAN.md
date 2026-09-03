@@ -1297,6 +1297,7 @@ that is actually about *you* rather than about the market.
 | 12h ✅ | `is_machine_sender` does not know `systemmessage@` | `[gen]` | A | Codex | ✅ | 1h |
 | 12i ✅ | **Scoped expiry** — per-board verdicts, so one dead board out of 485 stops disqualifying Greenhouse. Found by 12c | `[gen]` | A (+ the panel half) | Claude Code | ✅ | 4–5h |
 | 12j ✅ | 0026 watched during a real collection; migration `0027` deletes the immortal rows 12c found | `[gen]` | A | Claude Code | ✅ | 3–4h |
+| 12k ✅ | Migration `0028` backfills the scope tags 0026 can only earn forward, generated from `dedup::ats_identity` | `[gen]` | A | Claude Code | ✅ | 3h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1656,6 +1657,62 @@ The run's own log printed *"capped sources report Partial and will never expire 
 immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. The binary
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
+
+### 12k — migration `0028`, and a prediction that held in every clause
+
+12j found that scoped expiry is forward-looking: a sighting is tagged when a run *sees* it, so a
+sighting whose job is already gone is never tagged, and an untagged sighting does not advance on
+a partial run. `posting_sightings.url` already records the board, and `upsert_posting` rewrites
+it every time the sighting is seen — so its slug is the same fact the tag carries, from the same
+run. 0028 backfills from it.
+
+**Generated, not hand-written, and not parsed in SQL.** `dedup::ats_identity` already knows
+Greenhouse's three host forms and its one case-foldable path. A second parser in SQLite string
+functions would agree with it until it didn't, and the failure mode of that divergence is a
+sighting tagged to a board that does not exist. The generator is
+`src/internships/scope_backfill.rs`, committed, with its invocation in
+`INTERNSHIP_SCRAPING.md` § D.4.
+
+**The measurement, which is what decided it.**
+
+| | |
+|---|---|
+| greenhouse sightings | 254 |
+| taggable | **253**, across 82 boards |
+| skipped | 1 — `ats_identity` returns the pseudo-slug `gh_jid` for a job known only by a query-parameter id on a company's own careers page. Not a board, never polled |
+| would be tagged with a slug the directory does not carry | **0** — so no row is made worse off than leaving it untagged |
+| sightings on unscoped sources | 2,087 (1,310 ATS-shaped), none touched |
+
+The one number that could have said "don't do this" was the fourth, and it came back zero.
+Greenhouse's 485 directory slugs are, as it happens, all lowercase, so `ats_identity`'s
+case-folding of that one host — which would have been a live hazard for SmartRecruiters, where
+121 of 122 slugs are mixed-case — costs nothing here.
+
+### The prediction, written before the migration was applied, and all six clauses held
+
+| | prediction | result |
+|---|---|---|
+| 1 | the five known-dead sightings advance by exactly 1: 2→3, 3→4, 3→4, 7→8, 7→8 | ✅ exactly |
+| 2 | the 37 live sightings on those boards reset to 0 | ✅ (42 rows on polled boards hold 27 misses, all of it the five) |
+| 3 | boards 101–485 untouched: 39 misses before and after | ✅ |
+| 4 | the `gh_jid` row stays NULL | ✅ 253 tagged, 1 untagged |
+| 5 | `swept_vanished = 1`, and it is Astranis "Avionics Engineer Intern" — its only sighting, greenhouse at 2, reaching the threshold of 3 | ✅ expired `vanished_from_sources` |
+| 6 | Astranis "Software Engineer Intern, Fall" does **not** expire, because vanshb03 still lists it at 0 misses | ✅ |
+
+Clause 6 is the sweep's all-sightings rule working on live data: a posting gone from Greenhouse
+and still carried by another source stays live, which is the behaviour `expiry.rs` claims and had
+never been observed doing anything.
+
+**The honest scale of what 12k buys.** Of the five sightings the backfill reaches on these
+boards, three were already expired and one is protected by another source. Exactly one posting
+expired. The backfill's value is not this run — it is that 253 sightings now advance whenever
+their own board is read cleanly, instead of waiting for the fully-successful Greenhouse run that
+12i established will essentially never happen.
+
+**It narrows nothing.** On a fully successful run an untagged sighting advances because the
+source was completely enumerated, and a tagged one advances because its board is in the completed
+set — and on such a run every board is. `a_tagged_and_an_untagged_sighting_advance_together_on_a_full_run`
+pins that rather than leaving it as an argument.
 
 ### 12j, commit 2 — migration `0027`, and every reference checked rather than assumed
 

@@ -43,6 +43,7 @@ pub mod normalize;
 pub mod prestige;
 pub mod orphans;
 pub mod rekey;
+pub mod scope_backfill;
 pub mod rank;
 pub mod sources;
 pub mod store;
