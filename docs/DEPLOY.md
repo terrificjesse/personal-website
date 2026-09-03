@@ -335,6 +335,50 @@ never the part the proxy broke.
 
 ---
 
+## Rehearsed locally, 2026-09-03 — six steps of eleven
+
+Everything below was run on a development Mac against the real artifacts in `deploy/`. It is
+not a substitute for the host, and the second list says exactly what it could not touch.
+
+| Step | Result |
+|---|---|
+| `cargo build --release` | **Passes.** 9.2 s compile, 17 MB binary. It had never been run against this tree — the previous release binary predated migrations 0026–0031 and 25 other changed files |
+| Frontend production build | **Passes**, `npm ci` and `next build` exactly as step 7 writes them. `NEXT_PUBLIC_FRIDGE_API_URL` is genuinely compiled into the client bundle — grepped for and found, not assumed |
+| Restore drill | **Passes.** Byte-faithful against the backup it came from, and every table added since the drill was last recorded is present: `application_events`, `application_deadlines`, `resume_variants`, `source_run_scopes` |
+| Preflight, *succeeding* | **Passes** — `looks deployable`, exit 0. Every previous run of it had been a run that refused, so its success condition had never actually been observed |
+| Unit file paths | **6 of 6 resolve** against this repo at the same relative path, so the only variable on the host is the `/opt/personal-website` prefix |
+| Caddyfile routing | **Correct.** `handle_path /api/*` strips the prefix, which is what `apiClient::apiBase()` expects when the env var points at `…/api`. Syntax **not** validated — `caddy` is not installed here |
+
+### Two stale claims it found, both in what you would read before going live
+
+**`deploy/Caddyfile` said the rate limiter shares one IP bucket behind the proxy**, and that its
+`header_up` lines were "set for the day the backend learns to trust one hop". That day was
+2026-09-02. `rate_limit.rs:client_ip` trusts the last hop when the TCP peer is loopback, and
+`a_forwarded_header_is_ignored_from_a_remote_peer` pins the other half. The comment described a
+live denial-of-service vector that no longer exists, in the file an operator reads while
+installing the proxy.
+
+**`rate_limit.rs`'s own module header said the same thing**, thirty lines above the function
+documenting at length why and how the header *is* trusted. One file, contradicting itself.
+
+Both corrected. Had they been found on the host instead, the likely cost was not an outage but
+an hour spent working around a problem that had already been fixed — or, worse, deleting the two
+`header_up` lines as pointless, which would have *created* the vector the comment warned about.
+
+### What could not be rehearsed here, and is still genuinely untested
+
+- **systemd** does not run on macOS. The units are path-checked and never started.
+- **TLS and DNS**: Caddy's certificate provisioning needs the real domain to resolve.
+- **The Google OAuth round trip**, both redirect URIs.
+- **Build time and memory on a small box.** The 9.2 s above is an incremental compile on a
+  developer machine with every dependency already built and a warm npm cache. It says the code
+  compiles in release mode; it says **nothing** about the cold first build on a 2 GB VPS, and
+  the estimate in "Before you start" is still an estimate.
+- **The restore drill on the host**, with the backend stopped, which is gate 2 and remains the
+  gate.
+
+---
+
 ## The `[you]` half of 10h, in order
 
 Nothing below can be done by an agent: it needs an account, a card, DNS, or a decision.

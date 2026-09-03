@@ -13,10 +13,16 @@
 //!
 //! The state is intentionally in memory: this deployment is one process, a restart may forgive
 //! old attempts, and the user explicitly accepted an in-memory limiter for this hardening pass.
-//! It is not a distributed rate limiter. IP means the TCP peer supplied by Axum; proxy headers
-//! are not trusted, because accepting a caller-controlled `X-Forwarded-For` would make the IP
-//! limit optional. A reverse proxy therefore shares one IP bucket unless a later deployment
-//! change introduces an explicitly trusted proxy boundary.
+//! It is not a distributed rate limiter. IP means the TCP peer supplied by Axum, and a
+//! caller-controlled `X-Forwarded-For` is **not** trusted in general, because accepting one
+//! would make the IP limit optional.
+//!
+//! **There is exactly one exception, and it is the deployed case:** when the TCP peer is
+//! loopback, the header's last hop is trusted, because nothing but the proxy on this host can
+//! be that peer. See [`client_ip`] for the full reasoning and the two properties that keep it
+//! honest. Without it a reverse proxy would put every caller on the internet into one IP
+//! bucket — which this doc used to describe as the deployed reality, and which stopped being
+//! true on 2026-09-02.
 
 use std::{
     collections::{HashMap, VecDeque},

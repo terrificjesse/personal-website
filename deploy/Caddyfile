@@ -13,10 +13,18 @@ hunt.example.com {
 	# The backend, path-stripped: /api/health -> /health upstream.
 	handle_path /api/* {
 		reverse_proxy 127.0.0.1:8080 {
-			# The rate limiter reads the TCP peer and does not trust forwarded headers, so
-			# behind this proxy EVERY caller shares one IP bucket. That is a real interaction,
-			# not a formality — see docs/DEPLOY.md § The rate limiter behind a proxy before
-			# going live. These headers are set for the day the backend learns to trust one hop.
+			# These two lines are load-bearing, not boilerplate. The backend's rate limiter
+			# trusts X-Forwarded-For only when the TCP peer is loopback — which behind this
+			# proxy it always is — and takes the LAST hop. Without them every caller on the
+			# internet would share one login bucket, and an attacker could lock the real user
+			# out by exhausting it.
+			#
+			# `header_up` SETS rather than appends, so a header forged by a remote client does
+			# not survive the hop. Swapping this proxy for one that appends keeps the last-hop
+			# rule working, but check that assumption rather than inheriting it.
+			#
+			# (Until 2026-09-02 the limiter ignored the header entirely and this comment said
+			# so. See docs/DEPLOY.md § The rate limiter behind a proxy.)
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Real-IP {remote_host}
 		}
