@@ -2180,10 +2180,10 @@ reason. This week is the point of the other three.
 |---|---|---|---|---|---|---|
 | 13a | `cargo run --release -- labelset export` over everything the month accumulated | `[you]` | A | You | ⛔ | 30m |
 | 13b | Hand-label the sheet | `[you]` | — | You | ⛔ **by construction** — labels from the author of the rules measure the tuning, not the classifier | 3–4h |
-| 13c | `labelset score`; report both failure modes against **separate denominators** | `[gen]` | A | Codex | ✅ | 1h |
+| 13c | `labelset score`; report both failure modes against **separate denominators** | `[gen]` | A | ~~Codex~~ Claude Code | ⛔ needs 13b's labels | 1h |
 | 13d | Diagnose and fix; pin every real string as a test | `[gen]` | A | Claude Code | ✅ | 4–6h |
 | 13e | Set `INBOX_AUTO_APPLY_CONFIDENCE` from the measured numbers | `[you]` | — | You | ⛔ it is a risk threshold, not a parameter | 1h |
-| 13f | Regression gate: `labelset score` in CI over the sealed sets, failing on a regression | `[gen]` | A | Codex | ✅ | 3–4h |
+| 13f ✅ | Regression gate: `labelset gate` in CI, failing on a regression. Built 2026-09-03 against a **synthetic** fixture; point it at the sealed set once 13b exists | `[gen]` | A | ~~Codex~~ Claude Code | ✅ | 3–4h |
 | 13g | Write the phase up: what the real corpus caught that the tests could not | `[gen]` | C | Claude Code | ✅ | 2h |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 5h, you ≈ 5h. The lightest week for the agents and the

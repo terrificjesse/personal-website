@@ -187,6 +187,11 @@ labelset — 8b's measurement harness
   labelset score --labels <file.csv>
       Re-run the rules over the labelled rows and report how they did.
 
+  labelset gate [--update]
+      Grade the committed SYNTHETIC fixture and fail if any failure mode regressed.
+      Needs no database. --update prints a fresh baseline instead of checking one.
+      This grades the harness, not the classifier — see the module docs.
+
 Labels: confirmation, oa, interview, offer, rejection, outreach, disregarded
 ";
 
@@ -210,6 +215,7 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
             )
             .await
         }
+        "gate" => gate(args.iter().any(|a| a == "--update")),
         "score" => {
             let labels = flag(args, "--labels")
                 .ok_or_else(|| anyhow::anyhow!("score needs --labels <file.csv>"))?;
@@ -377,6 +383,157 @@ fn report(title: &str, s: &Summary) {
 }
 
 /// Grade the rules against a filled-in labelling sheet.
+/// The committed regression fixture, its company list, and the baseline it is graded against.
+///
+/// All three are `include_str!`d rather than read from disk so `gate` cannot silently grade a
+/// different set than the one in the repository — which is the whole failure a regression gate
+/// is supposed to prevent, arriving through the gate itself.
+const FIXTURE_SET: &str = include_str!("../../data/inbox/regression-set.csv");
+const FIXTURE_COMPANIES: &str = include_str!("../../data/inbox/regression-companies.txt");
+const FIXTURE_BASELINE: &str = include_str!("../../data/inbox/regression-baseline.json");
+
+/// The counts a regression is measured against.
+///
+/// **Counts, not rates.** The fixture is fixed, so every denominator is fixed, and comparing
+/// integers avoids asking whether 8.33% and 8.34% are the same number. Rates are still printed
+/// for a human; the gate never compares them.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Baseline {
+    graded: usize,
+    agreed: usize,
+    junk_leaked_to_outreach: usize,
+    real_mail_disregarded: usize,
+    pressing_missed: usize,
+}
+
+impl Baseline {
+    fn of(summary: &Summary) -> Self {
+        Baseline {
+            graded: summary.graded,
+            agreed: summary.agreed,
+            junk_leaked_to_outreach: summary.junk_leaked_to_outreach,
+            real_mail_disregarded: summary.real_mail_disregarded,
+            pressing_missed: summary.pressing_missed,
+        }
+    }
+}
+
+/// Grade the committed fixture and refuse to pass if any failure mode got worse.
+///
+/// # What counts as a regression, given there is deliberately no single number
+///
+/// The checkpoint names two failure modes with separate denominators and refuses to average
+/// them, so this refuses to average them too. Each is compared on its own, and **any one of
+/// them worsening fails the gate** — there is no budget where a gain in one pays for a loss in
+/// the other, because they do not cost the same thing. Losing an interview is not repaid by a
+/// tidier Outreach folder.
+///
+/// `agreed` going down also fails, which catches a rewrite that moves messages between two
+/// categories that are both "not disregarded" and would otherwise show as no change at all.
+///
+/// # This fixture is SYNTHETIC and it grades the harness, not the classifier
+///
+/// Twelve invented messages written to exercise each category once. A green gate here means
+/// the rules still do what they did to these twelve strings — nothing more. It is **not** a
+/// quality signal about real mail, and reading it as one would be exactly the failure this
+/// project keeps finding: a number that looks like evidence and is not. The real measurement is
+/// 13b's hand-labelled fortnight, and when that exists this gate should be pointed at it and
+/// this fixture kept only as a fast smoke test.
+/// Every way `current` is worse than `baseline`, as sentences.
+///
+/// Pure, so the failing direction can be tested without editing the committed baseline — a gate
+/// nobody has watched go red is a gate nobody knows the failing behaviour of, which is the
+/// defect this whole file exists to measure.
+fn regressions(current: &Baseline, baseline: &Baseline) -> Vec<String> {
+    let mut worse = Vec::new();
+    if current.graded != baseline.graded {
+        worse.push(format!(
+            "the fixture changed size: {} rows, baseline {}. Re-baseline deliberately with \
+             `labelset gate --update`, never as a reflex",
+            current.graded, baseline.graded
+        ));
+    }
+    if current.agreed < baseline.agreed {
+        worse.push(format!(
+            "agreement fell: {} of {}, baseline {}",
+            current.agreed, current.graded, baseline.agreed
+        ));
+    }
+    // Each on its own, and any one of them failing the gate. There is no budget where a gain in
+    // one pays for a loss in another: a tidier Outreach folder does not repay a lost interview.
+    for (name, now, was) in [
+        ("junk leaked to Outreach", current.junk_leaked_to_outreach, baseline.junk_leaked_to_outreach),
+        ("REAL MAIL DISREGARDED", current.real_mail_disregarded, baseline.real_mail_disregarded),
+        ("pressing mail missed", current.pressing_missed, baseline.pressing_missed),
+    ] {
+        if now > was {
+            worse.push(format!("{name} rose: {now}, baseline {was}"));
+        }
+    }
+    worse
+}
+
+fn gate(update: bool) -> Result<()> {
+    let companies: Vec<String> = FIXTURE_COMPANIES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let context = classify::Context { known_companies: &companies };
+
+    let mut reader = csv::Reader::from_reader(FIXTURE_SET.as_bytes());
+    let mut graded: Vec<(Category, Category)> = Vec::new();
+    for row in reader.deserialize() {
+        let row: Row = row?;
+        let truth = parse_label(&row.label).ok_or_else(|| {
+            anyhow::anyhow!("fixture row {} has an unknown label {:?}", row.gmail_message_id, row.label)
+        })?;
+        let verdict = classify::classify(
+            Some(&row.from),
+            Some(&row.subject),
+            Some(&row.snippet),
+            &context,
+        );
+        if truth != verdict.category {
+            // Named, not counted. A gate that says "one regression" without saying which row
+            // sends the reader to diff two integers.
+            println!(
+                "  disagrees: {} — labelled {}, classified {} :: {}",
+                row.gmail_message_id,
+                truth.as_str(),
+                verdict.category.as_str(),
+                row.subject
+            );
+        }
+        graded.push((truth, verdict.category));
+    }
+
+    let summary = summarize(&graded);
+    let current = Baseline::of(&summary);
+
+    if update {
+        let json = serde_json::to_string_pretty(&current)?;
+        println!("{json}");
+        println!("\n-- paste into data/inbox/regression-baseline.json --");
+        return Ok(());
+    }
+
+    let baseline: Baseline = serde_json::from_str(FIXTURE_BASELINE)?;
+    report("labelset gate — SYNTHETIC fixture", &summary);
+
+    let worse = regressions(&current, &baseline);
+
+    if worse.is_empty() {
+        println!("\ngate: no failure mode regressed against the committed baseline");
+        return Ok(());
+    }
+    for line in &worse {
+        eprintln!("gate: {line}");
+    }
+    bail!("{} regression(s) against data/inbox/regression-baseline.json", worse.len())
+}
+
 async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
     let mut reader = csv::Reader::from_path(labels)?;
     let mut rows: Vec<Row> = Vec::new();
@@ -528,6 +685,57 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
     println!("Change the rules after reading this and these messages become in-sample.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn base() -> Baseline {
+        Baseline { graded: 12, agreed: 11, junk_leaked_to_outreach: 0, real_mail_disregarded: 1, pressing_missed: 0 }
+    }
+
+    #[test]
+    fn the_committed_fixture_passes_its_committed_baseline() {
+        gate(false).expect("the fixture and its baseline must agree in the repository");
+    }
+
+    #[test]
+    fn every_failure_mode_fails_the_gate_on_its_own() {
+        // No budget between them: each one worsening is a failure by itself.
+        for mutate in [
+            |b: &mut Baseline| b.junk_leaked_to_outreach += 1,
+            |b: &mut Baseline| b.real_mail_disregarded += 1,
+            |b: &mut Baseline| b.pressing_missed += 1,
+        ] {
+            let mut current = base();
+            mutate(&mut current);
+            assert_eq!(regressions(&current, &base()).len(), 1, "{current:?}");
+        }
+    }
+
+    #[test]
+    fn a_gain_in_one_mode_does_not_pay_for_a_loss_in_another() {
+        // The averaging this file refuses to do, expressed as a test: fewer leaks AND more
+        // disregarded real mail is still a failure.
+        let current = Baseline { junk_leaked_to_outreach: 0, real_mail_disregarded: 2, ..base() };
+        let baseline = Baseline { junk_leaked_to_outreach: 3, ..base() };
+        assert!(!regressions(&current, &baseline).is_empty());
+    }
+
+    #[test]
+    fn a_smaller_fixture_fails_rather_than_flattering_the_rates() {
+        // Deleting the rows a change breaks is the easiest way to make a gate green.
+        let current = Baseline { graded: 11, agreed: 11, ..base() };
+        let worse = regressions(&current, &base());
+        assert!(worse.iter().any(|w| w.contains("changed size")), "{worse:?}");
+    }
+
+    #[test]
+    fn improving_passes() {
+        let current = Baseline { agreed: 12, real_mail_disregarded: 0, ..base() };
+        assert!(regressions(&current, &base()).is_empty());
+    }
 }
 
 #[cfg(test)]
