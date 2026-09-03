@@ -204,13 +204,29 @@ agent's copy is a rule the other agent will violate while being helpful.
 Lane C is written by whoever finishes first; it is never a *concurrent* lane, because two
 agents appending to `docs/PLAN.md` at once conflict on every line of it.
 
-**3. Migration numbers are reserved, not discovered.** Lane A owns `0021–0029`. An agent that
-picks the next free number by looking at the directory will pick the same one as the agent in
-the other worktree, and the conflict surfaces at `sqlx migrate run`, not at merge.
+**3. Migration numbers are reserved, not discovered.** An agent that picks the next free number
+by looking at the directory will pick the same one as the agent in the other worktree, and the
+conflict surfaces at `sqlx migrate run`, not at merge.
 
-**That range is now exhausted — `0029` was taken on 2026-09-03.** Reserve the next one before
-either agent writes another migration; picking `0030` because it looks free is precisely the
-failure this rule exists to prevent.
+| Block | Reserved for | Status |
+|---|---|---|
+| `0021–0029` | Lane A | **exhausted** — `0029` taken 2026-09-03 |
+| `0030–0059` | **Claude Code** | in use |
+| `0060–0089` | **Codex** | free |
+| `0090+` | unreserved | claim a block here before using one |
+
+**Reserved per agent, not per lane, since 2026-09-03.** The original scheme gave the block to
+Lane A, which stopped working the moment both agents started doing backend work: two agents
+inside one reserved block collide exactly as if there were no rule. The unit of reservation has
+to be whoever is holding the pen.
+
+**Exhaustion has a protocol, because the first block ran out with none.** When your block is
+down to its **last two numbers**, reserve the next one *in this file* before you spend them.
+Discovering there is no free number in the middle of writing a migration is what happened on
+2026-09-03, and it blocked the work rather than the other way round.
+
+Whatever the table says, the rule underneath it does not change: **never pick a number because
+it looks free.**
 
 **4. Cross-seam work is contract-first.** The backend↔client seam is in two languages and
 invisible to both compilers — it is what `f17d983` spent a whole commit closing by hand. A
