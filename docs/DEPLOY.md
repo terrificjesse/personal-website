@@ -84,7 +84,8 @@ Ordered. The two gates are marked and are not optional.
    ```
    It refuses on: `COOKIE_SECURE` not on, a wildcard or still-localhost `ALLOWED_ORIGINS`, a
    relative `DATABASE_URL` or one inside a checkout, half-configured Google credentials, an
-   unparseable sync interval, and an unset `INBOX_APPLY_LABELS` (task 10k — see below).
+   unparseable sync interval, and an unset `INBOX_APPLY_LABELS` (decided ON — see below; the
+   check remains so the value is never inherited).
 7. Build both halves:
    ```bash
    cargo build --release --manifest-path apps/fridge-app/backend/Cargo.toml
@@ -219,18 +220,27 @@ the exposure is larger.
 **Recommended:** keep no expiry, and mint exactly one token, labelled with the machine. Revoke
 and re-mint when that machine changes. Revisit only if a second device ever needs one.
 
-### `INBOX_APPLY_LABELS` defaults to ON — this is task 10k
+### `INBOX_APPLY_LABELS` — decided 2026-09-03: **ON**
 
-`labelling_enabled()` returns true unless the variable is `false`/`0`. The code's reasoning is
-recorded and is not unreasonable: the `gmail.modify` scope withholds permanent delete and send,
-`labels.rs` never removes a label, never archives, and never touches a disregarded message. But
-`docs/PLAN.md` § Phase 9 said label writes were *held* until 8b met a real corpus, and 8b's
-checkpoint is still unmet.
+**Task 10k is closed. The value is `true`, and `deploy/env.production.example` ships it that
+way.** The owner made the call: the agent writes labels into the real mailbox from the first
+deploy, rather than waiting for the classifier to be graded.
 
-**Recommended: `INBOX_APPLY_LABELS=false` for the first fortnight.** That is exactly the window
-Phase 13 needs the mail for, and classification does not need write access to be measured — the
-verdicts are stored either way. Turn it on after 13c grades the corpus. The preflight refuses to
-start without an explicit value, so this gets decided rather than inherited.
+What that buys and what it costs, recorded so the decision is legible later:
+
+- **It is reversible in the place it happens.** A wrong label is visible in Gmail and removable
+  by hand. `labels.rs` never removes a label, never archives, and never touches a disregarded
+  message, and the `gmail.modify` scope withholds permanent delete and send entirely.
+- **Expect some wrong labels.** 8b's checkpoint is still unmet, so the classifier's accuracy is
+  genuinely unmeasured until 13c grades the corpus. Labels applied before then are a guess being
+  written down, and the mail this happens to is the same mail Phase 13 will be labelled from —
+  which is fine, because 13b labels from **stored verdicts and raw mail, not from Gmail labels**,
+  so the measurement cannot be contaminated by the agent's own writes.
+- **The alternative would have been `false` for a fortnight**, which was the previous
+  recommendation here. It was rejected in favour of getting the tool useful immediately.
+
+The preflight still refuses to start without an explicit value. That check stays: it stops the
+setting being *inherited* by a future host, which is a different failure from being undecided.
 
 ### The Gmail refresh token now lives on a machine you do not sit in front of
 
@@ -276,7 +286,8 @@ Nothing below can be done by an agent: it needs an account, a card, DNS, or a de
 1. ~~Gate — merge `phase-10-hardening`~~ — done.
 2. **Gate — drill the restore on the host** (10i). The scripts and a dev-machine drill exist;
    what is still yours is one restore performed on the deployed host, with the backend stopped.
-3. Decide **`INBOX_APPLY_LABELS`** (task 10k). Recommended `false` for the first fortnight.
+3. ~~Decide **`INBOX_APPLY_LABELS`**~~ — decided 2026-09-03: **ON**, and the example env file
+   ships `true`. Nothing to do but keep the explicit value when you fill in the real file.
 4. Decide the **`moz-extension://`** posture: pin the UUID, or put the host behind a VPN.
 5. Buy/choose the host and point DNS at it. Caddy provisions the certificate on first start,
    which requires the DNS record to already resolve.

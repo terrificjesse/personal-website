@@ -116,7 +116,7 @@ if [[ "$interval" != "0" ]]; then
   set_and_nonempty GMAIL_REDIRECT_URI || problems+=("GMAIL_REDIRECT_URI is unset while the inbox sync is enabled")
   case "$(get INBOX_APPLY_LABELS)" in
     true|false|0|1) ;;
-    *) problems+=("INBOX_APPLY_LABELS must be set explicitly (it defaults to ON) — this is task 10k") ;;
+    *) problems+=("INBOX_APPLY_LABELS must be set explicitly (it defaults to ON). Task 10k decided ON on 2026-09-03; this check stops the value being inherited rather than chosen") ;;
   esac
 fi
 

@@ -35,7 +35,7 @@ edited.
 | Extension auth — `hunt_tokens` bearer, minted from the site | ✅ migration `0015` |
 | Email producer — OA / interview / offer mail | ✅ 8d (`95f0443`), same table, gated on `is_pressing()` |
 | Gmail OAuth, sync, classify, match | ✅ 8a–8b (`afe7c8c`), rules layer; **classifier checkpoint unmet** |
-| Gmail label writes | ✅ 8c (`f911f46`) — **on by default**, `INBOX_APPLY_LABELS=false` opts out |
+| Gmail label writes | ✅ 8c (`f911f46`) — **on by default**, `INBOX_APPLY_LABELS=false` opts out. Decided ON for the deploy, 2026-09-03 (task 10k) |
 | Status proposals — every email-driven change is reviewable | ✅ 8c (`c976955`), `status_proposals` |
 | Auto-apply above a confidence threshold | ◐ built, **off by default** — no threshold set until 13e |
 | Unattended sync on an interval | ✅ Phase 9 (`c001445`), `INBOX_SYNC_INTERVAL_SECS`, `0` disables |

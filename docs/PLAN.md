@@ -1000,7 +1000,9 @@ reasoning is recorded and is not unreasonable: a wrong label is visible and remo
 and the granted scope withholds delete and send, so the one irreversible-feeling thing is not
 irreversible. But the plan said *held*, the code says *on*, and nobody reconciled the two —
 which is worth noticing now rather than after the agent has been labelling a real mailbox
-unattended for a week. **10k makes it an explicit decision.**
+unattended for a week. **10k made it an explicit decision, and on 2026-09-03 the owner decided
+ON.** The plan's "held" language above is superseded: label writing is deliberate, not
+inherited, and `deploy/env.production.example` ships `INBOX_APPLY_LABELS=true`.
 
 One defect found while reconciling: `InboxPanel.tsx:172` renders the email **subject** under
 the label `from:`. Cosmetic in isolation — but the panel exists so you can check a proposal
@@ -1066,7 +1068,7 @@ tool running unattended on a host that stays up.
 | 10h ◐ | Deploy: host, HTTPS, `COOKIE_SECURE=1`, service unit, restart-on-boot, `.env` off the repo | `[gen]`+`[you]` | A | You + either | ⛔ secrets, DNS and the host account are yours; the unit files and scripts are not | 8–12h |
 | 10i ✅ | `fridge.db` backup on a schedule, and a **restore drill** that actually restores | `[gen]` | A | Codex | ✅ | 2h |
 | 10j ✅ | Rate limit `POST /auth/login` (and `/reviews`) — Argon2 with no throttle is a cheap DoS | `[gen]` | A | Codex | ✅ | 2h |
-| 10k ⬜ | **Decide `INBOX_APPLY_LABELS` before the host goes unattended**, and make `PLAN.md` and the code agree either way | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
+| 10k ✅ | **Decide `INBOX_APPLY_LABELS` before the host goes unattended** — decided ON, 2026-09-03 | `[you]` | C | You | ⛔ it is a write-access call on a real mailbox | 30m |
 
 **Board corrected 2026-09-03.** 10d and 10f were still marked not-started and had both
 shipped — `migrations/0021_create_application_events.sql` exists, and `verify_invariant` plus
@@ -1786,7 +1788,7 @@ nominally: it was shipped API-only, and Codex's panel is what made it reachable.
 hand-labels it, and 13c through 13g all read those labels. Nothing an agent can start.
 
 The other standing blockers are unchanged: deploy waits on the host, DNS, the Google OAuth
-client, the `INBOX_APPLY_LABELS` decision and a restore drill. And expiry needs two more
+client and a restore drill. And expiry needs two more
 uncapped runs before `swept_vanished` means anything at scale — 12c was the first of three, and
 0026–0028 change what the second one can conclude.
 
