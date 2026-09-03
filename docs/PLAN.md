@@ -1310,6 +1310,8 @@ that is actually about *you* rather than about the market.
 | 12n ✅ | The first production expiry, reconstructed from a backup; migration `0031` closes the inbox accounting | `[gen]` | A | Claude Code | ✅ | 3h |
 | 12o ✅ | Rehearse the deploy locally — six of eleven steps — and correct two stale claims about the rate limiter | `[gen]` | A | Claude Code | ✅ | 2h |
 | 12p ✅ | Consolidate; review Codex's `verify` fix; **name the deploy branch**, which `main` did not contain | `[gen]` | C | Claude Code | ✅ | 2h |
+| 12q ✅ | Amend the two-agent rules for one agent; self-review sixteen commits; the 13f regression gate | `[gen]` | C+A | Claude Code | ✅ | 4h |
+| 12r ✅ | Scoped expiry for **Lever and Ashby**; migration `0032` makes a 404'd board legible after the run that found it | `[gen]` | A | Claude Code | ✅ | 4h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.
@@ -1728,6 +1730,108 @@ It cannot find what the author did not think to look for, which is precisely the
 existed to cover. Everything above tests claims the author already made. A second reader would
 have brought different questions, and the sixteen commits have not had one — the user is now the
 only reader who did not write the code.
+
+### 12r — the other two board sources, and a finding that stopped dying with its log line
+
+Two halves, both of which existed because a fix was applied to one instance of a problem and not
+to its siblings.
+
+#### Lever and Ashby had the defect 12i removed from Greenhouse
+
+Measured before touching anything, over the whole recorded history in `fridge.db`:
+
+| source | `partial` runs | of those, runs that could still expire |
+|---|---|---|
+| Greenhouse | 9 | 1 — the one run since `0026` landed |
+| Lever | 4 | 0 |
+| Ashby | 4 | 0 |
+
+`source_run_scopes` held 970 rows and every one of them was Greenhouse; `lever.rs` and `ashby.rs`
+contained no reference to `ScopeRun` at all. Lever is 157 boards under one source name and Ashby
+is 297, so one unreachable board out of either made the whole source `partial` and threw away
+156 or 296 complete enumerations — the exact defect 12i wrote four hours of analysis about and
+fixed for one source.
+
+**The backend half needed no change, which is 12i's claim finally tested rather than asserted.**
+`settle_source_run` already branched on `scopes.is_empty()` and already wrote scope rows for
+whatever source reported them. What each adapter needed was its own half and nothing else.
+
+Ashby is Greenhouse's shape and got Greenhouse's treatment. Lever pages, so its board read has
+four ways to end, and a scope push at each of four `continue 'boards` sites is a defect waiting
+for a fifth to be added. Its read is now a function returning a `BoardRead`, so the verdict is
+the return value and the compiler asks for it.
+
+**No backfill migration, and that is measured rather than assumed** — the interesting decision in
+this task, because the obvious move was to copy `0028`. Greenhouse needed `0028` because it is
+`partial` on about half its runs, so its untagged sightings were genuinely frozen. Lever succeeds
+on 17 of 21 runs and Ashby on 15 of 19, and on a `success` run the scoped path advances untagged
+sightings *exactly* as the unscoped path did — `source_fully_enumerated()` is the branch that
+says so. Their 240 untagged sightings split into 205 at zero misses (live, tagged by the next
+successful run) and 34 at or past the threshold, of which **31 belong to postings that are
+already expired** and 3 are held alive by a live sighting on another source, which no scope tag
+can override. A backfill would have changed the fate of zero rows.
+
+#### The 404 that could not survive its own run
+
+Every run printed `internships: N board(s) 404'd and should be retired: …` and **nothing
+consumed it**. The database could not hold the fact: `0026` records a 404'd board as a
+`completed` scope with zero postings — correct, and the reason scoped expiry works — which makes
+a deleted board and a board with zero internships the same row. The scraping rule that a source
+silently returning zero must be distinguishable from one that genuinely had zero held at the
+source level and was violated one level down.
+
+Migration `0032` adds `source_run_scopes.gone`. A flag beside `outcome`, not a third
+`ScopeOutcome`: every expiry decision keys off `outcome = 'completed'`, so a new enum value
+would have silently removed 404'd boards from expiry, which is the opposite of what `0026` was
+built to do. A `CHECK` enforces that `gone` implies `completed`, because a failed read proves
+nothing.
+
+**The first run under `0032` immediately showed why a log line was not enough.** 939 scope rows,
+of which **37 were `gone`: 22 Greenhouse, 13 Ashby, 2 Lever.** The six-slug Greenhouse list that
+had been printing for days came from a *capped* 100-board run. Uncapped there are 22, and nothing
+in the log said which kind of run you were reading — the finding's completeness depended silently
+on the board budget. Ashby's 13 dead orgs had never appeared anywhere at all, because Ashby
+reported no scopes and its `println!` only ran when someone was watching stdout.
+
+#### What 12r deliberately did not do
+
+**It did not retire a single slug.** Pruning one from `board-slugs.json` makes every posting on it
+stop advancing, so retiring a live board by mistake costs invisible lingering rows; and a 404 can
+be a deploy, a rename in flight, or a CDN with an opinion. Retiring 37 slugs on one observation
+is precisely the error `92ef2f4` retracted a day earlier, with a data file as the blast radius
+instead of a doc.
+
+So `boards retire` reports and does not act: three consecutive `gone` verdicts for the same scope
+with no answer in between, a window of one refused rather than answered, and an explicit
+statement of how far from full the window is. Against live data it currently says
+
+```
+boards retire: ashby — 1 run(s) able to record a 404; 3 needed for a verdict
+boards retire: greenhouse — 1 run(s) able to record a 404; 3 needed for a verdict
+boards retire: lever — 1 run(s) able to record a 404; 3 needed for a verdict
+boards retire: no slug has 404'd on 3 consecutive verdicts.
+```
+
+which is the honest answer and not the satisfying one. **The answer arrives on the third run**
+— roughly two days at the current cadence — and it will name candidates from evidence rather
+than from one afternoon.
+
+#### One stale claim corrected on the way
+
+`expiry.rs`'s module doc said "Greenhouse is partial nearly always". It is `partial` on 9 of 17
+runs. This is the same single-observation inference `92ef2f4` retracted — *fifteen lines below
+the retraction, in the same file* — and it survived that pass because the pass grepped for the
+number, not for the claim. Worth remembering as a method: correcting a number does not correct
+the sentences that were written from it.
+
+#### Verification
+
+Self-review, not a rule-7 review; there is one agent. Checked against artifacts rather than
+argument: every table above is a query against `fridge.db`, `0032` was applied to the live
+database after a snapshot (`scratchpad/fridge-pre-0032.db`, version 31 → 32,
+`integrity_check ok`) with the column and its `CHECK` confirmed by `PRAGMA`, and the whole thing
+was watched through a real uncapped collection run rather than inferred from tests — all three
+board sources `success`, 939 scopes, 0 failed, 37 gone. 898 tests, clippy 37.
 
 ### 12p — the deploy had no branch, and `main` had nothing
 

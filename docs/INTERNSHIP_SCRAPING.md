@@ -690,7 +690,8 @@ answerable per scope instead of per source.
 | source | scope | why |
 |---|---|---|
 | Greenhouse | the board slug | Whole board in one request, no pagination, so "this board was completely read" is unambiguous. 485 of them under one source name. |
-| Lever, Ashby | *none yet* | Also multi-board and the obvious next candidates. The mechanism is source-agnostic; only the adapter half is missing. Deliberately not done in the same change. |
+| Lever | the board slug | 157 of them. Added 12r. Unlike the other two it pages, so only a *short page* — a verifiable end of board — makes a scope complete; a spent page budget is `failed`. |
+| Ashby | the org slug | 297 of them. Added 12r. Same shape as Greenhouse: whole board in one request, no pagination. |
 | Simplify, vanshb03, WeWorkRemotely | *none, and none needed* | One endpoint each. A scope would be the whole source. |
 | LinkedIn, Indeed, Handshake | *none* | Never enumerate at all — see A.4. |
 
@@ -710,6 +711,65 @@ Three properties worth knowing before touching this:
 
 `expiry.rs`'s module doc carries the soundness analysis, including the single narrow case where
 scoped expiry can over-expire where the source-level rule would not.
+
+**All three board sources report scopes as of 12r (2026-09-03).** 12i built the mechanism and
+wired one source to it; 12r wired the other two, and each needed only its adapter half, which is
+the test of "source-agnostic" that 12i could only assert. Measured before the change, over the
+whole recorded history:
+
+| source | `partial` runs | of those, runs that could still expire |
+|---|---|---|
+| Greenhouse | 9 | 1 — the one run since 0026 landed |
+| Lever | 4 | 0 |
+| Ashby | 4 | 0 |
+
+**No backfill migration for Lever or Ashby, and that was measured rather than assumed.**
+Greenhouse needed `0028` because it is `partial` on about half its runs, so its untagged
+sightings were frozen. These two are not: Lever succeeds on 17 of 21 runs and Ashby on 15 of 19,
+and on a `success` run the scoped path advances untagged sightings exactly as the unscoped path
+did. Their 240 untagged sightings on 2026-09-03 split into 205 at zero misses (live, and tagged
+by the next successful run) and 34 at or past the threshold, of which **31 belong to postings
+that are already expired** and 3 are held alive by a live sighting on another source, which no
+scope tag can override. A backfill would have changed the fate of zero rows. Re-measure before
+reusing this argument — if either source's success rate falls, Greenhouse's case starts to
+apply.
+
+### D.5 — A board that is gone, told apart from a board that is empty (migration `0032`, 12r)
+
+Recording a 404'd board as a *completed* scope with zero postings is right for expiry and is
+what D.4 above prescribes. It is also lossy, and the loss had a symptom: every run printed
+
+```
+internships: 6 Greenhouse board(s) 404'd and should be retired: 10xgenomics,
+appliedintuition, arcellx, arine, campusopportunities, capitalrx
+```
+
+and **nothing consumed it**. The database could not hold the distinction — a deleted board and a
+board that enumerated fine with zero internships were the same row — so the finding died with
+the log line, once per run, indefinitely. The scraping rule that a source silently returning
+zero must be distinguishable from a source that genuinely had zero held at the source level and
+was violated one level down.
+
+`source_run_scopes.gone` is where it lands now. It is a flag beside `outcome`, deliberately, not
+a third `ScopeOutcome`: every expiry decision keys off `outcome = 'completed'`, so a new enum
+value would silently remove 404'd boards from expiry — the opposite of what 0026 built. A
+`CHECK` enforces the other direction, that `gone` implies `completed`, because a failed read
+proves nothing.
+
+**Retiring a slug stays a human's decision, and needs more than one 404.** Pruning a slug from
+`board-slugs.json` makes every posting on it stop advancing (see `sources::BoardDirectory`), so
+retiring a live board by mistake costs invisible lingering rows. And a 404 can be a deploy, a
+rename in flight, or a CDN with an opinion. `internships::board_retirement` therefore reports
+candidates rather than acting: three consecutive `gone` verdicts for the same scope with no
+answer in between, a window of one refused rather than answered, and — because `0032` starts the
+clock at zero — an explicit statement of how far from full the window is.
+
+```
+cargo run --release -- boards retire
+```
+
+Run it from `apps/fridge-app/backend/`. `DATABASE_URL` defaults to a *relative*
+`sqlite://fridge.db?mode=rwc`, so anywhere else silently reads an empty database.
 
 **Scopes are forward-looking, and migration `0028` is what reaches backwards.** A sighting is
 tagged when a run *sees* it, so a sighting whose job is already gone can never be tagged — and
