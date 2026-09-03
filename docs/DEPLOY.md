@@ -9,6 +9,62 @@ that only starts here. See `docs/PLAN.md` § Phases 10–13.
 
 ---
 
+## Before you start — what this actually is
+
+**One machine, three processes, one domain name.** Caddy listens on 443 and hands `/` to the
+Next.js frontend and `/api/*` to the Rust backend. SQLite is a file on that machine's disk, not
+a service. Nothing is containerised and nothing is clustered, because one person's job hunt does
+not need it.
+
+The thing you are buying is **uptime for the inbox agent**. Everything else already works on
+your laptop; what does not work on a laptop is a fortnight of continuous polling.
+
+### The shopping list
+
+| What | Why | Notes |
+|---|---|---|
+| A small Linux VPS | Somewhere that stays on | **≥ 2 GB RAM and ≥ 20 GB disk.** Not a 1 GB box: `cargo build --release` links the backend in one process and will be OOM-killed, and the Rust `target/` directory alone runs to several GB |
+| A domain name | Caddy provisions a TLS certificate against it, and Google's OAuth client demands an `https://` redirect | Any registrar. This is the only item with a lead time — DNS has to resolve *before* the first deploy |
+| A Google Cloud OAuth client | Sign-in, and the Gmail scope the inbox agent runs on | Free. Made in the Google Cloud Console |
+
+Nothing else. No managed database, no object store, no CI runner.
+
+### The order things have to happen in, and why
+
+Three of the steps are ordered by something other than preference, and getting them out of
+order costs a retry rather than data:
+
+1. **DNS resolves → then deploy.** Caddy gets its certificate on first start by answering a
+   challenge on the domain. Start it before the record propagates and it fails, backs off, and
+   you wait.
+2. **The frontend's API URL is baked in at build time.** `NEXT_PUBLIC_*` is compiled into the
+   browser bundle. Setting it in the service file after the fact does nothing — you have to
+   rebuild.
+3. **The Google redirect URIs are registered before you sign in.** Both of them, matching
+   character for character, or the round trip dies as an opaque `redirect_uri_mismatch`.
+
+### The two things that are not retryable
+
+Everything above is a retry. These two are not, and they are why the checklist has gates:
+
+- **A restore you have never rehearsed.** After the first deploy, the copy of the database on
+  that host is the only record of a hunt in progress. `ops/restore-fridge-db.sh` exists and has
+  been drilled on a dev machine; drilling it *on the host*, with the backend stopped, is the
+  gate.
+- **The first boot runs migrations that delete rows.** `0025` merges 58 duplicate groups, `0027`
+  deletes 4 orphaned postings, `0029` merges another. All three were verified against copies of
+  this database and all three are guarded — but "verified against a copy" and "run on the only
+  copy" are different sentences. Take the backup first.
+
+### Roughly how long
+
+The runbook is 8–12 hours, but it is not 8–12 hours of typing. Most of it is waiting: DNS
+propagation, a first `cargo build --release` on a small box (20–40 minutes), and then a
+deliberate 48-hour period of not touching it, which is Checkpoint 10 and also when Phase 13's
+corpus starts accumulating.
+
+---
+
 ## One origin, one host
 
 Both processes sit behind a single origin: Caddy serves the Next frontend at `/` and the Rust
