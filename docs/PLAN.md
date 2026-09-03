@@ -1678,6 +1678,57 @@ immediately before *"disappearance counters advanced for 100 of 100 scope(s)"*. 
 predated `2880651`, the commit that corrected exactly that sentence — so the stale build
 demonstrated the defect that commit was written for, on real output.
 
+### 12q — a self-review of sixteen commits, labelled as one
+
+**This is not a rule-7 review and must not be read as one.** Codex wrote none of this and
+reviewed none of it; the author checked their own work. `CLAUDE.md` rule 7 was amended the same
+day to say what that means and what it costs, because the alternative — writing "reviewed" into
+this file — would be the same kind of untrue claim as the Greenhouse rate corrected hours
+earlier.
+
+The method was chosen around the weakness. Re-reading one's own argument re-derives one's own
+conclusions and feels rigorous, so almost none of this was reading. It was checking claims
+against things that do not care who wrote them.
+
+#### What was checked, and what it found
+
+| Check | Result |
+|---|---|
+| Regenerate `0028` from its pre-migration snapshot and diff | **Identical.** 82 statements, 253 taggable rows |
+| Regenerate `0029` likewise | **Identical.** 52 statements, 47 re-keyed, 1 merged |
+| `fetched = accepted + filtered + rejected`, every source run | 0 violations |
+| `fetched = classified + already_seen`, every inbox run | 0 violations |
+| `classified = pressing + confirmation + outreach + disregarded` | 0 violations |
+| `status == fold(events)` | `2/2 covered, 0 exempt, 0 mismatches` |
+| `PRAGMA foreign_key_check` | 1 — the `status_proposals` orphan, deliberately left as the live subject for 12m's degraded-row rendering |
+| Claims naming a test | 5 found, all 5 exist |
+
+Every number asserted in a commit message was re-run and every one held: 254 greenhouse
+sightings and 663 company keys in the pre-migration snapshot; 8 of 16 greenhouse runs
+successful; 267 sightings at or past threshold with 15 live postings holding one and **none**
+unprotected; 19 companies with split signals over 130 postings; 0 orphaned posting alerts after
+`0030`; 0 scopes on unscoped sources.
+
+#### The one methodological finding
+
+**Regenerating a migration against the database it has already been applied to proves nothing,
+and looks exactly like a pass.** Run against live, both generators emit **zero statements** —
+correctly, because both are idempotent by construction (`scope IS NULL`, `canonical <>
+company_key`). An empty diff against an empty regeneration is a green result that checked
+nothing.
+
+The check only means something against a snapshot in the state the generator originally ran in.
+`fridge-20260903T002827Z.db` — 27 migrations, 0 tagged sightings — is that state for both, and
+against it both reproduce byte for byte. Anyone re-running this check needs the same snapshot;
+against a current database they will get a reassuring nothing.
+
+#### What a self-review cannot do
+
+It cannot find what the author did not think to look for, which is precisely the category rule 7
+existed to cover. Everything above tests claims the author already made. A second reader would
+have brought different questions, and the sixteen commits have not had one — the user is now the
+only reader who did not write the code.
+
 ### 12p — the deploy had no branch, and `main` had nothing
 
 Consolidation, plus the one finding that made it urgent rather than tidy.
