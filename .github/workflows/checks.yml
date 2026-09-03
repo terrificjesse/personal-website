@@ -6,9 +6,18 @@
 # what makes it a separate step here rather than one more test: its failure has to read as
 # "the classifier changed behaviour", not as "a test broke".
 #
-# The gate needs NO DATABASE and no secrets — the fixture, its company list and the baseline are
-# all compiled into the binary. That is deliberate: a gate that needs the live database cannot
-# run in CI, and a gate that reads its fixture off disk can be pointed at a different one.
+# The gate itself needs no database and no secrets — the fixture, its company list and the
+# baseline are all compiled into the binary. That is deliberate: a gate that needs the live
+# database cannot run in CI, and a gate that reads its fixture off disk can be pointed at a
+# different one.
+#
+# **Running it is not the same as the gate itself, and the difference has bitten this repo.**
+# `main.rs` initialises the pool and applies all migrations before it dispatches any
+# subcommand, so `cargo run -- labelset gate` creates and migrates a SQLite file whatever the
+# gate then does with it. In CI that is ephemeral and harmless. Locally it is the 12n trap:
+# `DATABASE_URL` defaults to a RELATIVE `sqlite://fridge.db?mode=rwc`, so running this from the
+# repo root creates an empty database there rather than reading the real one. Run it from
+# `apps/fridge-app/backend/`, which is what `working-directory` below pins.
 
 name: checks
 
