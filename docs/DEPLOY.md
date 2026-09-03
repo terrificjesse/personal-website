@@ -180,14 +180,14 @@ said "clone" and nothing else, so the branch it told you to clone did not contai
 a single artifact it installs. The clone would have succeeded and step 5 would have failed on a
 missing file, three commands into a first deploy, with nothing pointing at the cause.
 
-Two answers, both fine, and the rest of this file works under either:
+**Decided 2026-09-03: `main`.** Phases 10 through 12 were merged to it, so a plain `git clone`
+is correct, `Redeploy`'s `git pull` is right as written, and there is nothing to remember. The
+alternative — deploying a named branch, with `git clone --branch <name>` at step 4 and a matching
+`pull` in `Redeploy` — was rejected as one more thing to keep in sync for no gain.
 
-- **Merge to `main` and deploy `main`.** Step 4 is a plain `git clone`, `Redeploy`'s `git pull`
-  is right as written, and there is nothing to remember. This is the simplest option and the one
-  to take unless there is a reason not to.
-- **Deploy a named branch or tag.** Then step 4 must be
-  `git clone --branch <name> <url> /opt/personal-website`, and `Redeploy` must pull that same
-  branch rather than whatever the clone happened to track.
+**What that decision commits you to:** `main` is now the deployed branch, so work merges there
+before it is deployed, and `main` staying current is the thing that stops this trap reappearing.
+It went 87 commits stale over three weeks precisely because nothing depended on it.
 
 **Whichever you choose, the trap is the same one:** a clone takes the *default* branch, and this
 repo's default branch has been stale for the entire period the deploy has been planned. Nothing
