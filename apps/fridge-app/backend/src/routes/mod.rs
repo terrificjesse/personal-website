@@ -218,6 +218,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hunt/inbox/sync", post(inbox::sync_now))
         .route("/hunt/inbox/disconnect", post(inbox::disconnect))
         .route("/hunt/proposals", get(inbox::proposals))
+        .route("/hunt/proposals/untracked", get(inbox::untracked_proposals))
+        .route(
+            "/hunt/proposals/untracked/{id}/accept",
+            post(inbox::accept_untracked),
+        )
+        .route(
+            "/hunt/proposals/untracked/{id}/reject",
+            post(inbox::reject_untracked),
+        )
         .route("/hunt/proposals/{id}/accept", post(inbox::accept_proposal))
         .route("/hunt/proposals/{id}/reject", post(inbox::reject_proposal))
         .route(

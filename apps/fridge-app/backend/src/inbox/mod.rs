@@ -39,3 +39,4 @@ pub mod labels;
 pub mod labelset;
 pub mod oauth;
 pub mod sync;
+pub mod untracked;

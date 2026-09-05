@@ -928,6 +928,48 @@ export async function decideProposal(id: string, accept: boolean): Promise<void>
   if (!res.ok) throw new Error(`Could not record that decision (${res.status})`);
 }
 
+/**
+ * An application the mailbox implies and the tracker has never heard of.
+ *
+ * Separate from {@link StatusProposal} because it answers a different question: not "should
+ * this application move?" but "does this application exist?". On 2026-09-04 the live mailbox
+ * held 24 confirmations and 4 OA invitations against 2 tracked applications — every one of them
+ * classified correctly and then dropped, because the agent only ever advanced applications that
+ * already existed.
+ *
+ * **Accepting creates a row in your tracker.** That is why it is a click and not automatic: the
+ * classifier is unmeasured until Checkpoint 13, and a wrong application is a row you must notice
+ * before you can delete it.
+ */
+export type UntrackedProposal = {
+  id: string;
+  company_name: string;
+  /** `null` means the subject named no role. Show that, rather than inventing one. */
+  title: string | null;
+  implied_status: string;
+  from_address: string | null;
+  subject: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  /** Same meaning as on {@link StatusProposal}: broken chain, not a terse email. */
+  evidence_available: boolean;
+  created_at: string;
+};
+
+export async function listUntrackedProposals(): Promise<UntrackedProposal[]> {
+  const res = await apiFetch("/hunt/proposals/untracked");
+  if (!res.ok) throw new Error(`Could not load untracked applications (${res.status})`);
+  return res.json();
+}
+
+export async function decideUntracked(id: string, accept: boolean): Promise<void> {
+  const res = await apiFetch(
+    `/hunt/proposals/untracked/${encodeURIComponent(id)}/${accept ? "accept" : "reject"}`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error(`Could not record that decision (${res.status})`);
+}
+
 /** Whether a Gmail account is connected, and what the last sync did. */
 export type InboxStatus = {
   account: string | null;

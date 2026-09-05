@@ -31,7 +31,7 @@ use crate::internships::application_events::{self, Actor, Cause, NewApplicationE
 use crate::internships::models::ApplicationStatus;
 
 use super::classify::{self, Category};
-use super::{advance, gmail, labels, oauth};
+use super::{advance, gmail, labels, oauth, untracked};
 
 /// How many messages one pass will look at.
 ///
@@ -498,6 +498,22 @@ fn auto_apply_threshold() -> Option<f64> {
 ///
 /// Returns without writing when there is nothing to propose: no match, no implied status, or a
 /// move rule 3 forbids.
+/// The stored verdict for one Gmail message, newest first.
+///
+/// Shared by both proposal paths so "the verdict this proposal came from" has one definition.
+/// Both paths write it as a foreign key that makes their decision reversible, and two lookups
+/// that could disagree would make one of them reversible to the wrong email.
+async fn verdict_id_for(pool: &SqlitePool, gmail_message_id: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT v.id FROM email_verdicts v
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE m.gmail_message_id = ? ORDER BY v.created_at DESC LIMIT 1",
+    )
+    .bind(gmail_message_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 async fn propose_status(
     pool: &SqlitePool,
     user_id: &str,
@@ -513,9 +529,30 @@ async fn propose_status(
     let Some(application_id) =
         advance::match_application(verdict.company_guess.as_deref(), applications)
     else {
-        // Rule 8: no match is not a failure. The email is classified, stored and — if
-        // pressing — alerted regardless. It simply proposes nothing.
-        return Ok(false);
+        // Rule 8 still holds: the email is classified, stored and — if pressing — alerted
+        // regardless. But "no match" has two causes and they are not the same problem.
+        //
+        // The matcher missing an application that exists is a matcher bug, and proposing
+        // nothing is right. An application that was **never tracked** is not a bug at all, and
+        // silently proposing nothing there is how a mailbox full of confirmations produced a
+        // tracker holding two rows. So the second case asks a question instead of dropping the
+        // fact — see `untracked`, which proposes and never creates.
+        let Some(company) = verdict.company_guess.as_deref() else {
+            return Ok(false);
+        };
+        let Some(verdict_id) = verdict_id_for(pool, &message.id).await? else {
+            return Ok(false);
+        };
+        return untracked::propose(
+            pool,
+            user_id,
+            &verdict_id,
+            company,
+            untracked::title_from_subject(message.subject.as_deref()).as_deref(),
+            to_status,
+            now,
+        )
+        .await;
     };
 
     let current: Option<String> = sqlx::query_scalar(
@@ -536,15 +573,7 @@ async fn propose_status(
         return Ok(false);
     }
 
-    let verdict_id: Option<String> = sqlx::query_scalar(
-        "SELECT v.id FROM email_verdicts v
-           JOIN email_messages m ON m.id = v.message_id
-          WHERE m.gmail_message_id = ? ORDER BY v.created_at DESC LIMIT 1",
-    )
-    .bind(&message.id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(verdict_id) = verdict_id else {
+    let Some(verdict_id) = verdict_id_for(pool, &message.id).await? else {
         return Ok(false);
     };
 

@@ -500,6 +500,94 @@ drift.
 | `labels` | The **only** module that modifies a mailbox. Adds labels; never removes one (including its own), never archives, never touches a disregarded message |
 | `sync` | The pass: fetch, record, classify, count. Owns `inbox_runs`, and hosts both write decisions (`labelling_enabled`, `auto_apply_threshold`) |
 
+### Untracked applications — the contract (Phase 12s, migration `0033`)
+
+**The gap this closes, measured before it was designed.** The agent above matches mail to a row
+and proposes a transition. It has no path that *creates* a row — exactly one production code
+path inserts into `internship_applications`, the HTTP route behind "track this application" — so
+the design assumes every application is tracked at the moment it is made. On 2026-09-04 the
+live mailbox held **24 confirmations and 4 OA invitations** naming Tesla, Stripe, Adobe,
+Microsoft, Amazon, Jump Trading, Workiva and a dozen others, against **2 tracked applications**.
+Every one of those emails was classified correctly and labelled in Gmail, and then had nowhere
+to go. Running the real classifier over a copy of the mailbox:
+
+| | |
+|---|---|
+| Messages already matched to a tracked application | 5 |
+| Distinct companies recoverable | **12** |
+| Messages where no company could be guessed | 4 |
+
+Of those 12, one is `internship` — a generic word, and the exact string
+`data/internships/company-aliases.json` already lists as a **refusal**. That is the reason for
+the shape below.
+
+**It proposes; it never creates.** Accepting is a click. This is the same discipline as
+`INBOX_AUTO_APPLY_CONFIDENCE`, which is deliberately unset until Checkpoint 13 measures the
+classifier: a system that writes rows into the real tracker from an unmeasured classifier is
+guessing, and the junk `internship` row is what guessing looks like. **Auto-creation is not a
+future default that measurement unlocks** — it is out of scope, because the failure is not
+symmetric with auto-apply. A wrong status change is reversible against an application you
+recognise; a wrong application is a row you have to notice before you can delete.
+
+#### `application_proposals`
+
+A separate table rather than a nullable `application_id` on `status_proposals`. That column is
+`NOT NULL` and the queue's user scoping rides on its join to `internship_applications` —
+`fetch_proposals` says in as many words that widening it would leak other people's rows. So this
+table carries its own `user_id`.
+
+| column | meaning |
+|---|---|
+| `verdict_id` | The email that caused it. Same reversibility guarantee as `status_proposals` |
+| `company_key` | Normalized by `internships::normalize::company_key`, the same function the matcher uses. Not a third normalizer |
+| `company_name` | What to show |
+| `title` | Best effort from the subject; **`NULL` is a legal, honest answer** and the panel says "role unknown" rather than inventing one |
+| `implied_status` | `applied` \| `oa` \| `interview`. Terminal statuses are excluded by CHECK, not by convention |
+
+**`UNIQUE (user_id, company_key)`, with no `reviewed_at` in it, and that is deliberate.** Five
+Stripe confirmations must produce one proposal, not five. Rejecting means "I did not apply
+there" and must not be asked again on the next email; accepting creates the application, after
+which the ordinary matcher finds it and this path never fires for that company again. A partial
+index over unreviewed rows would re-ask a question already answered.
+
+#### Endpoints
+
+```
+GET    /hunt/proposals/untracked            -> UntrackedProposal[]
+POST   /hunt/proposals/untracked/{id}/accept -> 201, creates the application
+POST   /hunt/proposals/untracked/{id}/reject -> 204
+```
+
+```ts
+type UntrackedProposal = {
+  id: string;
+  company_name: string;
+  title: string | null;          // null = unknown, render as such
+  implied_status: "applied" | "oa" | "interview";
+  from_address: string | null;   // all four null together means the evidence
+  subject: string | null;        //   chain is broken, NOT that the mail was terse
+  evidence: string | null;
+  confidence: number | null;
+  evidence_available: boolean;   // say which of those two it is
+  created_at: string;
+};
+```
+
+`evidence_available` exists for the same reason it does on `Proposal`: 12m established that four
+nulls and a broken join look identical on screen and mean opposite things.
+
+#### What accepting writes
+
+An application with **`posting_id = NULL`** — that column is already nullable and the read path
+already treats a non-resolving posting like a null one, so this is the enrichment being absent,
+not a new state. `url` is the empty string and `snapshot_json` holds the email evidence rather
+than a posting snapshot: there is no posting to snapshot, and writing a fake one would put a
+fabricated record where the audit trail looks for a real one. `source` is `email`.
+
+It emits an `application_events` row with `from_status = NULL`, `actor = Actor::Email`, and
+`cause = Cause::EmailVerdict(verdict_id)` — creation by the agent, traceable to the message that
+caused it, per 10e's rule that every writer emits.
+
 **`inbox_runs` accounts for every fetched message, since migration `0031`.** Two invariants,
 both checked where the row is written and both queryable afterwards:
 

@@ -22,10 +22,13 @@ import { useCallback, useEffect, useState } from "react";
 import { useApiError } from "@/lib/useApiError";
 import {
   decideProposal,
+  decideUntracked,
   getInboxStatus,
   listProposals,
+  listUntrackedProposals,
   type InboxStatus,
   type StatusProposal,
+  type UntrackedProposal,
 } from "@/lib/internshipsApi";
 
 function outcomeTone(outcome: string): string {
@@ -38,17 +41,20 @@ export function InboxPanel() {
   const handleError = useApiError();
   const [status, setStatus] = useState<InboxStatus | null>(null);
   const [proposals, setProposals] = useState<StatusProposal[]>([]);
+  const [untracked, setUntracked] = useState<UntrackedProposal[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [nextStatus, nextProposals] = await Promise.all([
+      const [nextStatus, nextProposals, nextUntracked] = await Promise.all([
         getInboxStatus(),
         listProposals(),
+        listUntrackedProposals(),
       ]);
       setStatus(nextStatus);
       setProposals(nextProposals);
+      setUntracked(nextUntracked);
     } catch (err) {
       setMessage(handleError(err, "Could not load the inbox agent's state"));
     }
@@ -58,13 +64,15 @@ export function InboxPanel() {
     let cancelled = false;
     void (async () => {
       try {
-        const [nextStatus, nextProposals] = await Promise.all([
+        const [nextStatus, nextProposals, nextUntracked] = await Promise.all([
           getInboxStatus(),
           listProposals(),
+          listUntrackedProposals(),
         ]);
         if (!cancelled) {
           setStatus(nextStatus);
           setProposals(nextProposals);
+          setUntracked(nextUntracked);
         }
       } catch (err) {
         if (!cancelled) setMessage(handleError(err, "Could not load the inbox agent's state"));
@@ -89,7 +97,23 @@ export function InboxPanel() {
     }
   }
 
-  if (!status?.account && proposals.length === 0) {
+  async function decideUntrackedProposal(id: string, accept: boolean) {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await decideUntracked(id, accept);
+      await refresh();
+      // Says what actually happened. "Tracked." would be vague about which of the two
+      // outcomes occurred, and one of them created a row in the tracker.
+      setMessage(accept ? "Added to your applications." : "Not tracked.");
+    } catch (err) {
+      setMessage(handleError(err, "Could not record that decision"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!status?.account && proposals.length === 0 && untracked.length === 0) {
     // Nothing connected and nothing pending: say so in one line rather than rendering an
     // empty panel that looks broken.
     return (
@@ -209,6 +233,83 @@ export function InboxPanel() {
             </li>
           ))}
         </ul>
+      )}
+
+      {/* Applications the mailbox implies and the tracker has never heard of.
+          
+          Its own section rather than mixed into the list above, because the question is
+          different: those ask "should this application move?", these ask "does this application
+          exist?". Accepting here CREATES a row, which is a heavier action than moving one, and
+          burying it among status changes would make the two buttons look interchangeable. */}
+      {untracked.length > 0 && (
+        <div className="mt-4 border-t border-neutral-200 pt-3 dark:border-neutral-800">
+          <h3 className="text-sm font-semibold">
+            Applications found in your mail{" "}
+            <span className="font-normal text-neutral-500">({untracked.length})</span>
+          </h3>
+          <p className="mt-0.5 text-xs text-neutral-500">
+            These emails look like applications you made but never tracked. Accepting adds them
+            to your list; nothing is added on its own.
+          </p>
+
+          <ul className="mt-3 space-y-3">
+            {untracked.map((item) => (
+              <li
+                key={item.id}
+                className="border-t border-neutral-200 pt-2 text-sm dark:border-neutral-800"
+              >
+                <div>
+                  <span className="font-medium">{item.company_name}</span>{" "}
+                  {/* `null` means the subject named no role. Saying so beats inventing one,
+                      and the row can be renamed after it is created. */}
+                  <span className="text-neutral-500">
+                    — {item.title ?? <em>role not named in the email</em>}
+                  </span>
+                </div>
+                <div className="mt-0.5 text-neutral-500">
+                  would be added as{" "}
+                  <code className="rounded bg-neutral-100 px-1 dark:bg-neutral-900">
+                    {item.implied_status}
+                  </code>
+                </div>
+
+                {item.evidence_available ? (
+                  <div className="mt-1 text-xs text-neutral-500">
+                    {item.from_address && <div>from: {item.from_address}</div>}
+                    {item.subject && <div>subject: {item.subject}</div>}
+                    {item.evidence && <div>matched: {item.evidence}</div>}
+                  </div>
+                ) : (
+                  <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                    The email behind this is no longer in the database, so there is nothing to
+                    check it against.
+                  </div>
+                )}
+
+                <div className="mt-1 flex gap-2">
+                  <button
+                    type="button"
+                    className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-50 dark:border-neutral-700"
+                    onClick={() => decideUntrackedProposal(item.id, true)}
+                    disabled={busy}
+                  >
+                    Track it
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-50 dark:border-neutral-700"
+                    onClick={() => decideUntrackedProposal(item.id, false)}
+                    disabled={busy}
+                  >
+                    {/* Not "Reject": this is a claim about whether you applied, and rejecting
+                        is permanent — the same company is never asked about again. */}
+                    I didn&apos;t apply here
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </section>
   );

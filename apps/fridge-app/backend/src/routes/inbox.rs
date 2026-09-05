@@ -1037,3 +1037,305 @@ mod decide_tests {
         assert_eq!(status_of(&pool, &app_id).await, "applied");
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// Untracked-application proposals (Phase 12s, the half that creates)
+// ------------------------------------------------------------------------------------------
+
+/// An application the mailbox implies and the tracker has never heard of.
+///
+/// Deliberately a separate shape and a separate endpoint from [`Proposal`] rather than a
+/// nullable-application variant of it. The two answer different questions — "should this
+/// application move?" versus "does this application exist?" — and folding them into one array
+/// would put a null `application_id` inside the type whose user scoping depends on that column
+/// being present.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct UntrackedProposal {
+    pub id: String,
+    pub company_name: String,
+    /// `null` means the subject named no role. The panel says so rather than inventing one.
+    pub title: Option<String>,
+    pub implied_status: String,
+    pub from_address: Option<String>,
+    pub subject: Option<String>,
+    pub evidence: Option<String>,
+    pub confidence: Option<f64>,
+    /// Same meaning as on [`Proposal`], for the same reason 12m added it there: four nulls
+    /// because the mail was terse and four nulls because the join broke look identical and mean
+    /// opposite things.
+    pub evidence_available: bool,
+    pub created_at: String,
+}
+
+/// Untracked-application proposals still awaiting a decision, newest first.
+pub async fn untracked_proposals(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<Vec<UntrackedProposal>>, StatusCode> {
+    // LEFT JOIN to the evidence for the same reason `fetch_proposals` does: a proposal whose
+    // verdict or message no longer resolves must still be reviewable. Scoping is `p.user_id`
+    // here, held on the row itself, because there is no application to join through — which is
+    // exactly why this is its own table.
+    sqlx::query_as::<_, UntrackedProposal>(
+        "SELECT p.id, p.company_name, p.title, p.implied_status,
+                m.from_address, m.subject, v.evidence, v.confidence,
+                (v.id IS NOT NULL AND m.id IS NOT NULL) AS evidence_available,
+                p.created_at
+           FROM application_proposals p
+           LEFT JOIN email_verdicts v ON v.id = p.verdict_id
+           LEFT JOIN email_messages m ON m.id = v.message_id
+          WHERE p.user_id = ? AND p.reviewed_at IS NULL
+          ORDER BY p.created_at DESC",
+    )
+    .bind(&user.id)
+    .fetch_all(&pool)
+    .await
+    .map(Json)
+    .map_err(|err| {
+        eprintln!("inbox: listing untracked proposals failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Accept: create the application this email implies, and mark the proposal reviewed.
+pub async fn accept_untracked(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide_untracked(&pool, &user.id, &id, true).await
+}
+
+/// Reject: mark it reviewed and create nothing.
+///
+/// The `UNIQUE (user_id, company_key)` row stays behind on purpose — a rejection means "I did
+/// not apply there", and the next of five Stripe confirmations must not re-ask.
+pub async fn reject_untracked(
+    State(pool): State<SqlitePool>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide_untracked(&pool, &user.id, &id, false).await
+}
+
+async fn decide_untracked(
+    pool: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    accept: bool,
+) -> Result<StatusCode, StatusCode> {
+    // One transaction, for the reason `decide` gives above: a reviewed proposal whose
+    // application was never created reads as settled while nothing exists, and nothing records
+    // that the two disagree.
+    let mut tx = crate::db::begin_write(pool).await.map_err(|err| {
+        eprintln!("inbox: opening a transaction failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT company_name, title, implied_status, verdict_id
+           FROM application_proposals
+          WHERE id = ? AND user_id = ? AND reviewed_at IS NULL",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| {
+        eprintln!("inbox: reading an untracked proposal failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let Some((company_name, title, implied_status, verdict_id)) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let now = Utc::now();
+
+    if accept {
+        let Some(status) = ApplicationStatus::parse(&implied_status) else {
+            eprintln!("inbox: untracked proposal {id} holds an unparseable status");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let application_id = Uuid::new_v4().to_string();
+
+        // `posting_id` is NULL: there is no posting behind this, and that column is already
+        // nullable with a read path that treats a non-resolving posting exactly like a null
+        // one. `snapshot_json` holds the email that caused it rather than a posting snapshot —
+        // writing a fabricated posting record into the column an audit trail reads would be
+        // worse than writing the truth, which is that this came from mail.
+        let snapshot = serde_json::json!({
+            "origin": "email",
+            "verdict_id": verdict_id,
+            "company_name": company_name,
+            "title": title,
+        })
+        .to_string();
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, posting_id, company_name, title, url,
+                 source, snapshot_json, snapshot_at,
+                 status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, '', 'email', ?5, ?6, ?7, ?6, ?6, ?6, ?6)",
+        )
+        .bind(&application_id)
+        .bind(user_id)
+        .bind(&company_name)
+        .bind(title.as_deref().unwrap_or("Unknown role"))
+        .bind(&snapshot)
+        .bind(now)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await
+        {
+            eprintln!("inbox: creating an application from mail failed: {err:?}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // 10e: every writer emits. `from_status` is NULL because there was no previous state,
+        // the actor is the agent rather than the person clicking, and the cause points at the
+        // email — so the tracker can always answer "why does this row exist".
+        application_events::record(
+            &mut tx,
+            NewApplicationEvent {
+                application_id: &application_id,
+                from_status: None,
+                to_status: status,
+                actor: Actor::Email,
+                cause: Some(Cause::EmailVerdict(&verdict_id)),
+                at: now,
+                note: None,
+            },
+        )
+        .await
+        .map_err(|err| {
+            eprintln!("inbox: recording the creation event failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    if let Err(err) = sqlx::query(
+        "UPDATE application_proposals SET reviewed_at = ?3, accepted = ?4
+          WHERE id = ?1 AND user_id = ?2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(now.to_rfc3339())
+    .bind(i64::from(accept))
+    .execute(&mut *tx)
+    .await
+    {
+        eprintln!("inbox: marking an untracked proposal reviewed failed: {err:?}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    tx.commit().await.map_err(|err| {
+        eprintln!("inbox: committing an untracked decision failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(if accept { StatusCode::CREATED } else { StatusCode::NO_CONTENT })
+}
+
+#[cfg(test)]
+mod untracked_tests {
+    use super::*;
+
+    async fn seed(pool: &SqlitePool) -> String {
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES ('u1','a@b.c','2026-09-04')")
+            .execute(pool).await.expect("user");
+        sqlx::query(
+            "INSERT INTO email_messages
+                (id, user_id, gmail_message_id, gmail_thread_id, from_address, subject,
+                 received_at, created_at)
+             VALUES ('m1','u1','m1','t','no-reply@stripe.com','We received your Stripe Application',
+                     '2026-09-04T00:00:00+00:00','2026-09-04T00:00:00+00:00')",
+        ).execute(pool).await.expect("message");
+        sqlx::query(
+            "INSERT INTO email_verdicts
+                (id, message_id, category, confidence, classifier, evidence, created_at)
+             VALUES ('v1','m1','confirmation',0.8,'rules','marker','2026-09-04T00:00:00+00:00')",
+        ).execute(pool).await.expect("verdict");
+        sqlx::query(
+            "INSERT INTO application_proposals
+                (id, user_id, verdict_id, company_key, company_name, title, implied_status,
+                 created_at)
+             VALUES ('p1','u1','v1','stripe','Stripe',NULL,'applied','2026-09-04T00:00:00+00:00')",
+        ).execute(pool).await.expect("proposal");
+        "p1".to_string()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn accepting_creates_an_application_traceable_to_the_email(pool: SqlitePool) {
+        let id = seed(&pool).await;
+
+        let code = decide_untracked(&pool, "u1", &id, true).await.expect("accept");
+        assert_eq!(code, StatusCode::CREATED);
+
+        let app: (String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT company_name, status, posting_id, source FROM internship_applications",
+        ).fetch_one(&pool).await.expect("the application exists");
+        assert_eq!(app.0, "Stripe");
+        assert_eq!(app.1, "applied");
+        assert_eq!(app.2, None, "there is no posting behind an email-derived application");
+        assert_eq!(app.3, "email");
+
+        // 10e: every writer emits, and this one has to say *why the row exists*.
+        let event: (Option<String>, String, String, Option<String>) = sqlx::query_as(
+            "SELECT from_status, to_status, actor, cause_id FROM application_events",
+        ).fetch_one(&pool).await.expect("the creation event exists");
+        assert_eq!(event.0, None, "there was no previous state, and NULL says so");
+        assert_eq!(event.1, "applied");
+        assert_eq!(event.2, "email");
+        assert_eq!(event.3.as_deref(), Some("v1"), "traceable to the mail that caused it");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rejecting_creates_nothing_and_settles_the_question(pool: SqlitePool) {
+        let id = seed(&pool).await;
+
+        let code = decide_untracked(&pool, "u1", &id, false).await.expect("reject");
+        assert_eq!(code, StatusCode::NO_CONTENT);
+
+        let apps: i64 = sqlx::query_scalar("SELECT count(*) FROM internship_applications")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(apps, 0);
+
+        let reviewed: (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT reviewed_at, accepted FROM application_proposals")
+                .fetch_one(&pool).await.expect("row");
+        assert!(reviewed.0.is_some(), "and it is settled, so it leaves the queue");
+        assert_eq!(reviewed.1, Some(0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_second_accept_changes_nothing(pool: SqlitePool) {
+        // The queue is a list of buttons; a double-click must not make two applications.
+        // `reviewed_at IS NULL` in the read is what enforces it.
+        let id = seed(&pool).await;
+        assert_eq!(decide_untracked(&pool, "u1", &id, true).await.unwrap(), StatusCode::CREATED);
+        assert_eq!(
+            decide_untracked(&pool, "u1", &id, true).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+
+        let apps: i64 = sqlx::query_scalar("SELECT count(*) FROM internship_applications")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(apps, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn another_users_proposal_is_not_yours_to_accept(pool: SqlitePool) {
+        // This table carries its own `user_id` precisely because there is no application to
+        // scope through. If that scoping were dropped the row would be everyone's.
+        let id = seed(&pool).await;
+        assert_eq!(
+            decide_untracked(&pool, "u2", &id, true).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+        let apps: i64 = sqlx::query_scalar("SELECT count(*) FROM internship_applications")
+            .fetch_one(&pool).await.expect("count");
+        assert_eq!(apps, 0);
+    }
+}
