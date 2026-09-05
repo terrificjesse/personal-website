@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useApiError } from "@/lib/useApiError";
+import { UntrackedApplications } from "../UntrackedApplications";
 import {
   APPLICATION_STATUSES,
   APPLICATION_STATUS_LABELS,
@@ -57,6 +58,16 @@ export default function ApplicationsPage() {
     };
   }, [handleApiError]);
 
+  // Re-read the list after a mail-derived application is created, so it appears in place
+  // rather than only after a manual reload.
+  const reload = async () => {
+    try {
+      setApplications(await listApplications());
+    } catch (err) {
+      setError(handleApiError(err, "Couldn't load your applications."));
+    }
+  };
+
   const changeStatus = async (id: string, status: ApplicationStatus) => {
     setBusyId(id);
     try {
@@ -99,6 +110,11 @@ export default function ApplicationsPage() {
           {error}
         </p>
       )}
+
+      {/* Above the list on purpose. This queue answers "does this application exist?", which
+          is exactly the question someone reading this page is asking — and it used to live at
+          the bottom of a different route, where it was never seen. */}
+      <UntrackedApplications onAccepted={reload} />
 
       {applications === null ? (
         <p className="mt-6 text-sm text-black/60 dark:text-white/60">Loading…</p>
