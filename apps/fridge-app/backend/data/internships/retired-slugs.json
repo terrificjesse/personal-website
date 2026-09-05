@@ -1,0 +1,257 @@
+{
+ "_readme": [
+  "Board slugs deliberately removed from board-slugs.json because their list endpoint",
+  "returns a definitive 404. This file is the RECORD of that decision, and it has two jobs.",
+  "",
+  "1. It stops a re-harvest silently resurrecting them. board-slugs.json is derived from",
+  "   Simplify's listings.json by simplify::extract_board_slugs. Nothing in that pipeline",
+  "   knows a slug was retired, so without this file the next harvest re-adds all of them and",
+  "   we go back to polling dead boards forever.",
+  "",
+  "2. It keeps migration 0028 honest. 0028 tagged sightings with scopes, and",
+  "   scope_backfill's `every_slug_named_is_one_the_board_directory_actually_polls` asserts",
+  "   every slug it names is still polled -- the failure being a tag pointing at a board",
+  "   nothing fetches, which never advances again. Retiring a slug necessarily breaks that",
+  "   assertion, so the test now accepts a slug that appears HERE instead. The exception is",
+  "   explicit and reviewable rather than the assertion being weakened.",
+  "",
+  "A slug earns a place here by 404ing on RETIREMENT_RUNS consecutive verdicts with no answer",
+  "in between -- see internships::board_retirement. One 404 is not evidence; a 404 can be a",
+  "deploy, a rename in flight, or a CDN with an opinion.",
+  "",
+  "Removing a slug is not free: under scoped expiry a retired board produces no completed",
+  "scope, so any sighting still tagged to it stops advancing. Before retiring, check that",
+  "nothing live depends on it. On 2026-09-05 exactly one did -- greenhouse/glossgenius, whose",
+  "two sightings were already expired at 9 consecutive misses, so nothing was stranded."
+ ],
+ "_provenance": {
+  "retired_on": "2026-09-05",
+  "decided_by": "internships::board_retirement, 3 consecutive gone verdicts per slug",
+  "observed_over": "5 runs per source recording 404s, 2026-09-03 to 2026-09-05",
+  "sightings_stranded": 0
+ },
+ "retired": [
+  {
+   "source": "ashby",
+   "slug": "atomicsemi",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "conductorone",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "genesis-therapeutics",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "iacollaborative",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "latitude",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "lindy",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "mentis",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "mtesting.ai",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "orbitalmaterials",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "tandem",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "tuesday-lab",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "veeda-labs",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "ashby",
+   "slug": "whatnot",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:20:28.155061+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "10xgenomics",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "appliedintuition",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "arcellx",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "arine",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "campusopportunities",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "capitalrx",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "dustyrobotics",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "embed",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "fireworksai",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "forerunner",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "galileofinancialtechnologies",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "glossgenius",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "ibkr",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "iherb",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "loop",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "maintainx",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "matx",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "memphismeats",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "mqreferrals",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "optirtc",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "seamlessai",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "greenhouse",
+   "slug": "transcarent",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:38:32.647253+00:00"
+  },
+  {
+   "source": "lever",
+   "slug": "sanctuary",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:19:09.482365+00:00"
+  },
+  {
+   "source": "lever",
+   "slug": "SprinterHealth",
+   "consecutive_404s": 3,
+   "oldest_observed": "2026-09-04T19:19:09.482365+00:00"
+  }
+ ]
+}

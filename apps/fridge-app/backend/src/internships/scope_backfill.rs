@@ -126,12 +126,22 @@ mod tests {
     fn every_slug_named_is_one_the_board_directory_actually_polls() {
         // The failure this prevents: a tag pointing at a board nothing fetches, which converts
         // "advances on a fully successful run" into "never advances again".
+        //
+        // **Retirement is the one legitimate way a slug leaves the directory**, and it breaks
+        // this assertion by construction — 37 slugs were retired on 2026-09-05 and one of them,
+        // `glossgenius`, is named by 0028. The exception is a second lookup rather than a
+        // softened assertion: a slug may be absent from the directory only if
+        // `retired-slugs.json` says why, which is a file a reviewer can read. Anything else
+        // still fails, including a slug removed by accident.
+        //
+        // 0028 itself is applied and checksummed and must never be edited to match.
         let vendored = BoardDirectory::vendored();
         let known: BTreeSet<&str> = vendored
             .slugs("greenhouse")
             .iter()
             .map(String::as_str)
             .collect();
+        let retired = retired_slugs();
         for statement in statements() {
             let slug = statement
                 .split_once("scope = '")
@@ -139,10 +149,53 @@ mod tests {
                 .map(|(slug, _)| slug)
                 .expect("every statement sets a scope");
             assert!(
-                known.contains(slug),
-                "0028 names `{slug}`, which the board directory does not carry"
+                known.contains(slug) || retired.contains(slug),
+                "0028 names `{slug}`, which the board directory does not carry and \
+                 retired-slugs.json does not account for"
             );
         }
+    }
+
+    /// Slugs deliberately removed from the directory, by slug alone.
+    ///
+    /// Keyed without the source because that is how 0028's statements name them — the migration
+    /// is Greenhouse-only, so a bare slug is unambiguous there.
+    fn retired_slugs() -> BTreeSet<String> {
+        #[derive(serde::Deserialize)]
+        struct Retired {
+            retired: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            slug: String,
+        }
+        let raw = include_str!("../../data/internships/retired-slugs.json");
+        serde_json::from_str::<Retired>(raw)
+            .expect("retired-slugs.json parses")
+            .retired
+            .into_iter()
+            .map(|entry| entry.slug)
+            .collect()
+    }
+
+    #[test]
+    fn a_retired_slug_is_gone_from_the_directory_and_recorded() {
+        // Both halves, because either one alone is a bug: still polled but marked retired means
+        // the record is stale, and removed without a record means the next slug harvest quietly
+        // resurrects it — `board-slugs.json` is derived from Simplify and nothing in that
+        // pipeline knows a slug was retired.
+        let vendored = BoardDirectory::vendored();
+        for source in ["greenhouse", "ashby", "lever"] {
+            let polled: BTreeSet<&str> =
+                vendored.slugs(source).iter().map(String::as_str).collect();
+            for slug in &retired_slugs() {
+                assert!(
+                    !polled.contains(slug.as_str()),
+                    "`{slug}` is recorded as retired and is still in {source}'s polled list"
+                );
+            }
+        }
+        assert_eq!(retired_slugs().len(), 37, "the 2026-09-05 retirement");
     }
 
     #[tokio::test]

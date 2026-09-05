@@ -4,10 +4,12 @@ Vendored snapshots backing `src/internships/sources/` (Phase 7). Same pattern as
 `data/themealdb/` and `data/foodkeeper/`: fetch once, commit the snapshot, document when it was
 taken — **no live API calls at test time, and none from a request handler ever**.
 
-Two different kinds of file live here and they are not interchangeable:
+Three kinds of file live here and they are not interchangeable:
 
 - **`board-slugs.json`** is *operational data*. It is compiled into the binary with
   `include_str!` and is what the Greenhouse / Lever / Ashby adapters actually poll.
+- **`retired-slugs.json`** is the *record* of slugs deliberately removed from
+  `board-slugs.json`. Read it before regenerating that file, or the boards you retired come back.
 - **`fixtures/`** are *test data*. They exist so the whole parsing layer runs offline. A test
   suite that needs the network is a test suite that fails in CI and teaches you nothing.
 
@@ -74,8 +76,23 @@ cargo run --release -- boards retire
 ```
 
 It names only slugs whose last three verdicts were all 404 with no answer in between, and says
-how far from full that window is when it cannot answer yet. Retiring is still a hand edit to
-this file; record in the commit which runs the slug was absent on.
+how far from full that window is when it cannot answer yet.
+
+**Retiring is a hand edit to this file, and the removal is recorded in `retired-slugs.json`.**
+That record is not bookkeeping. This file is *derived* — `simplify::extract_board_slugs` rebuilds
+it from Simplify's `listings.json`, and nothing in that pipeline knows a slug was retired, so
+without the record the next harvest silently resurrects every one of them. It also keeps
+migration `0028` honest: `scope_backfill` asserts every slug 0028 names is still polled, and a
+retired slug is accepted only because the record says why.
+
+**Check what depends on a slug before removing it.** Under scoped expiry a retired board produces
+no completed scope, so any sighting still tagged to it stops advancing — forever. The query is
+`SELECT count(*) FROM posting_sightings WHERE source = ? AND scope = ?`.
+
+**First retirement: 37 slugs on 2026-09-05** — 22 Greenhouse, 13 Ashby, 2 Lever, each 404 on
+three consecutive verdicts observed across five runs from 2026-09-03. Exactly one carried
+sightings (`greenhouse/glossgenius`, two rows), and both were already expired at nine consecutive
+misses, so nothing was stranded.
 
 ### `fixtures/` — offline test data
 
