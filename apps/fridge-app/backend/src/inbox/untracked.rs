@@ -25,7 +25,7 @@
 //!
 //! See `docs/HUNT.md` § "Untracked applications" for the table and endpoint contract.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -220,6 +220,125 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
     None
 }
 
+/// What deciding a proposal did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Accepted: the application now exists, with this id.
+    Created(String),
+    /// Rejected: nothing was created, and the question is settled for that company.
+    Rejected,
+    /// No such open proposal for this user. Also what a second accept returns, which is what
+    /// makes a double-click safe.
+    NotFound,
+}
+
+/// Accept or reject one proposal.
+///
+/// **One transaction, because this is two writes.** A reviewed proposal whose application was
+/// never created reads as settled while nothing exists, and nothing anywhere records that the
+/// two disagree — the same reasoning `routes::inbox::decide` gives for status proposals.
+///
+/// Lives here rather than in the route so the HTTP handler and the CLI share it. Two
+/// implementations would be two chances for the halves to come apart.
+pub async fn decide(
+    pool: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    accept: bool,
+) -> Result<Decision> {
+    let mut tx = crate::db::begin_write(pool).await?;
+
+    let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT company_name, title, implied_status, verdict_id
+           FROM application_proposals
+          WHERE id = ? AND user_id = ? AND reviewed_at IS NULL",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((company_name, title, implied_status, verdict_id)) = row else {
+        return Ok(Decision::NotFound);
+    };
+
+    let now = Utc::now();
+    let mut created = None;
+
+    if accept {
+        let status = ApplicationStatus::parse(&implied_status)
+            .ok_or_else(|| anyhow::anyhow!("proposal {id} holds an unparseable status"))?;
+        let application_id = Uuid::new_v4().to_string();
+
+        // `posting_id` is NULL: there is no posting behind this, and that column is already
+        // nullable with a read path that treats a non-resolving posting exactly like a null
+        // one. `snapshot_json` holds the email that caused it rather than a posting snapshot —
+        // a fabricated posting record in the column an audit trail reads would be worse than
+        // the truth, which is that this came from mail.
+        let snapshot = serde_json::json!({
+            "origin": "email",
+            "verdict_id": verdict_id,
+            "company_name": company_name,
+            "title": title,
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO internship_applications
+                (id, user_id, posting_id, company_name, title, url,
+                 source, snapshot_json, snapshot_at,
+                 status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, '', 'email', ?5, ?6, ?7, ?6, ?6, ?6, ?6)",
+        )
+        .bind(&application_id)
+        .bind(user_id)
+        .bind(&company_name)
+        .bind(title.as_deref().unwrap_or("Unknown role"))
+        .bind(&snapshot)
+        .bind(now)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        // 10e: every writer emits, and this one has to say *why the row exists*.
+        crate::internships::application_events::record(
+            &mut tx,
+            crate::internships::application_events::NewApplicationEvent {
+                application_id: &application_id,
+                from_status: None,
+                to_status: status,
+                actor: crate::internships::application_events::Actor::Email,
+                cause: Some(crate::internships::application_events::Cause::EmailVerdict(
+                    &verdict_id,
+                )),
+                at: now,
+                note: None,
+            },
+        )
+        .await?;
+
+        created = Some(application_id);
+    }
+
+    sqlx::query(
+        "UPDATE application_proposals SET reviewed_at = ?3, accepted = ?4
+          WHERE id = ?1 AND user_id = ?2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(now.to_rfc3339())
+    .bind(i64::from(accept))
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(match created {
+        Some(application_id) => Decision::Created(application_id),
+        None => Decision::Rejected,
+    })
+}
+
 /// Just enough of a stored message to re-classify it.
 #[derive(sqlx::FromRow)]
 struct StoredMessage {
@@ -351,15 +470,47 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
 }
 
 const USAGE: &str = "\
-usage: inbox backfill-untracked
+usage:
+  inbox backfill-untracked        re-read stored mail and propose what it implies
+  inbox untracked                 list proposals awaiting your review
+  inbox untracked accept <company>   track it  (use `all` for every pending one)
+  inbox untracked reject <company>   record that you did not apply there
 
-Re-reads stored mail and proposes the applications it implies. Proposes only; creates nothing.
-Idempotent — running it twice proposes nothing the second time.
+Company matching is case-insensitive and matches on the normalized key, so `jump` will not
+match `jump trading` but `Jump Trading` will. Ambiguity is refused rather than guessed.
 ";
+
+/// The single user this CLI acts for.
+///
+/// Refuses rather than guesses when there is more than one: accepting a proposal creates a row
+/// in somebody's tracker, and picking the wrong somebody silently is not a recoverable mistake.
+async fn only_user(pool: &SqlitePool) -> Result<String> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM users ORDER BY created_at")
+        .fetch_all(pool)
+        .await?;
+    match ids.len() {
+        1 => Ok(ids.into_iter().next().expect("one")),
+        0 => bail!("no users exist"),
+        n => bail!("{n} users exist; this command will not guess which one. Use the web UI."),
+    }
+}
+
+async fn pending(pool: &SqlitePool, user_id: &str) -> Result<Vec<(String, String, Option<String>, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id, company_name, title, implied_status
+           FROM application_proposals
+          WHERE user_id = ? AND reviewed_at IS NULL
+          ORDER BY company_name",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?)
+}
 
 pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("backfill-untracked") if args.len() == 1 => {}
+        Some("untracked") => return untracked_cli(pool, &args[1..]).await,
         _ => {
             print!("{USAGE}");
             return Ok(());
@@ -380,6 +531,66 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
         report.already_asked,
         report.proposed,
     );
+    Ok(())
+}
+
+async fn untracked_cli(pool: &SqlitePool, args: &[String]) -> Result<()> {
+    let user_id = only_user(pool).await?;
+    let rows = pending(pool, &user_id).await?;
+
+    let (verb, target) = match args {
+        [] => {
+            if rows.is_empty() {
+                println!("Nothing awaiting review.");
+                return Ok(());
+            }
+            println!("{} proposal(s) awaiting review:\n", rows.len());
+            for (_, company, title, status) in &rows {
+                println!(
+                    "  {company:<14} {:<40} would be added as {status}",
+                    title.as_deref().unwrap_or("(role not named in the email)")
+                );
+            }
+            println!("\n  accept with: inbox untracked accept <company>   (or `all`)");
+            return Ok(());
+        }
+        [verb, target] if verb == "accept" || verb == "reject" => (verb.as_str(), target.as_str()),
+        _ => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+    };
+    let accept = verb == "accept";
+
+    // `all` is spelled out rather than implied by omitting the target: a bare `accept` that
+    // took everything would be one typo away from tracking eleven companies you meant to read
+    // first.
+    let chosen: Vec<_> = if target.eq_ignore_ascii_case("all") {
+        rows.clone()
+    } else {
+        let wanted = company_key(target);
+        rows.iter()
+            .filter(|(_, company, _, _)| company_key(company) == wanted)
+            .cloned()
+            .collect()
+    };
+
+    if chosen.is_empty() {
+        bail!(
+            "no pending proposal matches {target:?}. Run `inbox untracked` to see the list."
+        );
+    }
+
+    for (id, company, _, status) in &chosen {
+        match decide(pool, &user_id, id, accept).await? {
+            Decision::Created(app_id) => {
+                println!("tracked   {company} as {status}  ({app_id})");
+            }
+            Decision::Rejected => println!("not mine  {company}"),
+            // Only reachable if something reviewed it between the list and the loop.
+            Decision::NotFound => println!("skipped   {company} — already reviewed"),
+        }
+    }
     Ok(())
 }
 

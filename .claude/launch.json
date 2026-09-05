@@ -1,4 +1,25 @@
 {
+  "_comment": [
+    "Both ports are fixed, and neither may be reassigned. `autoPort: true` looks harmless and",
+    "is not: on this project a moved port fails silently rather than loudly.",
+    "",
+    "BACKEND, port 8080 — three independent reasons:",
+    "  1. `BACKEND_PORT = 8080` is a hardcoded constant in frontend/src/lib/apiClient.ts:16.",
+    "     `apiBase()` derives the host from wherever the page was opened but always appends",
+    "     this port, so every API call goes to :8080 whatever the backend is listening on.",
+    "  2. GOOGLE_REDIRECT_URI is http://localhost:8080/auth/google/callback, and .env says",
+    "     outright that it must match the Google console entry exactly, INCLUDING THE PORT.",
+    "     A moved port cannot be fixed locally — it needs an edit in Google Cloud.",
+    "  3. InboxPanel.tsx hardcodes http://localhost:8080/auth/gmail/start.",
+    "",
+    "FRONTEND, port 3000 — CORS, and this one was `autoPort: true` until 2026-09-05:",
+    "  The backend's ALLOWED_ORIGINS and FRONTEND_ORIGIN both name localhost:3000. A frontend",
+    "  that started on 3001 would have every credentialed request rejected by the browser with",
+    "  no server error, so the whole app would read as signed-out with nothing in any log.",
+    "  Failing to start is strictly better than that.",
+    "",
+    "If a port is genuinely occupied, free it rather than reassigning it."
+  ],
   "version": "0.0.1",
   "configurations": [
     {
@@ -7,14 +28,15 @@
       "runtimeArgs": ["run", "dev"],
       "cwd": "frontend",
       "port": 3000,
-      "autoPort": true
+      "autoPort": false
     },
     {
       "name": "fridge-backend",
       "runtimeExecutable": "cargo",
       "runtimeArgs": ["run"],
       "cwd": "apps/fridge-app/backend",
-      "port": 8080
+      "port": 8080,
+      "autoPort": false
     }
   ]
 }

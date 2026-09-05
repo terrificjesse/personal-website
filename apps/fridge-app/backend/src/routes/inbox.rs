@@ -26,7 +26,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::auth::GoogleOAuthConfig;
-use crate::inbox::{oauth, sync};
+use crate::inbox::{oauth, sync, untracked};
 use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 use crate::routes::auth::CurrentUser;
@@ -1118,124 +1118,26 @@ pub async fn reject_untracked(
     decide_untracked(&pool, &user.id, &id, false).await
 }
 
+/// Thin HTTP shell over [`untracked::decide`].
+///
+/// The transaction lives in `inbox::untracked` rather than here so the CLI can reuse it: a
+/// second implementation of "create the application and mark the proposal reviewed" is a second
+/// chance for the two halves to come apart, which is the thing the transaction exists to stop.
 async fn decide_untracked(
     pool: &SqlitePool,
     user_id: &str,
     id: &str,
     accept: bool,
 ) -> Result<StatusCode, StatusCode> {
-    // One transaction, for the reason `decide` gives above: a reviewed proposal whose
-    // application was never created reads as settled while nothing exists, and nothing records
-    // that the two disagree.
-    let mut tx = crate::db::begin_write(pool).await.map_err(|err| {
-        eprintln!("inbox: opening a transaction failed: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
-        "SELECT company_name, title, implied_status, verdict_id
-           FROM application_proposals
-          WHERE id = ? AND user_id = ? AND reviewed_at IS NULL",
-    )
-    .bind(id)
-    .bind(user_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|err| {
-        eprintln!("inbox: reading an untracked proposal failed: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let Some((company_name, title, implied_status, verdict_id)) = row else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-
-    let now = Utc::now();
-
-    if accept {
-        let Some(status) = ApplicationStatus::parse(&implied_status) else {
-            eprintln!("inbox: untracked proposal {id} holds an unparseable status");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        };
-        let application_id = Uuid::new_v4().to_string();
-
-        // `posting_id` is NULL: there is no posting behind this, and that column is already
-        // nullable with a read path that treats a non-resolving posting exactly like a null
-        // one. `snapshot_json` holds the email that caused it rather than a posting snapshot —
-        // writing a fabricated posting record into the column an audit trail reads would be
-        // worse than writing the truth, which is that this came from mail.
-        let snapshot = serde_json::json!({
-            "origin": "email",
-            "verdict_id": verdict_id,
-            "company_name": company_name,
-            "title": title,
-        })
-        .to_string();
-
-        if let Err(err) = sqlx::query(
-            "INSERT INTO internship_applications
-                (id, user_id, posting_id, company_name, title, url,
-                 source, snapshot_json, snapshot_at,
-                 status, applied_at, status_changed_at, created_at, updated_at)
-             VALUES (?1, ?2, NULL, ?3, ?4, '', 'email', ?5, ?6, ?7, ?6, ?6, ?6, ?6)",
-        )
-        .bind(&application_id)
-        .bind(user_id)
-        .bind(&company_name)
-        .bind(title.as_deref().unwrap_or("Unknown role"))
-        .bind(&snapshot)
-        .bind(now)
-        .bind(status.as_str())
-        .execute(&mut *tx)
-        .await
-        {
-            eprintln!("inbox: creating an application from mail failed: {err:?}");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    match untracked::decide(pool, user_id, id, accept).await {
+        Ok(untracked::Decision::Created(_)) => Ok(StatusCode::CREATED),
+        Ok(untracked::Decision::Rejected) => Ok(StatusCode::NO_CONTENT),
+        Ok(untracked::Decision::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            eprintln!("inbox: deciding an untracked proposal failed: {err:?}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-
-        // 10e: every writer emits. `from_status` is NULL because there was no previous state,
-        // the actor is the agent rather than the person clicking, and the cause points at the
-        // email — so the tracker can always answer "why does this row exist".
-        application_events::record(
-            &mut tx,
-            NewApplicationEvent {
-                application_id: &application_id,
-                from_status: None,
-                to_status: status,
-                actor: Actor::Email,
-                cause: Some(Cause::EmailVerdict(&verdict_id)),
-                at: now,
-                note: None,
-            },
-        )
-        .await
-        .map_err(|err| {
-            eprintln!("inbox: recording the creation event failed: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
     }
-
-    if let Err(err) = sqlx::query(
-        "UPDATE application_proposals SET reviewed_at = ?3, accepted = ?4
-          WHERE id = ?1 AND user_id = ?2",
-    )
-    .bind(id)
-    .bind(user_id)
-    .bind(now.to_rfc3339())
-    .bind(i64::from(accept))
-    .execute(&mut *tx)
-    .await
-    {
-        eprintln!("inbox: marking an untracked proposal reviewed failed: {err:?}");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    tx.commit().await.map_err(|err| {
-        eprintln!("inbox: committing an untracked decision failed: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Ok(if accept { StatusCode::CREATED } else { StatusCode::NO_CONTENT })
 }
 
 #[cfg(test)]
