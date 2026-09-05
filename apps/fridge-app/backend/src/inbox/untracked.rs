@@ -33,55 +33,13 @@ use uuid::Uuid;
 use crate::internships::models::ApplicationStatus;
 use crate::internships::normalize::company_key;
 
-/// Guesses that are never an employer.
-///
-/// This is a stop-list and it is deliberately short. The guesser's job is to name a company
-/// from a sender and a subject line; when it returns a generic word it has failed, and creating
-/// a review item for `internship` trains the reader to dismiss the queue without looking.
-///
-/// `internship` is not hypothetical — `data/internships/company-aliases.json` already refuses
-/// it, in as many words: *"Neither is a company. Both are junk company names that survived
-/// QC"*. The rest are the shapes an ATS sender produces when no employer name is in the mail.
-///
-/// **Compared after [`company_key`]**, so casing and punctuation are already gone.
-const NOT_COMPANIES: &[&str] = &[
-    "internship",
-    "internship list",
-    "internships",
-    "careers",
-    "career",
-    "recruiting",
-    "recruitment",
-    "talent",
-    "talent acquisition",
-    "hiring",
-    "jobs",
-    "job",
-    "no reply",
-    "noreply",
-    "do not reply",
-    "team",
-    "university",
-    "greenhouse",
-    "workday",
-    "ashby",
-    "lever",
-];
-
 /// Whether a guessed company is worth asking a human about.
 ///
-/// Conservative in the direction that costs least: a real company wrongly filtered here is one
-/// application you add by hand, while junk that gets through is a queue nobody reads.
+/// Delegates to [`company_match::is_company_name`], which is also what
+/// `classify::guess_company` filters its candidates with. One definition of "not an employer",
+/// so a name that cannot be guessed cannot be proposed either.
 pub fn is_proposable_company(company: &str) -> bool {
-    let key = company_key(company);
-    if key.len() < 2 {
-        return false;
-    }
-    if NOT_COMPANIES.contains(&key.as_str()) {
-        return false;
-    }
-    // A guess that is all digits, or has no letter in it at all, came from parsing debris.
-    key.chars().any(|c| c.is_alphabetic())
+    crate::internships::company_match::is_company_name(&company_key(company))
 }
 
 /// A status an email may *create* an application at.
@@ -389,6 +347,13 @@ pub struct BackfillReport {
     pub already_tracked: usize,
     /// No company could be guessed, or the guess was not a company.
     pub unusable_company: usize,
+    /// **And which ones**, because a count is not findable.
+    ///
+    /// "5 had no usable company" tells you a number and gives you no way to reach the rows it
+    /// counted, which is the same defect as a source silently returning zero. These are real
+    /// applications that will never be proposed until the guesser improves, so the only way to
+    /// act on them is to be told which they are.
+    pub unusable_subjects: Vec<String>,
     /// Proposals written. Lower than the message count by design: one per company.
     pub proposed: usize,
     /// A company already asked about — the second Stripe confirmation and the third.
@@ -463,6 +428,11 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
         let Some(company) = verdict.company_guess.as_deref().filter(|c| is_proposable_company(c))
         else {
             report.unusable_company += 1;
+            report.unusable_subjects.push(format!(
+                "{}  [{}]",
+                subject.as_deref().unwrap_or("(no subject)"),
+                verdict.company_guess.as_deref().unwrap_or("no company guessed")
+            ));
             continue;
         };
 
@@ -477,6 +447,10 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
         .await?;
         let Some(verdict_id) = verdict_id else {
             report.unusable_company += 1;
+            report.unusable_subjects.push(format!(
+                "{}  [no stored verdict]",
+                subject.as_deref().unwrap_or("(no subject)")
+            ));
             continue;
         };
 
@@ -562,6 +536,15 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
         report.already_asked,
         report.proposed,
     );
+
+    if !report.unusable_subjects.is_empty() {
+        println!(
+            "\nthese look like applications but no employer could be named — track them by hand:"
+        );
+        for subject in &report.unusable_subjects {
+            println!("  {subject}");
+        }
+    }
     Ok(())
 }
 

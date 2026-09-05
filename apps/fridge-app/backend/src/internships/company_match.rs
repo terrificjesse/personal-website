@@ -106,6 +106,58 @@ impl AliasTable {
 /// Takes the key `normalize::company_key` would otherwise return — lowercased, legal suffixes
 /// already stripped — and maps it through the committed table. An unknown key is returned
 /// unchanged, which is the whole corpus except the twenty-one entries in that file.
+/// Strings that are not an employer, however often they appear in a company column.
+///
+/// **`internship` and `internship list` are in the live postings corpus** — 1 and 8 postings —
+/// as company names that survived QC. `company-aliases.json` refuses to merge them for a stated
+/// reason: *"Neither is a company. Both are junk company names that survived QC; merging them
+/// would tidy the symptom and hide the parsing defect."* That refusal keeps them visible; this
+/// list keeps them from being *used*, which is a different job.
+///
+/// It matters beyond tidiness. `classify::guess_company` picks the **longest** corpus name the
+/// email mentions, so `internship` (10 characters) outranks `tesla` (5) on any message whose
+/// text contains the word — which is most job mail. On 2026-09-05 that is exactly what happened
+/// to a real Tesla confirmation, against a company with 119 postings.
+///
+/// The rest are the shapes an ATS or a careers alias produces when no employer name is present.
+/// Compared after [`company_key`](super::normalize::company_key), so casing and punctuation are
+/// already gone.
+pub const NOT_COMPANY_NAMES: &[&str] = &[
+    "internship",
+    "internships",
+    "internship list",
+    "career",
+    "careers",
+    "recruiting",
+    "recruitment",
+    "talent",
+    "talent acquisition",
+    "hiring",
+    "job",
+    "jobs",
+    "no reply",
+    "noreply",
+    "do not reply",
+    "team",
+    "university",
+    "greenhouse",
+    "workday",
+    "ashby",
+    "lever",
+];
+
+/// Whether a normalized key names an employer at all.
+///
+/// Conservative in the direction that costs least: a real company wrongly excluded shows up as
+/// one row to add by hand, while junk that gets through is an email matched to an application it
+/// has nothing to do with — rule 2's failure.
+pub fn is_company_name(key: &str) -> bool {
+    let key = key.trim();
+    key.len() >= 2
+        && !NOT_COMPANY_NAMES.contains(&key)
+        && key.chars().any(|c| c.is_alphabetic())
+}
+
 pub fn canonical_company(key: &str) -> String {
     table().canonical(key).to_string()
 }

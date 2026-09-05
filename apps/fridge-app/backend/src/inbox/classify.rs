@@ -374,6 +374,14 @@ fn guess_company(sender: &str, text: &str, context: &Context<'_>) -> Option<Stri
         if company.len() < 3 {
             continue;
         }
+        // The corpus contains names that are not employers — `internship` and `internship
+        // list` are really in it. Because this loop prefers the LONGEST match, junk like that
+        // outranks a real company whose name is shorter, and `internship` beats `tesla` on any
+        // message that says the word. Skipping them here is what stops a 119-posting employer
+        // losing to one posting of parsing debris.
+        if !crate::internships::company_match::is_company_name(company) {
+            continue;
+        }
         let squashed = company.replace(' ', "");
         let mentioned =
             contains_whole_word(text, company.as_str()) || contains_whole_word(sender, &squashed);
@@ -789,5 +797,50 @@ mod tests {
         // A non-ASCII neighbour is a boundary, and must not panic on a byte index mid-char.
         assert!(contains_whole_word("café zip", "zip"));
         assert!(!contains_whole_word("çzip", "zip"));
+    }
+
+    #[test]
+    fn junk_in_the_company_corpus_cannot_outrank_a_real_employer() {
+        // A live defect, 2026-09-05. The postings corpus really contains `Internship` and
+        // `Internship List` as company names, and this function prefers the LONGEST match — so
+        // `internship` (10 chars) beat `tesla` (5) on a genuine Tesla confirmation, against a
+        // company with 119 postings. The email was then never proposed as an application at
+        // all, because a guess of "internship" is filtered downstream as not-a-company.
+        let companies: Vec<String> = ["tesla", "internship", "internship list"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let context = Context { known_companies: &companies };
+
+        let verdict = classify(
+            Some("Tesla <noreply@tesla.com>"),
+            Some("Thank you \u{2013} we\u{2019}ve received your Tesla application"),
+            Some("Your internship application is being reviewed."),
+            &context,
+        );
+        assert_eq!(
+            verdict.company_guess.as_deref(),
+            Some("tesla"),
+            "a real employer must win against parsing debris in its own corpus"
+        );
+    }
+
+    #[test]
+    fn an_ats_hostname_is_not_read_as_the_employer() {
+        // `workiva@myworkday.com` and `no-reply@ashbyhq.com` send for hundreds of companies.
+        // Guessing the ATS would attach the mail to the wrong employer with full confidence.
+        let companies: Vec<String> = ["workday", "ashby", "greenhouse"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let context = Context { known_companies: &companies };
+
+        let verdict = classify(
+            Some("Workiva Careers <workiva@myworkday.com>"),
+            Some("Workiva Careers: Application for Summer 2027 Intern has been Received!"),
+            None,
+            &context,
+        );
+        assert_eq!(verdict.company_guess, None, "no employer is better than the wrong one");
     }
 }
