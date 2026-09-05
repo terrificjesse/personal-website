@@ -263,6 +263,31 @@ pub async fn decide(
     };
 
     let now = Utc::now();
+
+    // **When the application happened, which is not when you pressed the button.**
+    //
+    // A confirmation email lands essentially at apply time, so the message's `received_at` is
+    // by far the best estimate of `applied_at` — and `applied_at` is not decoration. It is the
+    // cohort key for the monthly breakdown, the left edge of every time-to-first-response
+    // measurement, and what the analytics date window filters on. Stamping `now` instead put
+    // eleven applications made between 30 August and 4 September into a single 5 September
+    // cohort and made their response times a week short.
+    //
+    // Falls back to `now` if the message cannot be resolved, which is the only honest answer
+    // left when the evidence is gone.
+    let applied_at: DateTime<Utc> = sqlx::query_scalar::<_, String>(
+        "SELECT m.received_at
+           FROM email_verdicts v
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE v.id = ?",
+    )
+    .bind(&verdict_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+    .map(|at| at.with_timezone(&Utc))
+    .unwrap_or(now);
+
     let mut created = None;
 
     if accept {
@@ -284,11 +309,14 @@ pub async fn decide(
         .to_string();
 
         sqlx::query(
+            // `applied_at` and `status_changed_at` are when the thing happened; `snapshot_at`,
+            // `created_at` and `updated_at` are when we recorded it. Conflating the two is what
+            // put every one of these in the wrong month.
             "INSERT INTO internship_applications
                 (id, user_id, posting_id, company_name, title, url,
                  source, snapshot_json, snapshot_at,
                  status, applied_at, status_changed_at, created_at, updated_at)
-             VALUES (?1, ?2, NULL, ?3, ?4, '', 'email', ?5, ?6, ?7, ?6, ?6, ?6, ?6)",
+             VALUES (?1, ?2, NULL, ?3, ?4, '', 'email', ?5, ?6, ?7, ?8, ?8, ?6, ?6)",
         )
         .bind(&application_id)
         .bind(user_id)
@@ -297,6 +325,7 @@ pub async fn decide(
         .bind(&snapshot)
         .bind(now)
         .bind(status.as_str())
+        .bind(applied_at)
         .execute(&mut *tx)
         .await?;
 
@@ -311,7 +340,9 @@ pub async fn decide(
                 cause: Some(crate::internships::application_events::Cause::EmailVerdict(
                     &verdict_id,
                 )),
-                at: now,
+                // The transition happened when the mail did, so the event fold and
+                // `applied_at` agree rather than reporting a response before its application.
+                at: applied_at,
                 note: None,
             },
         )
@@ -763,6 +794,50 @@ mod tests {
                 .expect("propose"),
             "a question already answered must not be re-asked"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accepted_application_is_dated_from_its_mail_not_from_the_click(pool: SqlitePool) {
+        // `applied_at` is the cohort key for the monthly breakdown, the left edge of every
+        // time-to-first-response measurement, and what the analytics date window filters on.
+        // Stamping the moment of acceptance put eleven applications made across five days into
+        // one cohort and shortened every response time by however long the row sat unreviewed.
+        let user = seed_user(&pool).await;
+        let verdict = seed_verdict(&pool, "m1").await;
+        propose(&pool, &user, &verdict, "stripe", None, ApplicationStatus::Applied, Utc::now())
+            .await
+            .expect("propose");
+        let id: String = sqlx::query_scalar("SELECT id FROM application_proposals")
+            .fetch_one(&pool)
+            .await
+            .expect("id");
+
+        assert!(matches!(
+            decide(&pool, &user, &id, true).await.expect("accept"),
+            Decision::Created(_)
+        ));
+
+        // `seed_verdict` dates the message 2026-09-04, and the click is happening now.
+        let (applied_at, created_at): (String, String) =
+            sqlx::query_as("SELECT applied_at, created_at FROM internship_applications")
+                .fetch_one(&pool)
+                .await
+                .expect("row");
+        assert!(
+            applied_at.starts_with("2026-09-04"),
+            "applied_at must come from the email, got {applied_at}"
+        );
+        assert!(
+            !created_at.starts_with("2026-09-04"),
+            "created_at is when we recorded it, which is a different fact"
+        );
+
+        // And the event agrees, or the fold reports a response before its application.
+        let at: String = sqlx::query_scalar("SELECT at FROM application_events")
+            .fetch_one(&pool)
+            .await
+            .expect("event");
+        assert!(at.starts_with("2026-09-04"), "event must sit with the application, got {at}");
     }
 
     #[sqlx::test(migrations = "./migrations")]
