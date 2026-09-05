@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useApiError } from "@/lib/useApiError";
+import { UnauthorizedError } from "@/lib/apiClient";
 import {
   decideUntracked,
   listUntrackedProposals,
@@ -37,13 +38,21 @@ export function UntrackedApplications({
   const [items, setItems] = useState<UntrackedProposal[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * A load that failed for any reason other than being signed out.
+   *
+   * This section renders `null` when it holds nothing, which is right for an empty queue and
+   * **wrong for a broken one** — the first version swallowed every first-load error, so a 500
+   * and "no proposals" looked identical on screen and one of them meant the feature was dead.
+   * That is the quiet-inbox failure `sync`'s rule 7 exists to prevent, reintroduced in the UI.
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
       setItems(await listUntrackedProposals());
+      setLoadError(null);
     } catch (err) {
-      // Signed out, or the backend is down. Not worth a red banner on a page whose main
-      // content loaded fine — the section simply stays empty.
       setMessage(handleError(err, "Could not check your mail for untracked applications"));
     }
   }, [handleError]);
@@ -53,10 +62,19 @@ export function UntrackedApplications({
     void (async () => {
       try {
         const loaded = await listUntrackedProposals();
-        if (!cancelled) setItems(loaded);
-      } catch {
-        // Same reasoning as above, and deliberately silent on first load: a signed-out visitor
-        // should not be told about a queue they cannot see.
+        if (!cancelled) {
+          setItems(loaded);
+          setLoadError(null);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        // Signed out is the one silent case, and it is silent because it is not a fault: a
+        // visitor who cannot see the queue should not be told it broke. Everything else is
+        // said out loud, because an empty section is otherwise the only symptom.
+        if (err instanceof UnauthorizedError) return;
+        setLoadError(
+          err instanceof Error ? err.message : "Could not load applications found in your mail",
+        );
       }
     })();
     return () => {
@@ -79,7 +97,15 @@ export function UntrackedApplications({
     }
   }
 
-  if (items.length === 0) return null;
+  if (items.length === 0) {
+    // Nothing pending renders nothing. A failed load says so instead — see `loadError`.
+    if (!loadError) return null;
+    return (
+      <section className="mt-6 rounded-lg border border-red-500/40 bg-red-500/5 p-3 text-sm text-red-700 dark:text-red-400">
+        Could not check your mail for untracked applications: {loadError}
+      </section>
+    );
+  }
 
   return (
     <section className="mt-6 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4">
