@@ -29,6 +29,13 @@ import {
 } from "@/lib/internshipsApi";
 import { UntrackedApplications } from "./UntrackedApplications";
 
+/// Where the Gmail consent round trip starts.
+///
+/// **Must be reached on the same host `GMAIL_REDIRECT_URI` names**, which is `localhost` — the
+/// state cookie is host-scoped and `SameSite=Lax`, so starting the flow on `127.0.0.1` or a LAN
+/// address means the cookie never comes back and the callback fails its own check.
+const GMAIL_CONNECT_URL = "http://localhost:8080/auth/gmail/start";
+
 function outcomeTone(outcome: string): string {
   if (outcome === "success") return "text-green-700 dark:text-green-400";
   if (outcome === "skipped") return "text-neutral-500";
@@ -98,7 +105,7 @@ export function InboxPanel() {
         <span className="font-semibold">Inbox agent</span>{" "}
         <span className="text-neutral-500">
           — not connected.{" "}
-          <a className="underline" href="http://localhost:8080/auth/gmail/start">
+          <a className="underline" href={GMAIL_CONNECT_URL}>
             Connect a Gmail account
           </a>
         </span>
@@ -137,9 +144,20 @@ export function InboxPanel() {
 
       {/* The line rule 5 exists for. A stopped agent must not read as a quiet inbox. */}
       {status?.last_run?.error && !status.last_run.superseded_by_reconnect && (
-        <p className="mt-1 rounded border border-red-500/40 bg-red-500/5 px-2 py-1 text-sm text-red-700 dark:text-red-400">
-          {status.last_run.error}
-        </p>
+        <div className="mt-1 rounded border border-red-500/40 bg-red-500/5 px-2 py-1 text-sm text-red-700 dark:text-red-400">
+          <p>{status.last_run.error}</p>
+          {/* An error with no way to act on it is half a message.
+              
+              Google expires refresh tokens after 7 days while the OAuth app is in Testing, so
+              this is a scheduled event, not an incident — and the account stays "connected" the
+              whole time, which meant the only reconnect link in this panel (the not-connected
+              branch below) was never reachable when it was actually needed. Reconnecting is
+              always safe: the callback overwrites the stored token, and `prompt=consent` is
+              what makes Google re-issue a refresh token rather than silently returning none. */}
+          <a className="mt-0.5 inline-block font-medium underline" href={GMAIL_CONNECT_URL}>
+            Reconnect this account
+          </a>
+        </div>
       )}
 
       {message && <p className="mt-2 text-sm text-neutral-600">{message}</p>}
