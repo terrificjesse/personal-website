@@ -94,15 +94,32 @@ pub struct Context<'a> {
 /// trap arriving through the classifier instead of through timestamps.
 const REJECTION: &[&str] = &[
     "unfortunately",
+    // Pronoun-agnostic. `"we regret"` was here alone and missed *"I regret to inform you"* on a
+    // real rejection — the formulation a named recruiter uses rather than a template.
+    "regret to inform",
     "we regret",
     "not be moving forward",
     "not moving forward",
+    // "not be moving forward" is not a substring of the contraction, and the contraction is how
+    // most of these are actually written.
+    "won't be moving forward",
     "will not be progressing",
+    "not be proceeding",
+    "decided not to move forward",
     "decided to move forward with other",
     "no longer under consideration",
     "were not selected",
     "not selected for",
     "pursue other candidates",
+    // Fit-based refusals, which name no decision verb at all. Every one is negated on purpose:
+    // a bare "ideal fit" would read an enthusiastic offer as a rejection, and REJECTION is
+    // checked first so it would win.
+    "not an ideal fit",
+    "isn't an ideal fit",
+    "not the right fit",
+    "not a fit at this time",
+    "position has been filled",
+    "role has been filled",
 ];
 
 const OFFER: &[&str] = &[
@@ -113,15 +130,56 @@ const OFFER: &[&str] = &[
     "offer letter",
 ];
 
+/// An interview you are being **invited to** — not one merely described.
+///
+/// Bare `"interview"` was here and it was wrong on real mail, in exactly the way bare
+/// `"assessment"` was wrong below. Two confirmations were classified as interviews on 2026-09-10:
+/// *"help prepare you for the interview process"* and *"details on the interview"*. Both are
+/// describing a process; neither is an invitation. The word is the topic, not the ask.
+///
+/// **ASSESSMENT already learned this and the lesson was never carried across** — its own comment
+/// says the marker has to carry the ask rather than the topic. This list now does too.
+///
+/// Kept deliberately broad within that constraint. Rule 8: an unmatched interview invitation is
+/// the single most costly thing this tool can drop, so the bar is "does this phrase carry an
+/// invitation", not "is this phrase common".
 const INTERVIEW: &[&str] = &[
-    "interview",
+    "invite you to interview",
+    "invitation to interview",
+    "interview invitation",
+    "invite you to an interview",
+    "like to interview you",
+    "would like to interview",
+    "to interview you",
+    "schedule an interview",
+    "schedule your interview",
+    "scheduling your interview",
+    "set up an interview",
+    "book an interview",
+    "book your interview",
+    "confirm your interview",
+    "your interview is",
+    "interview has been scheduled",
+    "interview is scheduled",
     "phone screen",
     "schedule a call",
     "schedule some time",
     "schedule time",
     "meet with the team",
-    "speak with you",
+    "like to speak with you",
+    // Rounds and slot-booking, which invite you without using the word "interview" as a verb.
+    // The 13f gate caught the absence of these: tightening this list dropped `syn-012`,
+    // *"Please book a time — final round"*, whose snippet reads "select a slot for your final
+    // round interview". That is an invitation with no invitation verb anywhere in it, and it is
+    // exactly the miss rule 8 says costs the most.
     "next round",
+    "final round",
+    "round interview",
+    "book a time",
+    "select a slot",
+    "select a time",
+    "choose a time",
+    "pick a time",
 ];
 
 /// An assessment you are being **asked to do** — not one merely mentioned.
@@ -255,11 +313,43 @@ const ATS_DOMAINS: &[&str] = &[
 /// curly apostrophe. A marker written with an ASCII apostrophe silently never matches it, and
 /// silently-never-matching is the failure mode this whole classifier is judged on.
 fn haystack(subject: Option<&str>, snippet: Option<&str>) -> String {
-    format!("{} {}", subject.unwrap_or(""), snippet.unwrap_or(""))
+    let joined = format!("{} {}", subject.unwrap_or(""), snippet.unwrap_or(""));
+    decode_entities(&joined)
         .to_lowercase()
         .replace(['\u{2018}', '\u{2019}'], "'")
         .replace(['\u{201c}', '\u{201d}'], "\"")
         .replace(['\u{2013}', '\u{2014}'], "-")
+}
+
+/// Undo the HTML escaping Gmail applies to `snippet`.
+///
+/// **Snippets arrive escaped**, so a contraction reaches the markers as `isn&#39;t` and any
+/// marker containing an apostrophe silently never fires. Found 2026-09-10 on a real rejection —
+/// *"there isn&#39;t an ideal fit at this time"* — which no marker could have caught.
+///
+/// The existing marker lists contain no apostrophes at all, which reads like a style choice and
+/// was really the bug: the lists were written around it rather than it being fixed. Decoding
+/// here means a marker can be written the way the sentence is actually spoken.
+///
+/// Deliberately a short fixed table rather than a dependency. These are the entities Gmail
+/// actually emits in snippets; anything else passes through unchanged and simply fails to match,
+/// which is the safe direction.
+fn decode_entities(text: &str) -> String {
+    text.replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&rsquo;", "'")
+        .replace("&lsquo;", "'")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&ldquo;", "\"")
+        .replace("&rdquo;", "\"")
+        .replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        // Last: an escaped ampersand can encode another entity, so unescaping it first would
+        // let "&amp;#39;" become an apostrophe that was never in the text.
+        .replace("&amp;", "&")
 }
 
 fn hit<'a>(text: &str, markers: &[&'a str]) -> Option<&'a str> {
@@ -842,5 +932,163 @@ mod tests {
             &context,
         );
         assert_eq!(verdict.company_guess, None, "no employer is better than the wrong one");
+    }
+
+    // ---- 2026-09-10: rejections missed, confirmations read as interviews ----
+
+    fn verdict_for(subject: &str, snippet: &str) -> Category {
+        let companies = vec!["stripe".to_string(), "optiver".to_string()];
+        let ctx = Context { known_companies: &companies };
+        classify(Some("no-reply@example.com"), Some(subject), Some(snippet), &ctx).category
+    }
+
+    #[test]
+    fn a_rejection_does_not_have_to_say_we() {
+        // `"we regret"` was the only regret marker and missed the formulation a named recruiter
+        // actually uses. Both must land.
+        assert_eq!(
+            verdict_for("Application Status", "I regret to inform you the decision has been made"),
+            Category::Rejection
+        );
+        assert_eq!(
+            verdict_for("Application Status", "We regret to inform you that we have decided"),
+            Category::Rejection
+        );
+    }
+
+    #[test]
+    fn an_html_escaped_apostrophe_does_not_hide_a_rejection() {
+        // Gmail escapes snippets, so a contraction arrives as `isn&#39;t`. Every marker
+        // containing an apostrophe silently failed, and the marker lists had been written
+        // around that rather than the escaping being undone. This is the real wording of a
+        // rejection that classified as a confirmation.
+        assert_eq!(
+            verdict_for(
+                "Application Update",
+                "After reviewing your application we&#39;ve determined that there isn&#39;t an ideal fit at this time"
+            ),
+            Category::Rejection
+        );
+        // And the decoding itself, independent of any marker.
+        assert_eq!(haystack(Some("A&amp;B"), Some("don&#39;t")), "a&b don't");
+        // An escaped ampersand must not be unescaped into another entity.
+        assert_eq!(haystack(None, Some("&amp;#39;")).trim(), "&#39;");
+    }
+
+    #[test]
+    fn the_contraction_form_of_a_refusal_counts() {
+        assert_eq!(
+            verdict_for("Update", "we won't be moving forward with your application"),
+            Category::Rejection
+        );
+        assert_eq!(
+            verdict_for("Update", "the position has been filled"),
+            Category::Rejection
+        );
+    }
+
+    #[test]
+    fn a_fit_marker_is_negated_or_it_is_not_a_marker() {
+        // A bare "ideal fit" would read this as a rejection, and REJECTION is checked first, so
+        // it would win outright and flip a real offer to rejected.
+        assert_ne!(
+            verdict_for("Great news", "we think you are an ideal fit and are pleased to offer you the role"),
+            Category::Rejection
+        );
+    }
+
+    #[test]
+    fn describing_an_interview_is_not_inviting_you_to_one() {
+        // Both are real confirmations that classified as interviews. Bare "interview" matched
+        // the topic; neither email asks for anything.
+        assert_eq!(
+            verdict_for(
+                "Prepare for your application process",
+                "Your application has been received. Here is some information to help prepare you for the interview process."
+            ),
+            Category::Confirmation
+        );
+        assert_eq!(
+            verdict_for(
+                "Thank you for applying",
+                "Please see below for information on the program and details on the interview"
+            ),
+            Category::Confirmation
+        );
+    }
+
+    #[test]
+    fn a_real_invitation_still_lands_as_an_interview() {
+        // The corpus contains no genuine invitation, so tightening INTERVIEW is unvalidated in
+        // the direction that matters. Rule 8: an unmatched invitation is the costliest miss in
+        // the system, so these are the guard on that tightening.
+        for snippet in [
+            "We would like to invite you to interview for the role",
+            "Please schedule an interview using the link below",
+            "Let's set up an interview next week",
+            "Your interview is confirmed for Tuesday",
+            "We'd like to schedule a call to discuss the role",
+            "The next step is a phone screen with the team",
+            "You have been invited to the next round",
+            "We would like to interview you for this position",
+            // No invitation verb at all — the shape the 13f gate caught when this list was
+            // first tightened.
+            "Use the link below to select a slot for your final round interview",
+            "Please book a time that works for you",
+        ] {
+            assert_eq!(
+                verdict_for("Next steps", snippet),
+                Category::Interview,
+                "must read as an invitation: {snippet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_that_mentions_an_interview_is_still_a_rejection() {
+        // The ordering guard REJECTION's own doc calls out. Checked first for exactly this.
+        assert_eq!(
+            verdict_for(
+                "Thank you for interviewing with us",
+                "Unfortunately we will not be moving forward with your application"
+            ),
+            Category::Rejection
+        );
+    }
+
+    /// Re-classify a COPY of the live mailbox and print what changed. Ignored; never in CI.
+    ///
+    ///   INBOX_PROBE_DB=/path/copy.db cargo test classify::tests::probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn probe_reclassify_the_live_mailbox() {
+        use sqlx::SqlitePool;
+        let path = std::env::var("INBOX_PROBE_DB").expect("INBOX_PROBE_DB");
+        let pool = SqlitePool::connect(&format!("sqlite://{path}")).await.expect("open");
+        let companies: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT lower(company_name) FROM internship_postings WHERE company_name IS NOT NULL",
+        ).fetch_all(&pool).await.expect("companies");
+        let ctx = Context { known_companies: &companies };
+
+        let rows: Vec<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT m.subject, m.from_address, m.snippet, v.category
+               FROM email_messages m JOIN email_verdicts v ON v.message_id = m.id
+              ORDER BY m.received_at",
+        ).fetch_all(&pool).await.expect("rows");
+
+        let mut changed = 0;
+        let mut after = std::collections::BTreeMap::new();
+        for (subject, from, snippet, was) in &rows {
+            let v = classify(from.as_deref(), Some(subject), snippet.as_deref(), &ctx);
+            let now = format!("{:?}", v.category).to_lowercase();
+            *after.entry(now.clone()).or_insert(0usize) += 1;
+            if now != *was {
+                changed += 1;
+                println!("  {was:>12} -> {now:<12} {}", &subject.chars().take(58).collect::<String>());
+                println!("               {}", v.evidence);
+            }
+        }
+        println!("\n{changed} of {} messages change category", rows.len());
+        println!("new distribution: {after:?}");
     }
 }
