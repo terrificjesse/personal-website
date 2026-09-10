@@ -16,13 +16,16 @@
 //! time*, which is the difference between "the rules improved" and "the history was edited" —
 //! and Checkpoint 13's ledger depends on being able to tell those apart.
 //!
-//! # Labels are added, never removed
+//! # Labels are reconciled, and only ours are removed
 //!
-//! `labels` will not remove a label, including one it added, and a test enforces that by
-//! grepping its own source. So this reconciles in the only direction it can: it adds the label
-//! the corrected verdict projects. **The superseded label stays on the message**, and this
-//! module reports exactly which ones, because a message carrying both `Hunt/Confirmed` and
-//! `Hunt/Rejected` is a state a human has to resolve and must not have to discover.
+//! The corrected label is added, and the one it replaces is taken off — but only through
+//! [`labels::SupersededLabel`], which can be built from nothing except this agent's own record
+//! of what it applied. A label you added by hand is not constructible and therefore not
+//! removable, which is the half of the old absolute rule worth keeping.
+//!
+//! **Order matters: add first, then remove.** A failure between the two leaves the message
+//! carrying both labels, which is visibly wrong. The other order would leave it carrying
+//! neither, which looks like the agent never saw it.
 
 use anyhow::{Result, bail};
 use chrono::Utc;
@@ -172,6 +175,31 @@ pub async fn relabel(pool: &SqlitePool, changes: &[Change]) -> Result<Vec<String
         };
         labels::apply(&client, &token, &change.gmail_message_id, label_id).await?;
 
+        // Then take off the one it replaced, if we are the ones who put it there.
+        let superseded = labels::SupersededLabel::from_recorded(change.stale_label.as_deref(), name);
+        if let Some(superseded) = &superseded {
+            match ids.get(superseded.name()) {
+                Some(old_id) => {
+                    labels::remove_superseded(
+                        &client,
+                        &token,
+                        &change.gmail_message_id,
+                        old_id,
+                        superseded,
+                    )
+                    .await?;
+                    stale.push(format!("{} removed from: {}", superseded.name(), change.subject));
+                }
+                // The label is recorded but Gmail has no such label any more — somebody deleted
+                // it. Nothing to remove, and inventing it to delete it would be absurd.
+                None => stale.push(format!(
+                    "{} recorded but not in Gmail, left alone: {}",
+                    superseded.name(),
+                    change.subject
+                )),
+            }
+        }
+
         sqlx::query(
             "UPDATE email_messages SET labels_applied = ?2, labels_applied_at = ?3 WHERE id = ?1",
         )
@@ -180,21 +208,61 @@ pub async fn relabel(pool: &SqlitePool, changes: &[Change]) -> Result<Vec<String
         .bind(Utc::now().to_rfc3339())
         .execute(pool)
         .await?;
-
-        if let Some(old) = change.stale_label.as_deref()
-            && old != name
-        {
-            stale.push(format!("{old} still on: {}", change.subject));
-        }
     }
 
     Ok(stale)
+}
+
+/// Messages whose recorded label disagrees with their newest verdict.
+///
+/// [`reclassify`] only reports messages whose *category* moved, which is the right unit while
+/// the verdict and the label are written together. They can still come apart: a relabel that
+/// half-succeeded, or — as on 2026-09-10 — a correction applied before this module could remove
+/// anything, which updated `labels_applied` to the new name and left the old one on the message
+/// with nothing recording it. This finds that state from the data rather than from memory.
+pub async fn label_drift(pool: &SqlitePool) -> Result<Vec<Change>> {
+    let rows: Vec<StoredVerdict> = sqlx::query_as(
+        "SELECT m.id, m.gmail_message_id, m.from_address, m.subject, m.snippet,
+                v.category, m.labels_applied
+           FROM email_messages m
+           JOIN email_verdicts v ON v.id = (
+               SELECT id FROM email_verdicts
+                WHERE message_id = m.id ORDER BY created_at DESC LIMIT 1)
+          WHERE m.labels_applied IS NOT NULL
+          ORDER BY m.received_at",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut drifted = Vec::new();
+    for row in &rows {
+        let Some(category) = Category::parse(&row.category) else {
+            continue;
+        };
+        let Some(should_be) = labels::label_for(category) else {
+            continue;
+        };
+        if row.labels_applied.as_deref() == Some(should_be) {
+            continue;
+        }
+        drifted.push(Change {
+            message_id: row.id.clone(),
+            gmail_message_id: row.gmail_message_id.clone(),
+            subject: row.subject.clone().unwrap_or_default(),
+            was: row.labels_applied.clone().unwrap_or_default(),
+            now: category,
+            evidence: "label disagrees with the stored verdict".to_string(),
+            stale_label: row.labels_applied.clone(),
+        });
+    }
+    Ok(drifted)
 }
 
 const USAGE: &str = "\
 usage:
   inbox reclassify              show what the current rules would change (writes nothing)
   inbox reclassify --apply      write the new verdicts and add the corrected Gmail labels
+  inbox reclassify --labels     reconcile Gmail labels against the stored verdicts
 
 Verdicts are APPENDED, never overwritten: the old row stays as the record of what the
 classifier decided at the time. Labels are added, never removed — see inbox::labels.
@@ -204,6 +272,28 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
     let apply = match &args[1..] {
         [] => false,
         [flag] if flag == "--apply" => true,
+        [flag] if flag == "--labels" => {
+            let drifted = label_drift(pool).await?;
+            if drifted.is_empty() {
+                println!("reclassify: every labelled message agrees with its verdict.");
+                return Ok(());
+            }
+            println!("reclassify: {} message(s) carry the wrong label\n", drifted.len());
+            for change in &drifted {
+                println!(
+                    "  {:<16} should be {:<16} {}",
+                    change.was,
+                    labels::label_for(change.now).unwrap_or("(none)"),
+                    change.subject.chars().take(48).collect::<String>()
+                );
+            }
+            let stale = relabel(pool, &drifted).await?;
+            println!("\nGmail: reconciled.");
+            for line in &stale {
+                println!("  {line}");
+            }
+            return Ok(());
+        }
         _ => {
             print!("{USAGE}");
             return Ok(());
@@ -238,15 +328,8 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
 
     let stale = relabel(pool, &changes).await?;
     println!("\nGmail: corrected labels added.");
-    if !stale.is_empty() {
-        println!(
-            "\n{} message(s) now carry a SUPERSEDED label too. `inbox::labels` never removes a\n\
-             label, so these need one manual removal each in Gmail:",
-            stale.len()
-        );
-        for line in &stale {
-            println!("  {line}");
-        }
+    for line in &stale {
+        println!("  {line}");
     }
     Ok(())
 }

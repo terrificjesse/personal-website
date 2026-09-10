@@ -9,9 +9,19 @@
 //! The granted scope is `gmail.modify`, which withholds the two irreversible powers — permanent
 //! delete and send-as. Within what it *does* allow, this module further limits itself:
 //!
-//! - It **adds** labels. It never removes one, including ones it added: a message that was a
-//!   confirmation stays a confirmation, and stripping a label a human added by hand would be
-//!   a silent loss of their work.
+//! - It **adds** labels, and removes one only under [`SupersededLabel`] — a label this agent
+//!   recorded applying, which a re-classification has since replaced.
+//!
+//!   The rule used to be "never removes one, including ones it added", for two stated reasons.
+//!   The second is real and is unchanged: **stripping a label a human added by hand would be a
+//!   silent loss of their work**, and nothing here can do that, because a `SupersededLabel`
+//!   cannot be constructed from anything but `email_messages.labels_applied` — this agent's own
+//!   record of what it put on. The first reason was *"a message that was a confirmation stays a
+//!   confirmation"*, which assumes the verdict was right; on 2026-09-10 four were not, and the
+//!   absolute rule meant a corrected message kept both labels for ever.
+//!
+//!   Narrowed rather than dropped, and narrowed in the type rather than in a comment: the
+//!   provenance check is what the constructor *is*, so a future caller cannot forget it.
 //! - It **never archives.** Removing `INBOX` is permitted by the scope and is not done here.
 //!   A mislabelled email is a nuisance you can see; an archived one is gone from where you
 //!   look for it.
@@ -131,18 +141,34 @@ pub async fn create(
 ///
 /// Resolved once per pass rather than per message: it is two API calls at most, against a
 /// hundred messages.
+/// Every category that projects a label.
+///
+/// One list, used both to create the labels and to decide whether a name found on a message is
+/// one of ours. A second copy would drift, and the direction it would drift is a label this
+/// agent does not project being treated as one it does — which is the removal that must never
+/// happen.
+const LABELLED: &[Category] = &[
+    Category::Confirmation,
+    Category::Oa,
+    Category::Interview,
+    Category::Offer,
+    Category::Rejection,
+    Category::Outreach,
+];
+
+/// Whether a label name is one this agent projects.
+fn is_ours(name: &str) -> bool {
+    LABELLED
+        .iter()
+        .filter_map(|category| label_for(*category))
+        .any(|ours| ours == name)
+}
+
 pub async fn ensure_all(client: &reqwest::Client, token: &str) -> Result<HashMap<String, String>> {
     let mut known = existing(client, token).await?;
 
-    for category in [
-        Category::Confirmation,
-        Category::Oa,
-        Category::Interview,
-        Category::Offer,
-        Category::Rejection,
-        Category::Outreach,
-    ] {
-        let Some(name) = label_for(category) else {
+    for category in LABELLED {
+        let Some(name) = label_for(*category) else {
             continue;
         };
         if known.contains_key(name) {
@@ -160,7 +186,68 @@ pub async fn ensure_all(client: &reqwest::Client, token: &str) -> Result<HashMap
 
 /// Add one label to one message.
 ///
-/// `addLabelIds` only. `removeLabelIds` is deliberately absent — see the module doc.
+/// A label this agent applied and may therefore take off again.
+///
+/// **The only way to construct one is from `email_messages.labels_applied`**, which is written
+/// by the code that did the labelling. That makes "we only remove our own labels" a property of
+/// the type rather than a rule a caller has to remember — the distinction the module doc turns
+/// on, and the reason this is a newtype and not a `&str` parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersededLabel(String);
+
+impl SupersededLabel {
+    /// `Some` only when this agent recorded applying exactly this label, and something else has
+    /// since replaced it.
+    ///
+    /// `recorded` is the value of `labels_applied` **before** the correction was written.
+    pub fn from_recorded(recorded: Option<&str>, replaced_by: &str) -> Option<Self> {
+        let recorded = recorded?.trim();
+        if recorded.is_empty() || recorded == replaced_by {
+            // Nothing was applied, or nothing changed. Neither is a superseded label.
+            return None;
+        }
+        // A name we do not project is not ours, whatever the column says.
+        if !is_ours(recorded) {
+            return None;
+        }
+        Some(SupersededLabel(recorded.to_string()))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Take off a label this agent applied and a re-classification has replaced.
+///
+/// Adds nothing. The corrected label is applied by [`apply`] separately, so a failure here
+/// leaves the message with both labels — visibly wrong — rather than with neither.
+pub async fn remove_superseded(
+    client: &reqwest::Client,
+    token: &str,
+    message_id: &str,
+    label_id: &str,
+    superseded: &SupersededLabel,
+) -> Result<()> {
+    debug_assert!(!superseded.name().is_empty());
+    let response = client
+        .post(format!("{API}/messages/{message_id}/modify"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "removeLabelIds": [label_id] }))
+        .send()
+        .await
+        .context("removing a superseded label")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Gmail refused to unlabel {message_id} ({status}): {body}"));
+    }
+
+    Ok(())
+}
+
+/// `addLabelIds` only.
 pub async fn apply(
     client: &reqwest::Client,
     token: &str,
@@ -238,17 +325,49 @@ fn code_only(source: &str) -> String {
     }
 
     /// The counterpart to `gmail.rs`'s read-only assertion: writes live HERE and nowhere else.
+    ///
+    /// **Archiving and deletion stay absolutely forbidden.** Only label removal was narrowed,
+    /// and only behind [`SupersededLabel`] — the tests below are what enforce that half, since
+    /// no amount of grepping can tell whose label is being removed.
     #[test]
-    fn this_module_never_removes_a_label_or_archives() {
+    fn this_module_never_archives_or_deletes() {
         let source = include_str!("labels.rs");
         let body = code_only(source.split("mod tests").next().expect("the module above its tests"));
 
-        for forbidden in ["removeLabelIds", "\"INBOX\"", "/trash", "/delete", "batchDelete"] {
+        for forbidden in ["\"INBOX\"", "/trash", "/delete", "batchDelete"] {
             assert!(
                 !body.contains(forbidden),
-                "labels.rs contains {forbidden:?} — this module adds labels and does nothing \
-                 else; removing or archiving needs its own deliberate change"
+                "labels.rs contains {forbidden:?} — a mislabelled email is a nuisance you can \
+                 see; an archived or deleted one is gone from where you look for it"
             );
         }
+    }
+
+    #[test]
+    fn removal_needs_a_label_this_agent_recorded_applying() {
+        // The whole safety property, and the reason it is a type. Each `None` here is a
+        // removal that cannot be expressed, not one a caller is trusted to avoid.
+        assert_eq!(
+            SupersededLabel::from_recorded(Some("Hunt/Confirmed"), "Hunt/Rejected")
+                .map(|l| l.name().to_string()),
+            Some("Hunt/Confirmed".to_string())
+        );
+        // Nothing was ever applied by us — so whatever is on the message is somebody else's.
+        assert_eq!(SupersededLabel::from_recorded(None, "Hunt/Rejected"), None);
+        assert_eq!(SupersededLabel::from_recorded(Some(""), "Hunt/Rejected"), None);
+        // Nothing changed.
+        assert_eq!(
+            SupersededLabel::from_recorded(Some("Hunt/Rejected"), "Hunt/Rejected"),
+            None
+        );
+        // A label we do not project is not ours, whatever the column happens to hold.
+        assert_eq!(
+            SupersededLabel::from_recorded(Some("Important"), "Hunt/Rejected"),
+            None
+        );
+        assert_eq!(
+            SupersededLabel::from_recorded(Some("Starred"), "Hunt/Confirmed"),
+            None
+        );
     }
 }

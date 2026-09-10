@@ -48,6 +48,24 @@ impl Category {
         matches!(self, Category::Oa | Category::Interview | Category::Offer)
     }
 
+    /// The inverse of [`as_str`](Category::as_str), for reading a stored verdict back.
+    ///
+    /// Exhaustive over the same match rather than a lookup table, so adding a category is a
+    /// compile error here instead of a silent `None` at the point something reads the database.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [
+            Category::Confirmation,
+            Category::Oa,
+            Category::Interview,
+            Category::Offer,
+            Category::Rejection,
+            Category::Outreach,
+            Category::Disregarded,
+        ]
+        .into_iter()
+        .find(|category| category.as_str() == raw)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Category::Confirmation => "confirmation",
