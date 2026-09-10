@@ -49,6 +49,27 @@ jobs:
       - name: classifier regression gate
         run: cargo run --quiet -- labelset gate
 
+  # The extension's own suites. Plain `node`, no build step and no dependencies — the extension
+  # is deliberately dependency-free (see apps/hunt-extension/CLAUDE.md), so this needs nothing
+  # but a Node runtime.
+  #
+  # `content/fields.js` decides which box each piece of your personal data goes into, and it was
+  # the one part of the repo CI did not run. On 2026-09-09 it was measured against a corpus of
+  # realistic negative labels and matched 22 of 34 that it should have left alone.
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/hunt-extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node manifest.test.mjs
+      - run: node settings.test.mjs
+      - run: node content/fields.test.mjs
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

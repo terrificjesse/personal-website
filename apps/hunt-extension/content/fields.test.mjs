@@ -120,5 +120,70 @@ eq("Ashby LinkedIn Profile", classify("LinkedIn Profile"), field("linkedin_url")
 eq("recaptcha textarea", classify("g-recaptcha-response g-recaptcha-response-100000"), blocked("sensitive"));
 eq("captcha, any spelling", classify("Captcha"), blocked("sensitive"));
 
+/*
+ * ------------------------------------------------------------------------------------------
+ * False positives — added 2026-09-09 after the user reported "a lot of false positives"
+ * ------------------------------------------------------------------------------------------
+ *
+ * Measured before anything was changed: of 34 realistic negative labels, **22 were matched**.
+ * Zero positives were wrong. The suite above could not have caught any of it, because it is
+ * almost entirely positives — it asked "does the right label match?" and never "does the wrong
+ * one stay unmatched?".
+ *
+ * A false positive here is not cosmetic. It types real personal data into a box that belongs to
+ * someone or something else, and the user only finds out by reading the form before submitting.
+ */
+
+console.log("\n-- fields that are about somebody else --");
+for (const label of ["Emergency contact name", "Emergency contact phone", "Emergency contact email",
+                     "Reference name", "Reference email", "Reference phone number",
+                     "Manager's email", "Supervisor phone", "Referrer email",
+                     "Parent or guardian email", "Next of kin", "Spouse name",
+                     "Last employer", "Most recent employer name"])
+  eq(`"${label}" is not ours to fill`, classify(label), skip);
+
+console.log("\n-- essay prompts that happen to contain a synonym --");
+for (const label of ["Describe a major challenge you overcame",
+                     "Tell us about your degree of involvement",
+                     "Explain your interest in this location",
+                     "Why do you want to work here?",
+                     "List the schools you attended"])
+  eq(`"${label}" is a prompt, not a field`, classify(label), skip);
+
+console.log("\n-- 'How did you hear about us', whose options render into the label --");
+for (const label of ["How did you hear about us? LinkedIn, Indeed, Referral, Other",
+                     "Where did you find this role? GitHub, LinkedIn, Careers page",
+                     "How did you learn about this opportunity?"])
+  eq(`"${label}" never yields a profile URL`, classify(label), skip);
+
+console.log("\n-- ordinary English words that are also synonyms --");
+// Each of these matched before: "last"/"first" as bare synonyms, "mobile" likewise, and
+// "major" as an adjective in front of a noun.
+for (const label of ["Last company", "When did you last use Python?",
+                     "First day available", "What is your first choice of office?",
+                     "Mobile development experience", "Do you have mobile app experience?",
+                     "What was your major accomplishment in this role?"])
+  eq(`"${label}" stays unmatched`, classify(label), skip);
+
+console.log("\n-- a question that mentions two of our fields is ambiguous --");
+// Asks for the school's city; wants neither your city nor your school's name. The
+// longest-phrase tie-break is a fair rule on a plain label and a guess inside a question.
+eq("city of your school", classify("What city is your school located in?"), skip);
+
+console.log("\n-- and none of that may cost a real match --");
+// The narrow-prompt rule exists because the first draft of it broke all four of these.
+eq("GPA as a question", classify("What is your GPA?"), field("gpa"));
+eq("graduation date as a question", classify("What is your expected graduation date?*"), field("graduation_date"));
+eq("school from a dropdown", classify("Please select your current school from the list below:*"), field("school"));
+eq("degree as a question", classify("What degree are you currently pursuing?*"), field("degree"));
+eq("bare First still matches", classify("First"), field("first_name"));
+eq("bare Last still matches", classify("Last"), field("last_name"));
+eq("bare Mobile still matches", classify("Mobile"), field("phone"));
+eq("bare Major still matches", classify("Major"), field("major"));
+eq("Undergraduate major still matches", classify("Undergraduate major"), field("major"));
+eq("Mobile Number still matches", classify("Mobile Number"), field("phone"));
+eq("sponsorship is a legitimate question", classify("Will you require sponsorship?"), field("needs_sponsorship"));
+eq("work authorization is too", classify("Are you authorized to work in the US?"), field("work_authorization"));
+
 console.log(fail === 0 ? "\n  ALL PASSED" : `\n  ${fail} FAILED`);
 process.exit(fail ? 1 : 0);

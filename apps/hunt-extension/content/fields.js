@@ -88,6 +88,79 @@ const DEMOGRAPHIC = [
 ];
 
 /**
+ * Fields that are about **someone else**, and are therefore never ours to fill.
+ *
+ * `cv_profile` holds one person's details: yours. A label that names a third party — an
+ * emergency contact, a reference, a referrer, a previous employer — is asking for somebody
+ * else's information, and the synonym match is *correct* about the word and wrong about the
+ * person. "Emergency contact phone" really does contain "phone".
+ *
+ * Measured on a corpus of realistic ATS labels 2026-09-09: this one shape accounted for 8 of
+ * 22 false positives, and it is the worst of them. The others put your own data in the wrong
+ * box; these put your phone number where a recruiter expects your reference's.
+ *
+ * A `skip`, not a `blocked`: nothing here is sensitive, we simply have nothing that belongs in
+ * it. Widening the refusal lists to catch a matching bug would misreport why the field was
+ * left alone.
+ */
+const THIRD_PARTY = [
+  /emergency\s*contact/,
+  /next\s*of\s*kin/,
+  /\breferences?\b/,
+  /\breferrer\b|referred\s*by|who\s*referred/,
+  /\bmanager\b|supervisor/,
+  // Your employer is not you. Catches "Last employer" and "Most recent employer name", which
+  // otherwise match `last_name` and would type your surname into a company box.
+  /\bemployer\b/,
+  /\bparent\b|guardian/,
+  /\bspouse\b/,
+];
+
+/**
+ * Openers that mean "write me a paragraph", not "here is a box for your X".
+ *
+ * "Describe a major challenge you overcame" contains "major"; "Tell us about your degree of
+ * involvement" contains "degree". Containment is doing what it was told and the label is still
+ * an essay prompt.
+ *
+ * **Deliberately narrow, and that is the second draft.** The first version treated every
+ * interrogative as a prompt — what, when, where, is, are, do, did — and broke four cases the
+ * suite already pinned, all of them real: "What is your GPA?", "What is your expected
+ * graduation date?", "What degree are you currently pursuing?", "Please select your current
+ * school from the list below". Forms ask for ordinary values as questions all the time. Only
+ * verbs that ask for prose belong here.
+ */
+const ESSAY_PROMPT = /^(describe|explain|tell|share|list|walk|why)\b/;
+
+/**
+ * "How did you hear about us?" and its variants.
+ *
+ * Near-universal on ATS forms, and its options are rendered into the label, so it arrives as
+ * "How did you hear about us? LinkedIn, Indeed, Referral" — which contains "linkedin" as a
+ * whole word and matched `linkedin_url`. The autofill would then type the applicant's LinkedIn
+ * profile URL into a sourcing dropdown. Never one of our fields, whatever it contains.
+ */
+const SOURCING_QUESTION = /\b(how|where)\s+did\s+you\s+(hear|find|learn|discover)\b/;
+
+/**
+ * Single-word synonyms that only count when the label **ends** with them.
+ *
+ * `major` is the case: as a field it is terminal — "Major", "Undergraduate major", "What is
+ * your major?" — and everywhere else in English it is an adjective sitting in front of a noun,
+ * as in "a major challenge" and "your major accomplishment". Requiring it to be label-final
+ * keeps every real field and drops the adjective, which no word list could separate.
+ */
+const TRAILING_ONLY = new Set(["major"]);
+
+/** Keys whose real-world labels are legitimately question-shaped. */
+const ANSWERS_A_QUESTION = new Set(["work_authorization", "needs_sponsorship"]);
+
+/** Whether the label reads as a question at all. Used only to raise the bar, never to lower it. */
+function looksLikeAQuestion(raw, label) {
+  return /\?/.test(raw || "") || /^(what|when|where|which|who|how|do|does|did|are|is|have|has|can|will|would)\b/.test(label);
+}
+
+/**
  * Label text that identifies each profile field, most specific first.
  *
  * Deliberately not including bare "name": on a real form it is as likely to be "Company name"
@@ -104,15 +177,25 @@ const DEMOGRAPHIC = [
  */
 const EXACT_ONLY = {
   full_name: ["name"],
+  // Same hazard as bare "name", found the same way. Each of these is an ordinary English word
+  // that real labels contain without being that field:
+  //   "Last employer", "Last company"        -> your surname
+  //   "First day available"                  -> your forename
+  //   "Mobile development experience"        -> your phone number
+  // A form that labels the box just "First" or "Mobile" still matches exactly; nothing that
+  // merely contains the word does.
+  first_name: ["first"],
+  last_name: ["last"],
+  phone: ["mobile"],
 };
 
 const SYNONYMS = {
-  first_name: ["first name", "given name", "forename", "first"],
-  last_name: ["last name", "surname", "family name", "last"],
+  first_name: ["first name", "given name", "forename"],
+  last_name: ["last name", "surname", "family name"],
   preferred_name: ["preferred name", "nickname", "goes by", "preferred first name"],
   full_name: ["full name", "legal name", "your name", "candidate name", "full legal name"],
   email: ["email", "e mail", "email address", "work email", "personal email"],
-  phone: ["phone", "phone number", "telephone", "mobile", "mobile number", "cell", "cell phone"],
+  phone: ["phone", "phone number", "telephone", "mobile number", "mobile phone", "cell", "cell phone"],
   location: ["location", "city", "current location", "address", "city and state", "where are you located", "current city"],
   school: ["school", "university", "college", "institution", "school name"],
   degree: ["degree", "degree type", "level of education"],
@@ -191,7 +274,20 @@ function classify(rawLabel) {
     if (refuses(pattern)) return { kind: "blocked", reason: "demographic" };
   }
 
-  // Exact match wins outright, including the exact-only labels.
+  // Then: is this field even about you? A third-party label is skipped before any matching,
+  // for the same reason the blocklist is — once "Emergency contact phone" reaches the matcher
+  // it will find "phone", correctly, and be wrong about whose.
+  for (const pattern of THIRD_PARTY) {
+    if (refuses(pattern)) return { kind: "skip" };
+  }
+
+  // An essay prompt or a sourcing dropdown is never one of our fields, whatever words it
+  // happens to contain. Checked before matching, for the same reason the blocklist is.
+  if (ESSAY_PROMPT.test(label) || SOURCING_QUESTION.test(label)) return { kind: "skip" };
+
+  // Exact match wins outright, including the exact-only labels. Checked BEFORE the prompt
+  // shape, because an exact label is a field name however it reads — a box labelled exactly
+  // "Do you have a LinkedIn" is not a thing, but if it ever is, it means what it says.
   for (const [key, phrases] of Object.entries(SYNONYMS)) {
     if (phrases.includes(label)) return { kind: "field", key };
   }
@@ -203,10 +299,11 @@ function classify(rawLabel) {
   const matches = new Map();
   for (const [key, phrases] of Object.entries(SYNONYMS)) {
     for (const phrase of phrases) {
-      if (containsPhrase(label, phrase)) {
-        const best = matches.get(key) || 0;
-        matches.set(key, Math.max(best, phrase.length));
-      }
+      if (!containsPhrase(label, phrase)) continue;
+      // "major" is a field at the end of a label and an adjective anywhere else.
+      if (TRAILING_ONLY.has(phrase) && !label.endsWith(phrase)) continue;
+      const best = matches.get(key) || 0;
+      matches.set(key, Math.max(best, phrase.length));
     }
   }
   if (matches.size === 0) return { kind: "skip" };
@@ -219,7 +316,17 @@ function classify(rawLabel) {
   if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) {
     return { kind: "skip" };
   }
-  return { kind: "field", key: ranked[0][0] };
+
+  // A *question* that matches two different fields is asking about one of them and merely
+  // mentioning the other: "What city is your school located in?" matches `location` and
+  // `school`, and wants neither your city nor your school's name. On a plain label the
+  // longest-phrase rule is a fair tie-break; inside a question it is a guess, and guessing
+  // writes real data into the wrong box.
+  const key = ranked[0][0];
+  if (ranked.length > 1 && looksLikeAQuestion(rawLabel, label) && !ANSWERS_A_QUESTION.has(key)) {
+    return { kind: "skip" };
+  }
+  return { kind: "field", key };
 }
 
 /**
