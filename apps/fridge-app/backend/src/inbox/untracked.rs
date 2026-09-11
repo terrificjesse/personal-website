@@ -76,8 +76,41 @@ pub async fn propose(
         return Ok(false);
     }
 
-    let key = company_key(company_guess);
+    let mut key = company_key(company_guess);
     let role = role_key(title_guess);
+
+    // **Reuse a spelling we already hold for this employer.**
+    //
+    // The company name comes from whatever the email offered — a display name on one, a domain
+    // label on the next. Chicago Trading Company sent both: one carries the name, one only
+    // `chicagotrading.com`, and the two key differently, so one employer became two. Compared
+    // with spaces removed, because a domain has none, and only on a prefix of six or more so
+    // "imc" cannot absorb "imc trading" by accident.
+    let squashed = key.replace(' ', "");
+    if squashed.len() >= 6 {
+        let known: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT company_key FROM application_proposals WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+        if let Some(existing) = known
+            .into_iter()
+            .filter(|k| {
+                // Compared SQUASHED, and equality there is the main case rather than an
+                // excluded one: "chicago trading" and "chicagotrading" are different keys whose
+                // squashed forms are identical, which is exactly the collision to collapse.
+                let theirs = k.replace(' ', "");
+                k != &key
+                    && theirs.len() >= 6
+                    && (theirs.starts_with(&squashed) || squashed.starts_with(&theirs))
+            })
+            // The longest, which is the more fully spelled of the two.
+            .max_by_key(String::len)
+        {
+            key = existing;
+        }
+    }
 
     // **A roleless email is not evidence of a second application.**
     //
@@ -133,7 +166,7 @@ pub async fn propose(
     .bind(user_id)
     .bind(verdict_id)
     .bind(&key)
-    .bind(display_name_for(pool, company_guess).await?)
+    .bind(display_name_for(pool, &key).await?)
     .bind(title_guess)
     .bind(&role)
     .bind(status.as_str())

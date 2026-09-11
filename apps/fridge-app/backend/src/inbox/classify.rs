@@ -623,7 +623,18 @@ pub fn classify_with_body(
 
     // Job-specific and addressed to you, but about no application you made.
     let from_ats = ATS_DOMAINS.iter().any(|domain| sender.contains(domain));
-    let named_company = guess_company(&sender, &headline, &text, context);
+    // **The corpus-backed guess only, deliberately not the sender fallback.**
+    //
+    // This decides whether an email we have no other reason to care about is job-related, and
+    // the bar is "it names a specific employer we have seen hiring". `employer_from_sender`
+    // clears no such bar: it reads a name off almost any domain, so wiring it in here made
+    // ordinary mail look like recruiter outreach — the 13f gate measured junk leaking into
+    // Outreach rise from 0 to 2 the moment it was.
+    //
+    // The fallback is still what names the employer on the verdict. Knowing WHICH company an
+    // application belongs to, once we believe it is one, is a different question from whether
+    // a stranger's email is about a job.
+    let named_company = best_company(&sender, &text, context);
     let from_a_person = !sender.is_empty() && !is_machine_sender(&sender);
 
     if from_ats || (named_company.is_some() && from_a_person) {
@@ -660,7 +671,11 @@ fn guess_company(
     text: &str,
     context: &Context<'_>,
 ) -> Option<String> {
-    best_company(sender, headline, context).or_else(|| {
+    // Corpus first, both passes, THEN the sender. The corpus knows how a company spells its own
+    // name and a domain label does not: "Chicago Trading Company" appears in the body of its own
+    // confirmation, and putting the fallback ahead of that pass renamed it "chicagotrading".
+    best_company(sender, headline, context)
+        .or_else(|| {
         // The body pass only accepts a name distinctive enough to survive four thousand
         // characters of prose. A short single word is not: the corpus contains "Secure", and it
         // matched inside the body of a Workiva information-session invitation. Two words, or
@@ -669,6 +684,161 @@ fn guess_company(
         best_company(sender, text, context)
             .filter(|company| company.contains(' ') || company.len() >= 8)
     })
+    .or_else(|| employer_from_sender(sender, headline, context))
+}
+
+/// Words a careers mailbox appends to its employer's name.
+const SENDER_ROLE_WORDS: &[&str] = &[
+    "careers", "career", "early", "recruiting", "recruitment", "talent", "acquisition",
+    "hiring", "team", "university", "campus", "support", "notifications", "notification",
+    "reply", "noreply", "donotreply", "jobs", "job", "hr", "people", "no", "do", "not",
+    "the", "at", "via", "info", "admin", "mail", "mailer", "system", "systemmessage",
+    "message", "messages", "alerts", "alert", "service", "services", "us", "inc", "llc",
+];
+
+/// Hosts that send on somebody else's behalf, so their domain names no employer.
+const RELAY_DOMAINS: &[&str] = &[
+    "joinhandshake.com", "handshake.com", "gmail.com", "googlemail.com", "outlook.com",
+    "hotmail.com", "yahoo.com", "icloud.com", "andrew.cmu.edu", "cmu.edu", "sendgrid.net",
+    "mailgun.org", "amazonses.com", "hackerrank.com", "codesignal.com", "eightfold.ai",
+];
+
+/// The employer, guessed from who sent it and what the subject says, when the postings corpus
+/// has never heard of them.
+///
+/// **Most employers are not in the corpus.** It only knows companies we have collected postings
+/// from, so Workiva (0 postings), the Oklahoma City Thunder and two companies reached through
+/// Handshake produced no guess at all and were dropped — real applications, invisible. Every one
+/// of them names its employer plainly: in the sender's display name, in its domain, in the local
+/// part, or in the subject.
+///
+/// Ordered by how much the source can be trusted, and each candidate still has to pass
+/// [`company_match::is_company_name`], which is what rejects "careers" and "no reply".
+fn employer_from_sender(sender: &str, headline: &str, context: &Context<'_>) -> Option<String> {
+    // 1. "Application sent to <employer>" — Handshake's receipt, forwarded by hand, where the
+    //    sender is the user themselves and says nothing.
+    for marker in ["application sent to ", "application to "] {
+        if let Some(at) = headline.find(marker) {
+            let tail = &headline[at + marker.len()..];
+            let name = tail
+                .split(['-', '—', ':', '|', ','])
+                .next()
+                .unwrap_or(tail)
+                .trim();
+            if let Some(name) = clean_employer(name) {
+                return Some(canonicalize(name, context));
+            }
+        }
+    }
+
+    let (display, address) = split_sender(sender);
+    let from_relay = RELAY_DOMAINS
+        .iter()
+        .any(|relay| address.ends_with(relay) || address.ends_with(&format!(".{relay}")));
+
+    // 2. The display name — human-written, and spells the employer the way the employer does.
+    //    Checked BEFORE the domain, which gives a squashed slug: one Chicago Trading Company
+    //    email carries the name and another only `chicagotrading.com`, and taking the domain
+    //    first produced two employers for one company.
+    //
+    //    Skipped on a relay. There the display name is a person — on a forwarded Handshake
+    //    receipt it is the user themselves, and reading that as an employer would file their
+    //    applications under their own name.
+    if !from_relay
+        && let Some(name) = clean_employer(&display)
+    {
+        return Some(canonicalize(name, context));
+    }
+
+    // 3. The domain, unless it belongs to an ATS or a relay — `recruiting.workiva.com` is
+    //    Workiva, `myworkday.com` is nobody.
+    if let Some(domain) = address.rsplit('@').next() {
+        let is_relay = ATS_DOMAINS.iter().chain(RELAY_DOMAINS.iter()).any(|d| domain.ends_with(d));
+        if !is_relay {
+            let labels: Vec<&str> = domain.split('.').collect();
+            if labels.len() >= 2
+                && let Some(name) = clean_employer(labels[labels.len() - 2])
+            {
+                return Some(canonicalize(name, context));
+            }
+        }
+    }
+
+    // 4. The local part, where an employer's name ends up when the domain is an ATS:
+    //    `workiva@myworkday.com`.
+    //
+    //    Gated on the sender not being a machine mailbox, because that is precisely where a
+    //    local part stops naming anybody: `systemmessage@paycomonline.com` yielded
+    //    "systemmessage", which is not a company and reads like one to every check downstream.
+    if from_relay || is_machine_sender(sender) {
+        return None;
+    }
+    address
+        .split('@')
+        .next()
+        .and_then(|local| clean_employer(&local.replace(['-', '.', '_'], " ")))
+        .map(|name| canonicalize(name, context))
+}
+
+/// Spell a guessed employer the way the corpus spells it, when the corpus knows them.
+///
+/// A domain gives "chicagotrading" and the corpus says "chicago trading company". Left alone
+/// those are two different `company_key`s and therefore two applications at one employer — the
+/// duplicate that showed up the first time this fallback ran. Compared with spaces removed,
+/// because a domain has none.
+fn canonicalize(name: String, context: &Context<'_>) -> String {
+    let squashed = name.replace(' ', "");
+    context
+        .known_companies
+        .iter()
+        .filter(|known| {
+            let theirs = known.replace(' ', "");
+            theirs == squashed || theirs.starts_with(&squashed) && squashed.len() >= 6
+        })
+        // The shortest match, so "chicagotrading" prefers "chicago trading company" over any
+        // longer name that merely begins the same way.
+        .min_by_key(|known| known.len())
+        .cloned()
+        .unwrap_or(name)
+}
+
+/// `"Name" <a@b>` split into its two halves, lowercased.
+fn split_sender(sender: &str) -> (String, String) {
+    match sender.split_once('<') {
+        Some((display, rest)) => (
+            display.trim().trim_matches('"').to_lowercase(),
+            rest.trim_end_matches('>').trim().to_lowercase(),
+        ),
+        None => (String::new(), sender.trim().to_lowercase()),
+    }
+}
+
+/// Strip the role words a careers mailbox appends, and refuse what is left if it is not a name.
+fn clean_employer(raw: &str) -> Option<String> {
+    // Token-wise, from both ends. Phrase-matching left dangling halves: "Workiva Early Career"
+    // lost "career" and kept "early", yielding "workiva early" — a company that does not exist
+    // and would key separately from Workiva.
+    let mut tokens: Vec<String> = raw
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    while tokens.last().is_some_and(|t| SENDER_ROLE_WORDS.contains(&t.as_str())) {
+        tokens.pop();
+    }
+    while tokens.first().is_some_and(|t| SENDER_ROLE_WORDS.contains(&t.as_str())) {
+        tokens.remove(0);
+    }
+
+    let name = tokens.join(" ");
+    // The same bar every other company guess clears: not a generic word, not parsing debris.
+    if crate::internships::company_match::is_company_name(&name) && name.len() >= 3 {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 fn best_company(sender: &str, text: &str, context: &Context<'_>) -> Option<String> {
@@ -1058,11 +1228,18 @@ mod tests {
             ("hr@somecorp.example", "Hello"),
         ] {
             let verdict = classify(Some(from), Some(subject), Some(""), &context);
-            assert_eq!(
-                verdict.company_guess, None,
-                "{from} should name no company, got {:?}",
-                verdict.company_guess
-            );
+            // **The property is that no name is matched out of the MIDDLE of a word**, not that
+            // no name is produced at all. Since the sender fallback landed, "Oklahoma City
+            // Thunder" is correctly read from the display name and "somecorp" from the domain —
+            // both real employers, neither a substring accident. What must never appear is a
+            // known-company name that is only there by coincidence.
+            let guess = verdict.company_guess.clone().unwrap_or_default();
+            for accident in &known {
+                assert_ne!(
+                    &guess, accident,
+                    "{from} matched {accident:?} inside an ordinary word"
+                );
+            }
         }
     }
 
@@ -1144,7 +1321,10 @@ mod tests {
             None,
             &context,
         );
-        assert_eq!(verdict.company_guess, None, "no employer is better than the wrong one");
+        // Since the sender fallback landed this DOES name an employer — and the property the
+        // test protects is unchanged: it must not be the ATS. `myworkday.com` is in the list
+        // above and is still never the answer.
+        assert_eq!(verdict.company_guess.as_deref(), Some("workiva"));
     }
 
     // ---- 2026-09-10: rejections missed, confirmations read as interviews ----
@@ -1363,15 +1543,84 @@ mod tests {
     }
 
     #[test]
+    fn an_employer_absent_from_the_corpus_is_still_named() {
+        // Every one of these is a real sender whose application was dropped entirely, because
+        // the guesser only knew companies we had collected postings from. Workiva has none.
+        let companies: Vec<String> = vec!["stripe".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let guess = |from: &str, subject: &str| {
+            classify(Some(from), Some(subject), None, &ctx).company_guess
+        };
+
+        // The local part, when the domain belongs to an ATS.
+        assert_eq!(
+            guess("workiva@myworkday.com", "Workiva Careers: Application for Summer 2027 Intern"),
+            Some("workiva".to_string())
+        );
+        // The display name, whole — a name that is three ordinary words and still an employer.
+        assert_eq!(
+            guess("Oklahoma City Thunder <donotreply@msg.paycomonline.com>", "Password setup"),
+            Some("oklahoma city thunder".to_string())
+        );
+        // The domain, with the careers subdomain ignored.
+        assert_eq!(
+            guess("Workiva Early Career <EarlyCareer@recruiting.workiva.com>", "Info session"),
+            Some("workiva".to_string())
+        );
+        // The subject, when the sender is you forwarding a Handshake receipt.
+        assert_eq!(
+            guess("Jesse Li <jesseli@andrew.cmu.edu>", "Fwd: Application sent to Glencliff Labs — here's what's next"),
+            Some("glencliff labs".to_string())
+        );
+    }
+
+    #[test]
+    fn the_fallback_refuses_a_relay_and_a_role_word() {
+        let companies: Vec<String> = vec!["stripe".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let guess = |from: &str| classify(Some(from), Some("Hello"), None, &ctx).company_guess;
+
+        // An ATS is not an employer, and neither is the mailbox it sends from.
+        assert_eq!(guess("no-reply@greenhouse.io"), None);
+        assert_eq!(guess("no-reply@ashbyhq.com"), None);
+        // Nor a relay, nor the user's own address.
+        assert_eq!(guess("Jesse Li <jesseli@andrew.cmu.edu>"), None);
+        assert_eq!(guess("notifications@joinhandshake.com"), None);
+        // Nor a generic careers mailbox with nothing else in it.
+        assert_eq!(guess("Careers <careers@myworkday.com>"), None);
+    }
+
+    #[test]
+    fn a_known_company_still_beats_the_fallback() {
+        // The fallback is a last resort: the corpus knows how a company spells its own name,
+        // and a domain label does not.
+        let companies: Vec<String> = vec!["jump trading".to_string()];
+        let ctx = Context { known_companies: &companies };
+        assert_eq!(
+            classify(
+                Some("no-reply@jumptrading.com"),
+                Some("Thank you for applying to Jump Trading"),
+                None,
+                &ctx
+            )
+            .company_guess
+            .as_deref(),
+            Some("jump trading")
+        );
+    }
+
+    #[test]
     fn a_short_company_name_is_not_guessed_from_prose() {
         // The corpus really contains "Secure", and it matched inside the body of a Workiva
         // information-session invitation. A name short enough to be an ordinary word is only
         // trusted from the sender or the subject, which the first pass reads.
         let companies: Vec<String> = vec!["secure".to_string(), "jump trading".to_string()];
         let ctx = Context { known_companies: &companies };
+        // A relay sender, so the fallback cannot name anyone either and the body is the only
+        // candidate — which is the case under test.
         let verdict = classify_with_body(
-            Some("events@workiva.com"),
-            Some("Join Workiva's Internship Information Session!"),
+            Some("Someone <someone@gmail.com>"),
+            Some("An invitation"),
             None,
             Some("Please secure your spot by registering before Friday."),
             &ctx,

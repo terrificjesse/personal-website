@@ -220,6 +220,57 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
         });
     }
 
+    // An unreviewed proposal carries the status the classifier implied WHEN IT WAS MADE, and a
+    // re-classification can change that implication. Two real ones said `interview` because
+    // they were created before bare "interview" stopped matching a description — accepting
+    // either would have tracked a confirmation as an interview.
+    // Refreshed for EVERY unreviewed proposal, not only the ones that moved in this pass. A
+    // proposal froze the status implied when it was made, and a verdict corrected by an
+    // *earlier* run leaves it stale for ever — which is why Optiver and Hudson River still read
+    // `interview` two corrections after bare "interview" stopped matching a description.
+    // Accepting either would have tracked a confirmation as an interview.
+    if !dry_run {
+        // The mapping lives in `advance::implied_status` and is applied here rather than
+        // rewritten as SQL: `category` and `implied_status` are different vocabularies —
+        // `confirmation` implies `applied` — and a second copy of that translation would be a
+        // second place for it to drift.
+        let pending: Vec<(String, String)> = sqlx::query_as(
+            "SELECT p.id,
+                    (SELECT v.category FROM email_verdicts v
+                      WHERE v.message_id = (SELECT message_id FROM email_verdicts WHERE id = p.verdict_id)
+                      ORDER BY v.created_at DESC LIMIT 1) AS category
+               FROM application_proposals p
+              WHERE p.reviewed_at IS NULL",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let mut refreshed = 0;
+        for (id, category) in &pending {
+            let Some(category) = Category::parse(category) else {
+                continue;
+            };
+            let Some(status) = super::advance::implied_status(category) else {
+                continue;
+            };
+            if !super::untracked::creatable_status(status) {
+                continue;
+            }
+            refreshed += sqlx::query(
+                "UPDATE application_proposals SET implied_status = ?2
+                  WHERE id = ?1 AND implied_status <> ?2",
+            )
+            .bind(id)
+            .bind(status.as_str())
+            .execute(pool)
+            .await?
+            .rows_affected();
+        }
+        if refreshed > 0 {
+            println!("reclassify: refreshed the implied status of {refreshed} pending proposal(s)");
+        }
+    }
+
     if !unreachable_bodies.is_empty() {
         eprintln!(
             "reclassify: {} message(s) skipped — their body could not be fetched, and a \
