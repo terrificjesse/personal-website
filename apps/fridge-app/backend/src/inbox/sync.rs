@@ -142,8 +142,8 @@ pub async fn run(
 
     // The applications an email can be matched to. Loaded once, like the company list — the
     // matcher is a pure function and everything it needs arrives as an argument.
-    let applications: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, company_name FROM internship_applications WHERE user_id = ?",
+    let applications: Vec<advance::TrackedApplication> = sqlx::query_as(
+        "SELECT id, company_name AS company, title FROM internship_applications WHERE user_id = ?",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -519,7 +519,7 @@ async fn propose_status(
     user_id: &str,
     message: &gmail::Message,
     verdict: &classify::EmailVerdict,
-    applications: &[(String, String)],
+    applications: &[advance::TrackedApplication],
     threshold: Option<f64>,
     now: DateTime<Utc>,
 ) -> Result<bool> {
@@ -527,7 +527,11 @@ async fn propose_status(
         return Ok(false);
     };
     let Some(application_id) =
-        advance::match_application(verdict.company_guess.as_deref(), applications)
+        advance::match_application(
+            verdict.company_guess.as_deref(),
+            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
+            applications,
+        )
     else {
         // Rule 8 still holds: the email is classified, stored and — if pressing — alerted
         // regardless. But "no match" has two causes and they are not the same problem.
@@ -548,7 +552,7 @@ async fn propose_status(
             user_id,
             &verdict_id,
             company,
-            untracked::title_from_subject(message.subject.as_deref()).as_deref(),
+            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
             to_status,
             now,
         )
@@ -669,7 +673,7 @@ async fn record_deadline(
     user_id: &str,
     message: &gmail::Message,
     verdict: &classify::EmailVerdict,
-    applications: &[(String, String)],
+    applications: &[advance::TrackedApplication],
     now: DateTime<Utc>,
 ) -> Result<bool> {
     let received = message
@@ -697,7 +701,11 @@ async fn record_deadline(
     };
 
     let application_id =
-        advance::match_application(verdict.company_guess.as_deref(), applications);
+        advance::match_application(
+            verdict.company_guess.as_deref(),
+            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
+            applications,
+        );
 
     let inserted = sqlx::query(
         "INSERT INTO application_deadlines

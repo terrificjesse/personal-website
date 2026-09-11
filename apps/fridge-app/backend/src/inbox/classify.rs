@@ -223,6 +223,16 @@ const ASSESSMENT: &[&str] = &[
     "codesignal",
     "codility",
     "karat",
+    // An assessment you already have and are about to LOSE. Real mail, disregarded:
+    // "[Action Required] Your Roblox Assessments Expire in 24 hours". Rule 8 calls a disregarded
+    // pressing message the costliest failure in the system, and an expiring OA is exactly that —
+    // the deadline is the whole point of telling you.
+    "assessment expires",
+    "assessments expire",
+    "assessment will expire",
+    "assessments will expire",
+    "assessment have expired",
+    "assessments have expired",
 ];
 
 /// An invitation *to* an assessment, where the two words are separated by template prose.
@@ -250,6 +260,21 @@ const CONFIRMATION: &[&str] = &[
     // Real mail: "Thank you for submitting your application for a position at Roblox!" —
     // the "applying"/"received" families both miss it.
     "submitting your application",
+    // Microsoft Careers' wording. Nine real confirmations — nine DIFFERENT roles — were
+    // disregarded because every marker above wants "applying", "received" or "submitted", and
+    // this says *"thank you for taking the time to submit your application for …"*.
+    //
+    // "taking the time to submit" and not the shorter "taking the time to apply", deliberately.
+    // The short form opens a polite REJECTION just as often — Epic Games' begins "thank you so
+    // much for taking the time to apply", and its refusal sits past the 200-character snippet
+    // where nothing can see it. Matching the short form would file that as a confirmation,
+    // which is worse than leaving it unclassified.
+    "taking the time to submit your application",
+    "time to submit your application",
+    // Handshake forwards an "Application sent to <employer>" receipt. Two real ones were
+    // disregarded — both for small companies that appear in no posting, which is why the
+    // company guesser could not help either.
+    "application sent to",
     "submitted your application",
     "for submitting your",
 ];
@@ -352,7 +377,7 @@ fn haystack(subject: Option<&str>, snippet: Option<&str>) -> String {
 /// Deliberately a short fixed table rather than a dependency. These are the entities Gmail
 /// actually emits in snippets; anything else passes through unchanged and simply fails to match,
 /// which is the safe direction.
-fn decode_entities(text: &str) -> String {
+pub fn decode_entities(text: &str) -> String {
     text.replace("&#39;", "'")
         .replace("&#x27;", "'")
         .replace("&rsquo;", "'")
@@ -1074,6 +1099,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn microsofts_wording_is_a_confirmation() {
+        // Nine real confirmations, nine different roles, all disregarded: every confirmation
+        // marker wanted "applying", "received" or "submitted", and this says neither.
+        assert_eq!(
+            verdict_for(
+                "Thank you for your application!",
+                "Hi Jesse, Thank you for taking the time to submit your application for Software Engineer: Data Platform"
+            ),
+            Category::Confirmation
+        );
+    }
+
+    #[test]
+    fn the_short_polite_opener_is_not_claimed_by_either_side() {
+        // "taking the time to APPLY" opens Microsoft-style confirmations and polite rejections
+        // alike — Epic Games' rejection begins with it and puts the refusal past the snippet.
+        // Claiming it for confirmation would file a rejection as an open application, which is
+        // worse than leaving it unclassified, so only the longer "submit your application"
+        // form is a marker.
+        assert_eq!(
+            verdict_for(
+                "Update from Epic Games",
+                "Thank you so much for taking the time to apply for the Gameplay Programmer Intern role. We know a lot of thought went into"
+            ),
+            Category::Disregarded
+        );
+    }
+
+    #[test]
+    fn a_forwarded_handshake_receipt_is_a_confirmation() {
+        // Two real ones, both for companies that appear in no posting — so the company guesser
+        // could not help either, and the message was dropped entirely.
+        assert_eq!(
+            verdict_for(
+                "Fwd: Application sent to Glencliff Labs — here's what's next",
+                "---------- Forwarded message --------- From: Handshake"
+            ),
+            Category::Confirmation
+        );
+    }
+
+    #[test]
+    fn an_expiring_assessment_is_pressing() {
+        // Rule 8: a disregarded pressing message is the costliest failure here, and an OA you
+        // are about to lose is exactly that. Both real subjects.
+        assert_eq!(
+            verdict_for("[Action Required] Your Roblox Assessments Expire in 24 hours", ""),
+            Category::Oa
+        );
+        assert_eq!(
+            verdict_for("Your Roblox Assessments Have Expired", ""),
+            Category::Oa
+        );
+    }
+
     /// Re-classify a COPY of the live mailbox and print what changed. Ignored; never in CI.
     ///
     ///   INBOX_PROBE_DB=/path/copy.db cargo test classify::tests::probe -- --ignored --nocapture
@@ -1089,8 +1170,14 @@ mod tests {
         let ctx = Context { known_companies: &companies };
 
         let rows: Vec<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+            // The NEWEST verdict per message. Joining all of them counts a re-classified
+            // message twice and reports more rows than there are messages, which is how this
+            // probe first read 87 rows for 83 messages.
             "SELECT m.subject, m.from_address, m.snippet, v.category
-               FROM email_messages m JOIN email_verdicts v ON v.message_id = m.id
+               FROM email_messages m
+               JOIN email_verdicts v ON v.id = (
+                   SELECT id FROM email_verdicts
+                    WHERE message_id = m.id ORDER BY created_at DESC LIMIT 1)
               ORDER BY m.received_at",
         ).fetch_all(&pool).await.expect("rows");
 

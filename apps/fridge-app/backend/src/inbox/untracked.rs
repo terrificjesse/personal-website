@@ -76,19 +76,66 @@ pub async fn propose(
         return Ok(false);
     }
 
+    let key = company_key(company_guess);
+    let role = role_key(title_guess);
+
+    // **A roleless email is not evidence of a second application.**
+    //
+    // The role is only sometimes in the text. Two emails about one opening — one naming the
+    // job, one a bare "thanks for applying" — would otherwise key differently and ask twice.
+    // Seen on the first real run: Adobe, Datadog, Two Sigma and Vercel each produced a roleless
+    // proposal beside a roled one. So:
+    //
+    //   - a roleless email proposes nothing when that company already has any proposal, and
+    //   - a roled email UPGRADES an unreviewed roleless proposal rather than sitting beside it.
+    //
+    // The per-role key still does its job for Microsoft's nine, because those nine all name
+    // their role. This only collapses the case where we genuinely cannot tell them apart.
+    if role.is_empty() {
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM application_proposals WHERE user_id = ?1 AND company_key = ?2",
+        )
+        .bind(user_id)
+        .bind(&key)
+        .fetch_one(pool)
+        .await?;
+        if existing > 0 {
+            return Ok(false);
+        }
+    } else {
+        let upgraded = sqlx::query(
+            "UPDATE application_proposals
+                SET role_key = ?3, title = ?4, verdict_id = ?5
+              WHERE user_id = ?1 AND company_key = ?2
+                AND role_key = '' AND reviewed_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(&key)
+        .bind(&role)
+        .bind(title_guess)
+        .bind(verdict_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if upgraded == 1 {
+            return Ok(true);
+        }
+    }
+
     let inserted = sqlx::query(
         "INSERT INTO application_proposals
-             (id, user_id, verdict_id, company_key, company_name, title,
+             (id, user_id, verdict_id, company_key, company_name, title, role_key,
               implied_status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT (user_id, company_key) DO NOTHING",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT (user_id, company_key, role_key) DO NOTHING",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(user_id)
     .bind(verdict_id)
-    .bind(company_key(company_guess))
+    .bind(&key)
     .bind(display_name_for(pool, company_guess).await?)
     .bind(title_guess)
+    .bind(&role)
     .bind(status.as_str())
     .bind(now.to_rfc3339())
     .execute(pool)
@@ -142,15 +189,59 @@ fn title_case(company: &str) -> String {
 /// precisely so the panel can say "role unknown" instead of showing a guess, and a subject like
 /// "Thank you for applying to Stripe!" names no role at all. Inventing "Software Engineer
 /// Intern" there would put a fabrication in the column an audit trail reads.
+pub fn role_from(subject: Option<&str>, snippet: Option<&str>) -> Option<String> {
+    // Subject first: when it names the role it names it cleanly. Microsoft's does not — nine
+    // real confirmations all read "Thank you for your application!" and put the role in the
+    // body preview, which is why the snippet is tried at all.
+    title_from_subject(subject).or_else(|| title_from_subject(snippet))
+}
+
+/// A role reduced to a comparison key: lowercase, alphanumerics and single spaces.
+///
+/// Two emails about the same application must produce the same key, and two applications at one
+/// company must not. `None` becomes the empty string — an email that names no role is not
+/// evidence of a *different* application, so every roleless email at a company collapses
+/// together, which is what keeps five Stripe autoresponders one proposal instead of five.
+pub fn role_key(role: Option<&str>) -> String {
+    role.map(|role| {
+        let words: Vec<&str> = role
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect();
+        // Drop a trailing requisition id. Tesla sent the same opening twice, once as
+        // "…Access Control Systems (Fall 2026), 277192" and once without, and a key that kept
+        // the number proposed one application as two.
+        let end = words
+            .iter()
+            .rposition(|word| !word.chars().all(|c| c.is_ascii_digit()) || word.len() < 5)
+            .map_or(0, |i| i + 1);
+        words[..end]
+            .iter()
+            .map(|word| word.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .unwrap_or_default()
+}
+
 pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
-    let subject = subject?;
+    // Real mail is HTML-escaped, so a role reaches this as "Summer &#39;27" and would be stored
+    // with the entity in it, in the column the tracker renders.
+    let subject = crate::inbox::classify::decode_entities(subject?);
+    let subject = subject.as_str();
     let lower = subject.to_lowercase();
     // Only the shapes that genuinely carry a role, and only the text after the marker.
     for marker in [
         "your application for ",
         "application for ",
         "applying to the ",
+        "application to the ",
+        "applying to our ",
         "application: ",
+        "following position: ",
+        "position: ",
+        "for the position of ",
+        "interest in the ",
     ] {
         if let Some(at) = lower.find(marker) {
             let tail = subject[at + marker.len()..].trim();
@@ -160,16 +251,63 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
                 .next()
                 .unwrap_or(tail)
                 .trim();
-            let tail = tail
-                .strip_prefix("the ")
-                .or_else(|| tail.strip_prefix("The "))
-                .unwrap_or(tail);
+            // Leading noise the surrounding sentence leaves behind: an article, a possessive,
+            // or a requisition number the ATS prefixes to the title. All real —
+            // "our [Summer 2027] Software Engineer Intern", "R171519 2027 Intern - …".
+            let mut tail = tail;
+            loop {
+                let before = tail;
+                for prefix in [
+                    "the ", "The ", "our ", "Our ", "a ", "an ",
+                    // "…your application for the following position: Software Engineer…"
+                    "following position: ", "Following position: ",
+                    "following role: ", "position: ", "Position: ", "role of ",
+                ] {
+                    tail = tail.strip_prefix(prefix).unwrap_or(tail);
+                }
+                tail = tail.trim_start_matches(['[', ']', '-', ':', ' ']);
+                // A requisition id: one leading token that is letters-then-digits or all digits,
+                // and is not itself a word. "R171519", "20005432".
+                if let Some((first, rest)) = tail.split_once(' ')
+                    && first.len() >= 5
+                    && first.chars().any(|c| c.is_ascii_digit())
+                    && first.chars().all(|c| c.is_ascii_alphanumeric())
+                    && !first.chars().all(|c| c.is_alphabetic())
+                {
+                    tail = rest.trim_start();
+                }
+                if tail == before {
+                    break;
+                }
+            }
             // The subject's own sentence, not part of the role: "... Intern role",
             // "... Position". Trimmed so the tracker shows a title and not a clause.
-            let tail = ["role", "Role", "position", "Position"]
+            // A role is a noun phrase, not the rest of the paragraph. Real extractions ran on
+            // into "… Software Engineer role. We loved reading about…", so the title is cut at
+            // the first sentence end before anything else is trimmed.
+            let tail = tail
+                .split_inclusive(['.', '!', '?', ';'])
+                .next()
+                .unwrap_or(tail);
+            // …and where the sentence stops naming the job and starts addressing you. A
+            // heuristic, and an admitted one: extracting a noun phrase from prose with
+            // substrings has a floor, and the honest failure is a title that is too long rather
+            // than one that is wrong. The role is still identifiable, and editable once tracked.
+            let tail = [" and are ", " and we ", " and you ", " What happens", " what happens"]
                 .iter()
-                .fold(tail, |acc, suffix| acc.trim_end().trim_end_matches(suffix))
-                .trim();
+                .fold(tail, |acc, cut| acc.split(cut).next().unwrap_or(acc));
+            let mut tail = tail.trim_end().trim_end_matches(['.', '!', '?', ';', ',', ' ']);
+            loop {
+                let before = tail;
+                for suffix in ["role", "Role", "position", "Position", "job", "Job", "opportunity"] {
+                    tail = tail.trim_end().trim_end_matches(suffix);
+                }
+                tail = tail.trim_end().trim_end_matches(['.', '!', ',', ']', ' ']);
+                if tail == before {
+                    break;
+                }
+            }
+            let tail = tail.trim();
             if tail.len() >= 4 && tail.len() <= 120 && tail.to_lowercase().contains("intern") {
                 return Some(tail.to_string());
             }
@@ -413,13 +551,17 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
 
         // Scoped to this message's own user, so a second account's applications can never
         // satisfy the match for the first one's mail.
-        let applications: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, company_name FROM internship_applications WHERE user_id = ?")
+        let applications: Vec<super::advance::TrackedApplication> =
+            sqlx::query_as("SELECT id, company_name AS company, title FROM internship_applications WHERE user_id = ?")
                 .bind(user_id)
                 .fetch_all(pool)
                 .await?;
-        if super::advance::match_application(verdict.company_guess.as_deref(), &applications)
-            .is_some()
+        if super::advance::match_application(
+            verdict.company_guess.as_deref(),
+            role_from(subject.as_deref(), snippet.as_deref()).as_deref(),
+            &applications,
+        )
+        .is_some()
         {
             report.already_tracked += 1;
             continue;
@@ -459,7 +601,7 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
             user_id,
             &verdict_id,
             company,
-            title_from_subject(subject.as_deref()).as_deref(),
+            role_from(subject.as_deref(), snippet.as_deref()).as_deref(),
             status,
             now,
         )
@@ -748,6 +890,90 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 1, "one company, one question");
+    }
+
+    #[test]
+    fn a_trailing_requisition_id_does_not_make_a_second_application() {
+        // Tesla sent one opening twice, once with the id appended. Keeping it in the key
+        // proposed the same application as two.
+        assert_eq!(
+            role_key(Some("Integration Engineer, Access Control Systems (Fall 2026), 277192")),
+            role_key(Some("Integration Engineer, Access Control Systems (Fall 2026)"))
+        );
+        // A short number is part of the role, not an id: "Summer 2027" must not be stripped.
+        assert_ne!(role_key(Some("SWE Intern 2027")), role_key(Some("SWE Intern")));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn different_roles_at_one_company_are_different_applications(pool: SqlitePool) {
+        // The reported bug: nine Microsoft confirmations for nine roles produced one proposal,
+        // so the tracker read 14 when it should have read far more.
+        let user = seed_user(&pool).await;
+        let now = Utc::now();
+        for (n, role) in ["SWE Intern: AI/ML", "SWE Intern: Security", "Firmware Intern"]
+            .iter()
+            .enumerate()
+        {
+            let verdict = seed_verdict(&pool, &format!("m{n}")).await;
+            assert!(
+                propose(&pool, &user, &verdict, "microsoft", Some(role), ApplicationStatus::Applied, now)
+                    .await
+                    .expect("propose")
+            );
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM application_proposals")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 3, "three roles, three applications");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_roleless_email_never_duplicates_a_company_already_proposed(pool: SqlitePool) {
+        // Half the autoresponders name no job. Keying those as their own application would
+        // propose a duplicate for every one — the failure the original per-company key was
+        // written to prevent, and still real.
+        let user = seed_user(&pool).await;
+        let now = Utc::now();
+        let first = seed_verdict(&pool, "m1").await;
+        propose(&pool, &user, &first, "stripe", Some("SWE Intern"), ApplicationStatus::Applied, now)
+            .await
+            .expect("propose");
+
+        let second = seed_verdict(&pool, "m2").await;
+        assert!(
+            !propose(&pool, &user, &second, "stripe", None, ApplicationStatus::Applied, now)
+                .await
+                .expect("propose"),
+            "a roleless email is not evidence of a second application"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn learning_the_role_upgrades_the_proposal_rather_than_adding_one(pool: SqlitePool) {
+        // Two emails about one opening, one naming the job. Seen on the first real run for
+        // Adobe, Datadog, Two Sigma and Vercel.
+        let user = seed_user(&pool).await;
+        let now = Utc::now();
+        let first = seed_verdict(&pool, "m1").await;
+        propose(&pool, &user, &first, "datadog", None, ApplicationStatus::Applied, now)
+            .await
+            .expect("propose");
+
+        let second = seed_verdict(&pool, "m2").await;
+        assert!(
+            propose(&pool, &user, &second, "datadog", Some("SWE Intern (Summer)"), ApplicationStatus::Applied, now)
+                .await
+                .expect("propose")
+        );
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT role_key, title FROM application_proposals")
+                .fetch_all(&pool)
+                .await
+                .expect("rows");
+        assert_eq!(rows.len(), 1, "still one application, now with its role");
+        assert_eq!(rows[0].1.as_deref(), Some("SWE Intern (Summer)"));
     }
 
     #[sqlx::test(migrations = "./migrations")]

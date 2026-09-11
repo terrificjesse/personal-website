@@ -82,7 +82,18 @@ pub fn may_auto_apply(to: ApplicationStatus, confidence: f64, threshold: Option<
     threshold.is_some_and(|threshold| confidence >= threshold)
 }
 
-/// The best application for an email, by company.
+/// An application as the matcher needs to see it.
+///
+/// Carries the title because the unit of matching is a (company, role) pair — see
+/// [`match_application`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TrackedApplication {
+    pub id: String,
+    pub company: String,
+    pub title: Option<String>,
+}
+
+/// The best application for an email, by company and role.
 ///
 /// Fuzzy, and **enrichment rather than a gate** — rule 8. A miss means the email is still
 /// classified, still labelled and still alerted, with no application attached.
@@ -92,18 +103,36 @@ pub fn may_auto_apply(to: ApplicationStatus, confidence: f64, threshold: Option<
 /// from the two that exist.
 pub fn match_application<'a>(
     company_guess: Option<&str>,
-    applications: &'a [(String, String)],
+    role_guess: Option<&str>,
+    applications: &'a [TrackedApplication],
 ) -> Option<&'a str> {
     let wanted = company_key(company_guess?);
     if wanted.is_empty() {
         return None;
     }
+    // The role the email names, if it names one. Empty means "this email does not say", which
+    // is not the same as "a different role" — see the filter below.
+    let wanted_role = super::untracked::role_key(role_guess);
 
     let mut best: Option<(&str, f64)> = None;
-    for (id, company) in applications {
+    for TrackedApplication { id, company, title } in applications {
         let key = company_key(company);
         if key.is_empty() {
             continue;
+        }
+        // **An application is a (company, role) pair, not a company.** Nine Microsoft
+        // confirmations for nine different roles all matched the one tracked Microsoft
+        // application, so eight real applications were never proposed and the tracker read 14
+        // when it should have read far more.
+        //
+        // Asymmetric on purpose: when the email names no role we fall back to company-only
+        // matching, because refusing to match there would propose a duplicate for every
+        // roleless autoresponder. When it DOES name one, it has to agree.
+        if !wanted_role.is_empty() {
+            let their_role = super::untracked::role_key(title.as_deref());
+            if !their_role.is_empty() && their_role != wanted_role {
+                continue;
+            }
         }
         let score = if key == wanted {
             1.0
@@ -199,32 +228,77 @@ mod tests {
         assert_eq!(implied_status(Category::Disregarded), None);
     }
 
-    fn applications() -> Vec<(String, String)> {
+    fn app(id: &str, company: &str, title: Option<&str>) -> TrackedApplication {
+        TrackedApplication {
+            id: id.into(),
+            company: company.into(),
+            title: title.map(str::to_string),
+        }
+    }
+
+    fn applications() -> Vec<TrackedApplication> {
         vec![
-            ("a1".into(), "Roblox".into()),
-            ("a2".into(), "Jump Trading".into()),
-            ("a3".into(), "Tesla".into()),
+            app("a1", "Roblox", Some("Software Engineer Intern")),
+            app("a2", "Jump Trading", None),
+            app("a3", "Tesla", Some("Firmware Intern")),
         ]
     }
 
     #[test]
     fn a_company_matches_its_application() {
-        assert_eq!(match_application(Some("roblox"), &applications()), Some("a1"));
-        assert_eq!(match_application(Some("Jump Trading"), &applications()), Some("a2"));
+        assert_eq!(match_application(Some("roblox"), None, &applications()), Some("a1"));
+        assert_eq!(match_application(Some("Jump Trading"), None, &applications()), Some("a2"));
     }
 
     #[test]
     fn a_suffix_variant_still_matches() {
         // company_key already collapses these; this asserts we are actually using it.
-        assert_eq!(match_application(Some("Roblox Corporation"), &applications()), Some("a1"));
+        assert_eq!(
+            match_application(Some("Roblox Corporation"), None, &applications()),
+            Some("a1")
+        );
     }
 
     #[test]
     fn an_unknown_company_matches_nothing_rather_than_the_nearest_one() {
         // The expensive failure is attaching an email to someone else's application, which
         // then proposes a status change on it. Rule 8 already makes the no-match case safe.
-        assert_eq!(match_application(Some("Datadog"), &applications()), None);
-        assert_eq!(match_application(Some("Stripe"), &applications()), None);
-        assert_eq!(match_application(None, &applications()), None);
+        assert_eq!(match_application(Some("Datadog"), None, &applications()), None);
+        assert_eq!(match_application(Some("Stripe"), None, &applications()), None);
+        assert_eq!(match_application(None, None, &applications()), None);
+    }
+
+    #[test]
+    fn a_different_role_at_the_same_company_is_a_different_application() {
+        // The bug that made the tracker read 14. Nine Microsoft confirmations for nine roles
+        // all matched the one tracked Microsoft application, so eight were never proposed.
+        assert_eq!(
+            match_application(Some("Roblox"), Some("Software Engineer Intern"), &applications()),
+            Some("a1"),
+            "the same role still matches"
+        );
+        assert_eq!(
+            match_application(Some("Roblox"), Some("Firmware Engineering Intern"), &applications()),
+            None,
+            "a different role at the same company is a different application"
+        );
+    }
+
+    #[test]
+    fn an_email_that_names_no_role_still_matches_on_company_alone() {
+        // Asymmetric on purpose. Refusing to match a roleless autoresponder would propose a
+        // duplicate for every "thanks for applying" that does not name the job — which is the
+        // failure the original per-company key was written to prevent, and it is still real.
+        assert_eq!(match_application(Some("Roblox"), None, &applications()), Some("a1"));
+    }
+
+    #[test]
+    fn a_tracked_application_with_no_title_matches_any_role() {
+        // We know nothing about a2's role, so an email naming one cannot contradict it. The
+        // alternative is proposing a duplicate for an application we already have.
+        assert_eq!(
+            match_application(Some("Jump Trading"), Some("Quant Intern"), &applications()),
+            Some("a2")
+        );
     }
 }
