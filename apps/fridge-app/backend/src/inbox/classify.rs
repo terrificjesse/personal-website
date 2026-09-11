@@ -111,7 +111,13 @@ pub struct Context<'a> {
 /// other order lets a rejection read as the stage it is rejecting you from, which is rule 3's
 /// trap arriving through the classifier instead of through timestamps.
 const REJECTION: &[&str] = &[
-    "unfortunately",
+    // Bare "unfortunately" is NOT here, and was until the classifier started reading bodies.
+    // In a 200-character snippet it was a fair proxy for a refusal. In four thousand it is not:
+    // a real OA invitation reads "complete the test in one go. Unfortunately, we cannot send a
+    // new test link", and that flipped a live assessment to `rejected`. It now has to appear
+    // beside a decision — see REJECTION_PAIRS.
+    "move forward with other",
+    "made the decision to move forward",
     // Pronoun-agnostic. `"we regret"` was here alone and missed *"I regret to inform you"* on a
     // real rejection — the formulation a named recruiter uses rather than a template.
     "regret to inform",
@@ -134,10 +140,54 @@ const REJECTION: &[&str] = &[
     // checked first so it would win.
     "not an ideal fit",
     "isn't an ideal fit",
-    "not the right fit",
+    // "not the right fit" is NOT here. In a body it matches "if you decide that this location
+    // is not the right fit FOR YOU, we will not be able to proceed" — a conditional about your
+    // preference inside a live OA invitation, which it flipped to `rejected`. The "ideal fit"
+    // forms carry the decision; this one does not.
     "not a fit at this time",
     "position has been filled",
     "role has been filled",
+];
+
+/// Phrases that mean an assessment is being *described*, not assigned to you.
+///
+/// A campus-event invitation reads "before you dive into **our** online assessments, please
+/// bring your laptop" — an event, not a test with your name on it. With message bodies in
+/// scope that flipped two real outreach emails to pressing.
+///
+/// Narrower than it looks, and narrow on purpose: an earlier attempt required the marker itself
+/// to carry a possessive, which dropped the real OA subject "[Action Required] Your Roblox
+/// Application - Online Assessment", where "your" and the marker sit either side of a dash.
+/// Excluding the one phrase that means "ours in general" keeps that and drops the event.
+/// **Each begins with a space, and that is load-bearing.** `hit` is substring matching with no
+/// word boundary, so the marker "our online assessment" matches inside "y*our online
+/// assessment*" — which is the exact wording of a real OA, and of the committed fixture
+/// `syn-002`. The gate caught it. The extension's field matcher learned the same lesson
+/// separately, where three-letter company names matched inside ordinary words.
+const ASSESSMENT_IS_DESCRIBED: &[&str] = &[
+    " our online assessment",
+    " our assessments",
+    " into our online",
+];
+
+/// "Unfortunately" plus something that makes it a decision about you.
+///
+/// The word alone is a tone, not a verdict — a rejection, a scheduling apology and a broken link
+/// all use it. Requiring a decision word alongside keeps every real refusal and drops the
+/// logistics. Order is not required; templates vary.
+const REJECTION_PAIRS: &[(&str, &str)] = &[
+    ("unfortunately", "not be moving forward"),
+    ("unfortunately", "not moving forward"),
+    ("unfortunately", "other candidates"),
+    ("unfortunately", "made the decision"),
+    ("unfortunately", "not selected"),
+    ("unfortunately", "unable to offer"),
+    ("unfortunately", "not be progressing"),
+    // NOT "will not be", "we have decided" or "no longer". Each is generic enough to appear in
+    // ordinary logistics, and proximity does not save them: a real OA invitation reads
+    // "unfortunately, we cannot send a new test link" and, one sentence later, "we will not be
+    // able to proceed with this part" — both inside the window, neither a rejection. The second
+    // half has to be decisive on its own.
 ];
 
 const OFFER: &[&str] = &[
@@ -210,6 +260,7 @@ const INTERVIEW: &[&str] = &[
 /// The named platforms stay bare because you are never sent a HackerRank link for reference.
 const ASSESSMENT: &[&str] = &[
     "online assessment",
+    "invited to complete",
     "assessment invitation",
     "assessments invitation",
     "complete the assessment",
@@ -355,8 +406,13 @@ const ATS_DOMAINS: &[&str] = &[
 /// confirmation is "Thank you – we've received your Tesla application", with an en-dash and a
 /// curly apostrophe. A marker written with an ASCII apostrophe silently never matches it, and
 /// silently-never-matching is the failure mode this whole classifier is judged on.
-fn haystack(subject: Option<&str>, snippet: Option<&str>) -> String {
-    let joined = format!("{} {}", subject.unwrap_or(""), snippet.unwrap_or(""));
+fn haystack_with_body(subject: Option<&str>, snippet: Option<&str>, body: Option<&str>) -> String {
+    let joined = format!(
+        "{} {} {}",
+        subject.unwrap_or(""),
+        snippet.unwrap_or(""),
+        body.unwrap_or("")
+    );
     decode_entities(&joined)
         .to_lowercase()
         .replace(['\u{2018}', '\u{2019}'], "'")
@@ -417,6 +473,26 @@ fn hit_pair<'a>(text: &str, pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, &'
         .find(|(a, b)| text.contains(a) && text.contains(b))
 }
 
+/// How far apart two halves of a pair may sit and still be one statement.
+///
+/// Roughly a long sentence. Unbounded co-occurrence was fine when the haystack was a subject
+/// and a 200-character snippet; across a whole body it is not. A real OA invitation says
+/// "unfortunately, we cannot send a new test link" in one paragraph and "we will not be able to
+/// proceed" in another, and an unbounded pair read those as a rejection.
+const PAIR_WINDOW: usize = 160;
+
+/// Like [`hit_pair`], but the two halves must appear within [`PAIR_WINDOW`] of each other.
+fn hit_pair_near<'a>(text: &str, pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
+    pairs.iter().copied().find(|(a, b)| {
+        text.match_indices(a).any(|(ai, _)| {
+            text.match_indices(b).any(|(bi, _)| {
+                let (lo, hi) = if ai < bi { (ai + a.len(), bi) } else { (bi + b.len(), ai) };
+                hi.saturating_sub(lo) <= PAIR_WINDOW
+            })
+        })
+    })
+}
+
 /// Classify one email from its metadata alone.
 ///
 /// **Rule 8: the category is decided here, from the email, before any match against an
@@ -430,19 +506,76 @@ pub fn classify(
     snippet: Option<&str>,
     context: &Context<'_>,
 ) -> EmailVerdict {
-    let text = haystack(subject, snippet);
+    classify_with_body(from, subject, snippet, None, context)
+}
+
+/// [`classify`], plus the message body when one was fetched.
+///
+/// Split rather than adding a parameter to `classify` so the existing call sites and their
+/// tests keep meaning what they meant: "decide this from the metadata alone". The body is
+/// strictly additional evidence, and every rule reads the same haystack whether it is there.
+///
+/// **Rule 1 still holds with the body in hand, and matters more.** The body is the
+/// prompt-injection surface: this is a pure function, it gets no tools, and text in an email
+/// addressed at the agent is data to classify rather than an instruction. `gmail::fetch_message`
+/// strips tags and truncates before anything reaches here.
+pub fn classify_with_body(
+    from: Option<&str>,
+    subject: Option<&str>,
+    snippet: Option<&str>,
+    body: Option<&str>,
+    context: &Context<'_>,
+) -> EmailVerdict {
+    let text = haystack_with_body(subject, snippet, body);
+    // Sender and subject only. Every employer worth naming appears in one of them, and a body
+    // is four thousand characters of prose in which a one-word company name — the corpus really
+    // contains "Secure" — turns up by accident. A real case: "Join Workiva's Internship
+    // Information Session" guessed `secure`, from a word in the body.
+    let headline = haystack_with_body(subject, None, None);
     let sender = from.unwrap_or("").to_lowercase();
 
     let verdict = |category: Category, confidence: f64, evidence: String| EmailVerdict {
         category,
         confidence,
-        company_guess: guess_company(&sender, &text, context),
+        company_guess: guess_company(&sender, &headline, &text, context),
         evidence,
+    };
+
+    // A marker plus the words around it.
+    //
+    // `rejection marker: "unfortunately"` names the rule and tells a reader nothing about
+    // whether it was right — and since the classifier started reading message bodies, a marker
+    // can match four thousand characters in rather than inside a 200-character snippet, where
+    // a human could see the whole haystack anyway. The evidence column exists to make a verdict
+    // checkable; a bare marker had stopped doing that.
+    let quote = |marker: &str| -> String {
+        match text.find(marker) {
+            Some(at) => {
+                let start = text[..at].char_indices().rev().nth(45).map_or(0, |(i, _)| i);
+                let end = text[at..]
+                    .char_indices()
+                    .nth(marker.chars().count() + 55)
+                    .map_or(text.len(), |(i, _)| at + i);
+                format!("…{}…", text[start..end].trim())
+            }
+            None => String::new(),
+        }
     };
 
     // Terminal outcomes first. See REJECTION's note on why it leads.
     if let Some(marker) = hit(&text, REJECTION) {
-        return verdict(Category::Rejection, 0.9, format!("rejection marker: {marker:?}"));
+        return verdict(
+            Category::Rejection,
+            0.9,
+            format!("rejection marker: {marker:?} — {}", quote(marker)),
+        );
+    }
+    if let Some((a, b)) = hit_pair_near(&text, REJECTION_PAIRS) {
+        return verdict(
+            Category::Rejection,
+            0.85,
+            format!("rejection pair: {a:?} + {b:?} — {}", quote(a)),
+        );
     }
     if let Some(marker) = hit(&text, OFFER) {
         return verdict(Category::Offer, 0.85, format!("offer marker: {marker:?}"));
@@ -451,12 +584,26 @@ pub fn classify(
     // Then the two that need a response from you. Interview before assessment: "interview" is
     // the more specific claim, and an email that mentions both is usually inviting you to one.
     if let Some(marker) = hit(&text, INTERVIEW) {
-        return verdict(Category::Interview, 0.8, format!("interview marker: {marker:?}"));
+        return verdict(
+            Category::Interview,
+            0.8,
+            format!("interview marker: {marker:?} — {}", quote(marker)),
+        );
     }
-    if let Some(marker) = hit(&text, ASSESSMENT) {
-        return verdict(Category::Oa, 0.8, format!("assessment marker: {marker:?}"));
+    // An assessment somebody is telling you about is not one you have been given.
+    let assessment_is_yours = hit(&text, ASSESSMENT_IS_DESCRIBED).is_none();
+    if assessment_is_yours
+        && let Some(marker) = hit(&text, ASSESSMENT)
+    {
+        return verdict(
+            Category::Oa,
+            0.8,
+            format!("assessment marker: {marker:?} — {}", quote(marker)),
+        );
     }
-    if let Some((a, b)) = hit_pair(&text, ASSESSMENT_PAIRS) {
+    if assessment_is_yours
+        && let Some((a, b)) = hit_pair(&text, ASSESSMENT_PAIRS)
+    {
         return verdict(Category::Oa, 0.7, format!("assessment pair: {a:?} + {b:?}"));
     }
 
@@ -476,7 +623,7 @@ pub fn classify(
 
     // Job-specific and addressed to you, but about no application you made.
     let from_ats = ATS_DOMAINS.iter().any(|domain| sender.contains(domain));
-    let named_company = guess_company(&sender, &text, context);
+    let named_company = guess_company(&sender, &headline, &text, context);
     let from_a_person = !sender.is_empty() && !is_machine_sender(&sender);
 
     if from_ats || (named_company.is_some() && from_a_person) {
@@ -501,7 +648,30 @@ pub fn classify(
 /// A company named in the sender's domain or the text, if we know of one.
 ///
 /// A hint for the matcher, never a gate. Longest match wins so "jump trading" beats "jump".
-fn guess_company(sender: &str, text: &str, context: &Context<'_>) -> Option<String> {
+/// The employer this email is about.
+///
+/// **Two passes, sender and subject first.** Matching anywhere in a body makes every short
+/// company name a coin flip — see the `headline` note in `classify_with_body`. The body is still
+/// searched, but only when the reliable fields name nobody, so it adds companies rather than
+/// outvoting them.
+fn guess_company(
+    sender: &str,
+    headline: &str,
+    text: &str,
+    context: &Context<'_>,
+) -> Option<String> {
+    best_company(sender, headline, context).or_else(|| {
+        // The body pass only accepts a name distinctive enough to survive four thousand
+        // characters of prose. A short single word is not: the corpus contains "Secure", and it
+        // matched inside the body of a Workiva information-session invitation. Two words, or
+        // eight-plus characters — anything shorter that is genuinely the employer is named in
+        // the sender or the subject too, which the first pass already read.
+        best_company(sender, text, context)
+            .filter(|company| company.contains(' ') || company.len() >= 8)
+    })
+}
+
+fn best_company(sender: &str, text: &str, context: &Context<'_>) -> Option<String> {
     let mut best: Option<&String> = None;
     for company in context.known_companies {
         if company.len() < 3 {
@@ -1013,9 +1183,9 @@ mod tests {
             Category::Rejection
         );
         // And the decoding itself, independent of any marker.
-        assert_eq!(haystack(Some("A&amp;B"), Some("don&#39;t")), "a&b don't");
+        assert_eq!(haystack_with_body(Some("A&amp;B"), Some("don&#39;t"), None).trim(), "a&b don't");
         // An escaped ampersand must not be unescaped into another entity.
-        assert_eq!(haystack(None, Some("&amp;#39;")).trim(), "&#39;");
+        assert_eq!(haystack_with_body(None, Some("&amp;#39;"), None).trim(), "&#39;");
     }
 
     #[test]
@@ -1151,6 +1321,99 @@ mod tests {
         );
         assert_eq!(
             verdict_for("Your Roblox Assessments Have Expired", ""),
+            Category::Oa
+        );
+    }
+
+    #[test]
+    fn unfortunately_alone_is_a_tone_not_a_verdict() {
+        // A real OA invitation, which bare "unfortunately" flipped to `rejected` the moment the
+        // classifier started reading bodies. In a 200-character snippet the word was a fair
+        // proxy for a refusal; in four thousand it is not.
+        assert_eq!(
+            verdict_for(
+                "Microsoft HackerRank Online Technical Screen",
+                "Complete the test in one go. Unfortunately, we cannot send a new test link. After submitting"
+            ),
+            Category::Oa
+        );
+        // And it still is a refusal when a decision stands beside it.
+        assert_eq!(
+            verdict_for(
+                "Update from Epic Games",
+                "Thank you for your interest in joining the team. Unfortunately, we have made the decision to move forward with other candidates"
+            ),
+            Category::Rejection
+        );
+    }
+
+    #[test]
+    fn a_pair_must_be_one_statement_not_two_paragraphs() {
+        // The live OA this cost. "unfortunately, we cannot send a new test link" and "we will
+        // not be able to proceed with this part" are one sentence apart and unrelated; an
+        // unbounded pair read them as a refusal and marked a live assessment rejected.
+        assert_eq!(
+            verdict_for(
+                "Microsoft HackerRank Online Technical Screen",
+                "Complete the test in one go. Unfortunately, we cannot send a new test link. After submitting, \
+                 if you decide that this location is not the right fit for you, we will not be able to proceed with this part"
+            ),
+            Category::Oa
+        );
+    }
+
+    #[test]
+    fn a_short_company_name_is_not_guessed_from_prose() {
+        // The corpus really contains "Secure", and it matched inside the body of a Workiva
+        // information-session invitation. A name short enough to be an ordinary word is only
+        // trusted from the sender or the subject, which the first pass reads.
+        let companies: Vec<String> = vec!["secure".to_string(), "jump trading".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let verdict = classify_with_body(
+            Some("events@workiva.com"),
+            Some("Join Workiva's Internship Information Session!"),
+            None,
+            Some("Please secure your spot by registering before Friday."),
+            &ctx,
+        );
+        assert_eq!(verdict.company_guess, None, "a word in prose is not an employer");
+
+        // A distinctive name in the body is still found.
+        let verdict = classify_with_body(
+            Some("no-reply@greenhouse.io"),
+            Some("Your application"),
+            None,
+            Some("Thank you for applying to Jump Trading."),
+            &ctx,
+        );
+        assert_eq!(verdict.company_guess.as_deref(), Some("jump trading"));
+    }
+
+    #[test]
+    fn an_assessment_someone_describes_is_not_one_you_were_given() {
+        // A campus event, flipped to pressing once bodies were in scope.
+        // `assert_ne` against Oa rather than `assert_eq` to a category: what matters is that it
+        // is not PRESSING. Whether it lands on outreach or disregarded depends on the known-
+        // company list, which this harness deliberately keeps tiny.
+        assert_ne!(
+            verdict_for(
+                "Roblox Week @ CMU",
+                "Bring any questions you have before you dive into our online assessments. Please bring your laptop"
+            ),
+            Category::Oa
+        );
+    }
+
+    #[test]
+    fn the_exclusion_does_not_match_inside_the_word_your() {
+        // "your online assessment" CONTAINS "our online assessment". `hit` is substring
+        // matching with no word boundary, so the exclusion silently ate a real OA — and the
+        // committed fixture syn-002 is worded exactly this way, which is what caught it.
+        assert_eq!(
+            verdict_for(
+                "Example Corp — Online Assessment",
+                "Please complete your online assessment within 5 days to continue."
+            ),
             Category::Oa
         );
     }

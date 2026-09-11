@@ -202,12 +202,13 @@ pub async fn run(
             // nothing. The verdict is NOT re-stored and the counts are not touched: those
             // measure new work, and inflating them would break rule 7's invariant.
             if let Some(ids) = &label_ids {
-                let verdict = classify::classify(
-                    message.from.as_deref(),
-                    message.subject.as_deref(),
-                    message.snippet.as_deref(),
-                    &context,
-                );
+                let verdict = classify::classify_with_body(
+            message.from.as_deref(),
+            message.subject.as_deref(),
+            message.snippet.as_deref(),
+            message.body.as_deref(),
+            &context,
+        );
                 if let Err(err) =
                     apply_label(pool, &client, &token, ids, &message, verdict.category, now).await
                 {
@@ -1009,6 +1010,7 @@ mod tests {
             subject: Some("Interview invitation".into()),
             received_at: Some(Utc::now().to_rfc3339()),
             snippet: Some("...".into()),
+            body: None,
         };
 
         assert!(store_message(&pool, "u1", &message, Utc::now()).await.expect("first"));
@@ -1037,6 +1039,7 @@ mod tests {
             subject: Some("[Action Required] Your Roblox Assessments Invitation".into()),
             received_at: Some(now.to_rfc3339()),
             snippet: Some("We're thrilled to invite you to the assessments".into()),
+            body: None,
         };
         let verdict = classify::EmailVerdict {
             category: Category::Oa,
@@ -1066,6 +1069,7 @@ mod tests {
             id: "gmail-oa-1".into(), thread_id: None,
             from: Some("a@b.com".into()), subject: Some("Interview".into()),
             received_at: None, snippet: None,
+            body: None,
         };
         let verdict = classify::EmailVerdict {
             category: Category::Interview, confidence: 0.8,
@@ -1099,6 +1103,7 @@ mod tests {
         let message = gmail::Message {
             id: "shared-id".into(), thread_id: None, from: None,
             subject: Some("Offer".into()), received_at: None, snippet: None,
+            body: None,
         };
         let verdict = classify::EmailVerdict {
             category: Category::Offer, confidence: 0.9, company_guess: None,
@@ -1120,6 +1125,7 @@ mod tests {
         let message = gmail::Message {
             id: "gmail-1".into(), thread_id: None, from: None,
             subject: Some("Thank you for applying".into()), received_at: None, snippet: None,
+            body: None,
         };
         for category in [Category::Confirmation, Category::Outreach, Category::Disregarded,
                          Category::Rejection] {

@@ -33,7 +33,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::classify::{self, Category};
-use super::labels;
+use super::{gmail, labels};
 
 /// A stored message paired with its newest verdict.
 #[derive(sqlx::FromRow)]
@@ -64,7 +64,63 @@ pub struct Change {
 ///
 /// Writes nothing to Gmail. `dry_run` additionally writes nothing to the database, so the
 /// change list can be read before anything is committed to.
+/// A live Gmail session, when one can be had.
+///
+/// Stored messages keep only the subject and the ~200-character snippet, so re-classifying from
+/// the database alone cannot see anything the original pass could not. Since 2026-09-11 the
+/// classifier reads message bodies, and a re-classification that skipped them would leave
+/// exactly the verdicts the body was fetched to fix — Epic Games' rejection among them.
+///
+/// `None` when no account is connected or the token is dead. Re-classification still runs, from
+/// subject and snippet, and says so rather than silently doing less.
+async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client, String)> {
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM gmail_accounts LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+    let client_id = std::env::var("GOOGLE_CLIENT_ID").ok()?;
+    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET").ok()?;
+    let token = super::oauth::access_token(pool, &user_id, &client_id, &client_secret)
+        .await
+        .ok()?;
+    Some((reqwest::Client::new(), token))
+}
+
+/// Gmail's per-user quota is per MINUTE, and a re-classification is a burst.
+///
+/// A full pass over the stored corpus is one `format=full` fetch per message, back to back, and
+/// Gmail answered 403 `rateLimitExceeded` for 52 of 83 on the first attempt. That is not a
+/// source pushing back on a scraper — it is our own mailbox asking us to slow down, so the
+/// scraping rule about giving up fast does not apply. Pace, and retry once.
+const FETCH_PACING: std::time::Duration = std::time::Duration::from_millis(150);
+const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn fetch_body_politely(
+    client: &reqwest::Client,
+    token: &str,
+    gmail_id: &str,
+) -> Result<gmail::Message> {
+    tokio::time::sleep(FETCH_PACING).await;
+    match gmail::fetch_message(client, token, gmail_id).await {
+        Err(error) if format!("{error:?}").contains("rateLimitExceeded") => {
+            // One retry, once. A loop here would be the retry storm the root rules forbid, and
+            // the failure is already reported and re-runnable.
+            tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+            gmail::fetch_message(client, token, gmail_id).await
+        }
+        other => other,
+    }
+}
+
 pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>> {
+    let session = gmail_session(pool).await;
+    if session.is_none() {
+        eprintln!(
+            "reclassify: no live Gmail session — classifying from subject and snippet only, \
+             which is what produced the verdicts being corrected. Reconnect for a full pass."
+        );
+    }
+
     let companies: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT lower(company_name) FROM internship_postings WHERE company_name IS NOT NULL",
     )
@@ -88,6 +144,7 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
 
     let now = Utc::now();
     let mut changes = Vec::new();
+    let mut unreachable_bodies: Vec<String> = Vec::new();
     for StoredVerdict {
         id,
         gmail_message_id: gmail_id,
@@ -98,10 +155,33 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
         labels_applied: applied,
     } in &rows
     {
-        let verdict = classify::classify(
+        // The body, if we can reach it.
+        //
+        // **A failed fetch skips the message rather than falling back to the snippet.** Two
+        // dry runs minutes apart disagreed — thirteen changes, then four — because Gmail
+        // rate-limited the second and every failure quietly produced a snippet-only verdict.
+        // That is not a smaller correction, it is a different and worse one: it would "correct"
+        // a rejection back to a confirmation using less evidence than the pass was run to use.
+        // Silently doing less is the failure this whole subsystem is written against.
+        let body = match &session {
+            Some((client, token)) => match fetch_body_politely(client, token, gmail_id).await {
+                Ok(message) => message.body,
+                Err(error) => {
+                    unreachable_bodies.push(format!(
+                        "{}: {error}",
+                        subject.as_deref().unwrap_or("(no subject)")
+                    ));
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        let verdict = classify::classify_with_body(
             from.as_deref(),
             subject.as_deref(),
             snippet.as_deref(),
+            body.as_deref(),
             &context,
         );
         let current = format!("{:?}", verdict.category).to_lowercase();
@@ -138,6 +218,18 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
             evidence: verdict.evidence.clone(),
             stale_label: applied.clone(),
         });
+    }
+
+    if !unreachable_bodies.is_empty() {
+        eprintln!(
+            "reclassify: {} message(s) skipped — their body could not be fetched, and a \
+             snippet-only verdict would be worse evidence than the one already stored:",
+            unreachable_bodies.len()
+        );
+        for line in unreachable_bodies.iter().take(5) {
+            eprintln!("  {line}");
+        }
+        eprintln!("  re-run to pick them up; Gmail rate-limits a long pass.");
     }
 
     Ok(changes)
