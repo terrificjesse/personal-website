@@ -35,12 +35,12 @@ All six below are unauthenticated. None required a key, a cookie, or a login.
 | Greenhouse (one job) | `https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{id}` | GET | job object | n/a |
 | Lever | `https://api.lever.co/v0/postings/{site}?mode=json` | GET | bare array | `skip` / `limit` |
 | Ashby | `https://api.ashbyhq.com/posting-api/job-board/{org}` | GET | `{apiVersion, jobs:[…]}` | none |
-| SmartRecruiters | `https://api.smartrecruiters.com/v1/companies/{co}/postings` | GET | `{offset, limit, totalFound, content:[…]}` | `offset`/`limit`, **limit caps at 100** |
+| SmartRecruiters | `https://api.smartrecruiters.com/v1/companies/{co}/postings` | GET | `{offset, limit, totalFound, content:[…]}` | `offset`/`limit`, **limit caps at 100**. **`robots.txt` disallows it — see below** |
 | SmartRecruiters (one) | `…/postings/{id}` | GET | posting object | n/a |
 | Workday | `https://{tenant}.wd{N}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` | **POST** | `{total, jobPostings:[…], facets}` | `limit`/`offset` in JSON body |
 | Workday (one job) | `…/wday/cxs/{tenant}/{site}{externalPath}` | GET | `{jobPostingInfo:{…}}` | n/a |
 | Recruitee | `https://{co}.recruitee.com/api/offers/` | GET | `{offers:[…]}` | none observed |
-| Workable | `https://apply.workable.com/api/v1/widget/accounts/{acct}?details=true` | GET | `{name, description, jobs:[…]}` | *unverified — the account I tried returned 0 jobs, so the job-object shape is unconfirmed* |
+| Workable | `https://apply.workable.com/api/v1/widget/accounts/{acct}?details=true` | GET | `{name, description, jobs:[…]}` | **none — whole board per request.** Verified 2026-09-16 against the paginated v3 `total`; see the Workable notes below |
 
 ### Per-ATS notes that matter
 
@@ -121,7 +121,25 @@ All six below are unauthenticated. None required a key, a cookie, or a login.
   remote flag and structured multi-location data.
 - No single-job endpoint and no filtering; you fetch the whole board every time.
 
-**SmartRecruiters**
+**SmartRecruiters — not permitted, and not built**
+
+> **Corrected 2026-09-16.** This section was written as if the API were usable, and § G ranked
+> it seventh. `https://api.smartrecruiters.com/robots.txt` reads, in full:
+>
+> ```
+> User-agent: LinkedInBot
+> Allow: /v1/companies/
+> User-agent: *
+> Disallow: /
+> ```
+>
+> The postings API is allowed for **LinkedInBot only**, and everything is disallowed for
+> everyone else — which includes this collector. The root rules are unambiguous: respect
+> `robots.txt`, and if a source is only reachable by evading its controls, leave it returning
+> zero rather than building the workaround. Presenting as LinkedInBot would be exactly that.
+> Whether the file changed after 2026-08-20 or this research missed it is not recoverable; the
+> rule applies either way. The notes below are kept for the record of what the API would
+> provide.
 
 - **No salary field anywhere** — not on the list, not on the posting detail. Confirmed on both.
 - `experienceLevel` (`{id,label}`, e.g. `mid_senior_level`) and `typeOfEmployment` are the
@@ -150,6 +168,30 @@ All six below are unauthenticated. None required a key, a cookie, or a login.
 - No salary field on either endpoint.
 - A wrong `{site}` returns 404, so the site id must be discovered, not guessed.
 - Note there is a second Workday domain, `myworkdaysite.com`, alongside `myworkdayjobs.com`.
+
+**Workable — verified 2026-09-16, built as a source**
+
+- `robots.txt` on `apply.workable.com` is `Disallow:` (empty) for `*`: everything permitted.
+- **All 43 harvested accounts answered 200**, 39 had jobs, **1,648 jobs** in total.
+- **No pagination, checked rather than assumed.** No `total`, no cursor, and the two largest
+  boards returned 248 and 245 — close enough to 250 to look like a silent cap. Compared against
+  the paginated v3 API's `total` (`POST /api/v3/accounts/{acct}/jobs`): 248 vs 247, 245 vs 245,
+  61 vs 60. The widget returns the whole board, so each board is a valid scope (§ D.4).
+- **The job `url` carries no account** — `apply.workable.com/j/{shortcode}` — while the form
+  in § C, and in Simplify's links, is `/{account}/j/{shortcode}`. The adapter builds the latter
+  from the account it asked for. Emitting the API's URL makes every posting miss its own
+  duplicate: on the first live run 11 of 14 accepted postings merged with Simplify's listing,
+  and would otherwise have appeared twice.
+- **`employment_type` is not an internship signal.** It takes six values — `Full-time`,
+  `Part-time`, `Contract`, `Temporary`, `Other`, empty — and none is "Internship"; real
+  software internships carry `Full-time`, `Temporary`, `Other` and blank. Not handed to QC.
+- **No pay field**, on any board. A real `telecommuting` boolean on every job.
+- A missing account answers **404**, so a dead board is recorded as `gone` like the others.
+
+**First live run (2026-09-16): 1,648 fetched = 16 accepted + 1,632 filtered + 0 rejected**,
+43 scopes, none failed. **Only 3 of the 14 distinct postings were new**; the rest were already
+in the corpus from Simplify. That is structural rather than a Workable problem, and it is the
+most important thing this section has to say about adding ATS sources — see § G.
 
 **Recruitee — richest schema, almost no US SWE presence**
 
@@ -281,7 +323,7 @@ Mostly a dead end. Verified:
 | Lever | no RSS; JSON is the feed |
 | Ashby | no RSS; JSON is the feed |
 | Recruitee `/api/offers/` | JSON, works (§A.1) |
-| Workable widget JSON | 200, shape *unverified* (test account had 0 jobs) |
+| Workable widget JSON | 200, shape **verified 2026-09-16** across all 43 accounts — see A.1 |
 | WeWorkRemotely `…/remote-programming-jobs.rss` | **works** — 25 items, standard RSS |
 | Handshake `joinhandshake.com/api/handshake-public-jobs.xml` | **works** — sitemap index (§A.4) |
 
@@ -887,12 +929,29 @@ Ordered by coverage-per-effort, not by data quality.
 | 4 | **Greenhouse boards** | Largest slug count after Workday; pay via `pay_transparency=true` on the list endpoint. | **6–12 h** | ~485 |
 | 5 | **Lever boards** | Structured `salaryRange`; whole board per request. | **12–24 h** | ~157 |
 | 6 | **vanshb03 `listings.json`** | 29% URL overlap with Simplify → ~285 unique listings, and MIT-licensed. | **daily** (commits are days apart) | 1 |
-| 7 | **SmartRecruiters boards** | Good structured fields, but **no pay at all**. | **daily** | ~121 + paging |
+| 7 | ~~**SmartRecruiters boards**~~ | **Not permitted** — its API's `robots.txt` allows `LinkedInBot` only (corrected 2026-09-16, § A.1). Not built. | — | — |
+| 7b | **Workable boards** | Built 2026-09-16. Whole board per request, no pay. Adds few new postings — see the note below this table. | **6–12 h**, with the others | ~43 |
 | 8 | **WeWorkRemotely RSS** | Cheap, but truncated to 25 items — must be frequent or skipped. | **hourly** or drop | 1 |
 | 9 | **Workday tenants** | Highest slug count (1,141) but N+1 fetches, no pay, and a useless list payload. Build last, and only for tenants that actually carry internships. | **daily**, tenant subset | expensive — budget it |
 | 10 | **Recruitee** | One board in the entire corpus. | **weekly** or skip | ~1 |
 | 11 | **Handshake** | Permitted, and the only `validThrough`. Enrichment only — never a sweep. | **on demand**, per known URL | 1 per posting |
 | — | **LinkedIn, Indeed** | Not built. See §A.4. | — | — |
+
+### The ceiling on adding ATS sources (measured 2026-09-16)
+
+**Every board slug this collector polls was harvested from Simplify's own URLs** (#2 above). So
+an ATS source can only ever reach employers Simplify already lists. What it adds is the *other*
+jobs on those boards, plus better closure detection — an ATS is the system of record, and the
+sweep expires a posting only when every sighting agrees. What it cannot add is **new
+companies**.
+
+Workable made this concrete: of 14 distinct postings on its first run, 11 were already in the
+corpus from Simplify and 3 were new. Workday's 979 harvested tenants would hit the same
+ceiling, at far higher cost (§ A.1: POST, N+1 detail fetches, useless list payload).
+
+**Coverage of new employers needs slug discovery that does not start from Simplify** — another
+public internship list, or looking up boards for the companies in `company-tiers.json` directly.
+That is a different task from writing another adapter, and it is where the remaining coverage is.
 
 ### Operating rules
 

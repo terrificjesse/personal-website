@@ -96,7 +96,7 @@ misses, so nothing was stranded.
 
 ### `fixtures/` — offline test data
 
-All five are **real responses**, trimmed. Trimming is only ever deletion (whole records
+All six are **real responses**, trimmed. Trimming is only ever deletion (whole records
 dropped, long HTML replaced with a marked placeholder); no field value was edited, so a test
 asserting on a shape is asserting on a shape the server really sent.
 
@@ -106,6 +106,7 @@ asserting on a shape is asserting on a shape the server really sent.
 | `greenhouse-board.sample.json` | `boards-api.greenhouse.io/v1/boards/{anthropic,airtable}/jobs?pay_transparency=true` | 6 jobs. The 4 Anthropic rows are **every** `intern` substring hit on that 485-job board — and all 6 are false positives ("Director, US International Tax", "Internal Communications Manager, Tech"), which is why they are the fixture. Pay-range `blurb`/`title` truncated |
 | `lever-board.sample.json` | `api.lever.co/v0/postings/belvederetrading?mode=json` | 4 postings: 2 with `categories.commitment == "Intern"`, 2 without. All carry a real `salaryRange`. Description bodies truncated |
 | `ashby-board.sample.json` | `api.ashbyhq.com/posting-api/job-board/Etched?includeCompensation=true` | 5 jobs: 3 `employmentType == "Intern"` (all with **empty** `summaryComponents`, which is the point), 2 `FullTime` with real compensation. Descriptions truncated |
+| `workable-board.sample.json` | `apply.workable.com/api/v1/widget/accounts/pony-dot-ai?details=true`, fetched 2026-09-16 | 4 of the board's jobs: a software intern (`employment_type` empty), a research intern (`Other`), a non-software intern (`HR Intern`, `Part-time`), and a full-time software role. Every `description`, and the board's own, replaced with a marked placeholder; nothing else edited |
 | `weworkremotely.sample.rss` | `weworkremotely.com/categories/remote-programming-jobs.rss` | the first 5 of the feed's 25 items, verbatim except that `<description>` bodies are replaced with a placeholder |
 
 There is deliberately **no Handshake fixture**. Handshake is never swept (see below), so there

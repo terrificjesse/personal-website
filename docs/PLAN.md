@@ -1312,6 +1312,8 @@ that is actually about *you* rather than about the market.
 | 12p ✅ | Consolidate; review Codex's `verify` fix; **name the deploy branch**, which `main` did not contain | `[gen]` | C | Claude Code | ✅ | 2h |
 | 12q ✅ | Amend the two-agent rules for one agent; self-review sixteen commits; the 13f regression gate | `[gen]` | C+A | Claude Code | ✅ | 4h |
 | 12r ✅ | Scoped expiry for **Lever and Ashby**; migration `0032` makes a 404'd board legible after the run that found it | `[gen]` | A | Claude Code | ✅ | 4h |
+| 12s ✅ | Untracked applications: proposals from mail, per (company, role); body fetch; employer from sender | `[gen]` | A+B | Claude Code | ✅ | — |
+| 12t ✅ | **Workable** as a source; SmartRecruiters found disallowed by `robots.txt` and not built | `[gen]` | A | Claude Code | ✅ | 3h |
 
 **Load:** Claude Code ≈ 17h, Codex ≈ 7h, you ≈ 6h. **12d blocks 12e and nothing else** — make
 the call at the start of the week so it never becomes the reason a week ended short.

@@ -70,6 +70,7 @@ pub mod greenhouse;
 pub mod lever;
 pub mod rss;
 pub mod simplify;
+pub mod workable;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -398,6 +399,14 @@ pub fn registry() -> Vec<Arc<dyn Source>> {
         Arc::new(lever::LeverSource::new()),
         // 6 — 29% URL overlap with Simplify, so ~285 unique listings, and MIT-licensed.
         Arc::new(simplify::SimplifySource::vanshb03()),
+        // 7 — SmartRecruiters is NOT here, and not by oversight. `docs/INTERNSHIP_SCRAPING.md`
+        //     ranked it seventh, but its API's robots.txt (checked 2026-09-16) allows
+        //     `/v1/companies/` for `LinkedInBot` only and disallows `/` for everyone else. The
+        //     root rules forbid working around that, so it stays unbuilt.
+        //
+        // — Workable: 43 harvested accounts, verified 2026-09-16. Whole board per request, no
+        //   pay, a real remote flag. Small yield, but from companies no other source reaches.
+        Arc::new(workable::WorkableSource::new()),
         // 8 — cheap, but truncated to 25 items, so it can never be a complete enumeration.
         Arc::new(rss::RssSource::we_work_remotely()),
         // — not built, and the reason is recorded rather than left looking like a bug.

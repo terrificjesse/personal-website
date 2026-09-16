@@ -1,0 +1,126 @@
+{
+  "name": "pony.ai",
+  "description": "[description removed from the fixture — see data/internships/README.md]",
+  "jobs": [
+    {
+      "title": "Software Engineer Intern - Generalist",
+      "shortcode": "BA5FFDBC71",
+      "code": "",
+      "employment_type": "",
+      "telecommuting": false,
+      "department": null,
+      "url": "https://apply.workable.com/j/BA5FFDBC71",
+      "shortlink": "https://apply.workable.com/j/BA5FFDBC71",
+      "application_url": "https://apply.workable.com/j/BA5FFDBC71/apply",
+      "published_on": "2026-09-08",
+      "created_at": "2026-05-29",
+      "country": "United States",
+      "city": "Fremont",
+      "state": "California",
+      "education": "",
+      "experience": "Internship",
+      "function": "",
+      "industry": "Computer Software",
+      "locations": [
+        {
+          "country": "United States",
+          "countryCode": "US",
+          "city": "Fremont",
+          "region": "California",
+          "hidden": false
+        }
+      ],
+      "description": "[description removed from the fixture — see data/internships/README.md]"
+    },
+    {
+      "title": "Research Intern - Deep Learning",
+      "shortcode": "4C1F53EF5D",
+      "code": "",
+      "employment_type": "Other",
+      "telecommuting": false,
+      "department": "Engineering - Software",
+      "url": "https://apply.workable.com/j/4C1F53EF5D",
+      "shortlink": "https://apply.workable.com/j/4C1F53EF5D",
+      "application_url": "https://apply.workable.com/j/4C1F53EF5D/apply",
+      "published_on": "2026-09-08",
+      "created_at": "2025-04-16",
+      "country": "United States",
+      "city": "Fremont",
+      "state": "California",
+      "education": "",
+      "experience": "Internship",
+      "function": "",
+      "industry": "Computer Software",
+      "locations": [
+        {
+          "country": "United States",
+          "countryCode": "US",
+          "city": "Fremont",
+          "region": "California",
+          "hidden": false
+        }
+      ],
+      "description": "[description removed from the fixture — see data/internships/README.md]"
+    },
+    {
+      "title": "HR Intern",
+      "shortcode": "0EB3640D71",
+      "code": "",
+      "employment_type": "Part-time",
+      "telecommuting": false,
+      "department": null,
+      "url": "https://apply.workable.com/j/0EB3640D71",
+      "shortlink": "https://apply.workable.com/j/0EB3640D71",
+      "application_url": "https://apply.workable.com/j/0EB3640D71/apply",
+      "published_on": "2026-09-08",
+      "created_at": "2022-03-17",
+      "country": "United States",
+      "city": "Fremont",
+      "state": "California",
+      "education": "Bachelor's Degree",
+      "experience": "Internship",
+      "function": "",
+      "industry": "Computer Software",
+      "locations": [
+        {
+          "country": "United States",
+          "countryCode": "US",
+          "city": "Fremont",
+          "region": "California",
+          "hidden": false
+        }
+      ],
+      "description": "[description removed from the fixture — see data/internships/README.md]"
+    },
+    {
+      "title": "(Senior) Software Engineer - Behavior",
+      "shortcode": "EF5F79EB04",
+      "code": "",
+      "employment_type": "Full-time",
+      "telecommuting": false,
+      "department": null,
+      "url": "https://apply.workable.com/j/EF5F79EB04",
+      "shortlink": "https://apply.workable.com/j/EF5F79EB04",
+      "application_url": "https://apply.workable.com/j/EF5F79EB04/apply",
+      "published_on": "2026-09-08",
+      "created_at": "2026-07-31",
+      "country": "United States",
+      "city": "Fremont",
+      "state": "California",
+      "education": "",
+      "experience": "Mid-Senior level",
+      "function": "",
+      "industry": "Computer Software",
+      "locations": [
+        {
+          "country": "United States",
+          "countryCode": "US",
+          "city": "Fremont",
+          "region": "California",
+          "hidden": false
+        }
+      ],
+      "description": "[description removed from the fixture — see data/internships/README.md]"
+    }
+  ]
+}
