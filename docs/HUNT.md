@@ -1009,6 +1009,118 @@ The gate needs **no database and no secrets** — fixture, company list and base
 `include_str!`d into the binary. A gate that needed the live database could not run in CI, and
 one that read its fixture off disk could be pointed at a different one.
 
+### The quality-control pass of 2026-09-22 — what a body-blind harness cost
+
+Run because the owner reported the classifier misfiling mail in both directions: rejections
+missed, confirmations read as interviews. The tuning had been oscillating for two weeks. The
+cause was not in the marker lists.
+
+**`sync` stored verdicts the classifier had not been given the evidence for.** `sync.rs` had two
+classification call sites sixteen lines apart. The branch that STORES a verdict for a new
+message called `classify` — no body. The branch that only re-applies a label to a message seen
+on an earlier pass called `classify_with_body`. Same message, same loop, two sets of rules.
+
+So every verdict a live sync wrote was decided from a ~200-character snippet, the body fetch
+added on 2026-09-11 reached nothing that was kept, and the label re-applied on the next pass was
+produced by different rules from the verdict in the database. `inbox reclassify` kept finding
+work because it was the only body-aware writer. Both branches now go through one function,
+`sync::verdict_for`, and there is no second call to drift from.
+
+**And the gate could not have caught it**, because `labelset gate` and `labelset score` also
+called `classify`. Every rule retuned for bodies was graded by a harness that could not exercise
+one. The gate was green through all of it — the exact failure this document already names for
+the fixture, one level up, and it had never been written down.
+
+Measured on the live corpus of 118 messages before any fix, by the new `inbox diagnose`:
+
+| | |
+|---|---|
+| classify differently with and without their body | **19 of 118** |
+| rejections that read as confirmations without a body | **13 of 16** |
+
+Thirteen of sixteen. Nine of them are Microsoft's "Thank you for your application!" — a subject
+and snippet shaped exactly like a confirmation, with the refusal only in the body. Every sync
+had stored those as confirmations until a reclassification corrected them. That is the whole of
+the missed-rejection complaint, and it was one function call.
+
+#### Three more defects the diagnostic surfaced, all live
+
+- **A veto written for a snippet became a veto over four thousand characters.**
+  `ASSESSMENT_IS_DESCRIBED` exists so that "learn about our assessments" is not an assessment
+  you were given. Against a full body, an Optiver invitation reading "invite you to complete the
+  assessments … please complete the assessments by September 18" was `disregarded`, because
+  2,500 characters further down it also said "A note on assessment integrity: **our assessments**
+  are designed to evaluate your skills". A real assessment with a real deadline, dropped by its
+  own integrity notice — rule 8's costliest failure, in production. Fixed with
+  `ASSESSMENT_IS_ASSIGNED`: a describing phrase disqualifies **unless the same mail also tells
+  you to go and do one**.
+- **`reclassify` ran with a smaller world than `sync`.** `sync` built its company list from
+  postings **union the user's own applications**; `reclassify` and the harness read postings
+  alone. Six employers the owner had applied to had no scraped posting and so did not exist to a
+  re-classification: workiva, glencliff labs, percheron capital, oklahoma city thunder, chicago
+  trading company, data solutions. The visible symptom was a Workiva mail classified `outreach`
+  on the evidence "names **secure**" — a different corpus company matched out of the words
+  "Secure your spot" in its body. One `sync::known_companies` now, called by all three.
+- **Seven of eleven evidence branches quoted nothing**, so most verdicts could not be checked
+  against the text that produced them. All eleven now carry context, and writing them exposed
+  two further lies in one sentence: a dry run described `no-reply@codesignal.com` as
+  "names reply in the sender, and a person sent it". "Reply" is a real company in the corpus and
+  a no-reply address offers it a clean whole-word match; a machine is not a person. Both fixed.
+
+#### The sender became a signal, narrowly
+
+`no-reply@` mail from a real employer had no path through the outreach gate at all, which is how
+a CodeSignal "Assessment completed", a Roblox "you have completed the assessments" and an
+Optiver assessment-portal login code all reached `disregarded`. The new branch requires **three**
+things at once: a machine sender, a **corpus** company found in the sender or the subject —
+never body prose, never `employer_from_sender`, which is what moved junk-leaked-to-outreach from
+0 to 2 when it was tried here — and a corroborating `JOB_TOPIC` word. The third is what keeps a
+Google security alert out: "google" really is in a corpus built from job postings, and the alert
+says nothing about employment.
+
+Assessment platforms are handled by sender too, but as corroboration rather than a verdict.
+"codesignal", "hackerrank", "codility" and "karat" were bare `ASSESSMENT` markers, and the cost
+ran both ways: "Verify your CodeSignal account" was stored `oa` at 0.8, while "Assessment
+completed: Roblox Assessment" from the same platform was `disregarded` because the word never
+appeared in its text. One list, opposite errors.
+
+#### What the numbers are, and what they are not
+
+The new `data/inbox/stress-set.csv` is fifteen rows, one per failure shape above, each citing
+the dated live message or numbered defect it came from. Graded body-aware, against identical
+labels before and after:
+
+| | before | after |
+|---|---|---|
+| agreed | 8 of 15 | 15 of 15 |
+| junk leaked to Outreach | 0 of 4 | **0 of 4** |
+| REAL MAIL DISREGARDED | 4 of 11 | **0 of 11** |
+| pressing mail missed | 2 of 4 | **0 of 4** |
+
+The junk-leak column is the one to read first: the gains did not come from loosening the
+relevance gate. The twelve-row synthetic fixture and its committed baseline are **byte-identical
+after this pass**, `syn-008` still disagreeing exactly as recorded above, which is the evidence
+that nothing leaked into the metadata-only path.
+
+**None of this is a measurement of the classifier.** The same agent wrote the stress rows and
+the rules that grade them — the liability this document already names — and three row labels
+were corrected after seeing output, which is recorded in the file's own `why` column. A green
+stress gate means "no known failure shape regressed". It does not mean accuracy, and the 100%
+must never be quoted as one.
+
+On live mail the pass moved ten messages, each read individually rather than accepted as a
+count: six out of `disregarded` into `outreach`, one into `oa`, one Amazon nag into
+`confirmation`, one false `oa` out, and one Hudson River Trading **rejection recovered from
+`confirmation`**. `inbox diagnose` afterwards shows a diagonal stored-vs-now matrix and
+`reclassify --labels` reports no drift. Three stale `Hunt/OA` labels came off messages stored
+as `disregarded` — the sync defect's fingerprint, still in the mailbox eleven days later.
+
+**The real measurement does not exist yet.** `labelsets/sealed-2026-09.csv` was frozen before
+any rule changed, 30 rows, and is 13b's to label. Everything above is tuned on the other 88 and
+is therefore in-sample by construction. This was a **self-review**: one agent wrote the diff and
+checked it, against artifacts rather than against its own reasoning — each of the fifteen new
+tests was verified to fail without its fix before being kept.
+
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
 The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first

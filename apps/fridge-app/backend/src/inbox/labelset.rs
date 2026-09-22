@@ -78,7 +78,7 @@ pub fn rules_fingerprint() -> String {
 ///
 /// Kept in step with the enum by [`category_index`] below, which stops compiling if a variant
 /// is added — a silently short list here would drop a whole row of the matrix.
-const ALL_CATEGORIES: [Category; 7] = [
+pub(super) const ALL_CATEGORIES: [Category; 7] = [
     Category::Confirmation,
     Category::Oa,
     Category::Interview,
@@ -88,19 +88,38 @@ const ALL_CATEGORIES: [Category; 7] = [
     Category::Disregarded,
 ];
 
-/// Sort order for the matrix, and the compile-time guard on [`ALL_CATEGORIES`].
+/// Sort order for the matrix. Delegates to [`Category::index`], which is the exhaustive match
+/// that stops compiling when a variant is added — a guard is only worth one copy.
+pub(super) fn category_index(category: Category) -> usize {
+    category.index()
+}
+
+/// The body-aware failure-shape fixture. See `data/inbox/stress-set.csv`'s own header.
+const STRESS_SET: &str = include_str!("../../data/inbox/stress-set.csv");
+const STRESS_BASELINE: &str = include_str!("../../data/inbox/stress-baseline.json");
+
+/// Print a square matrix over the seven categories.
 ///
-/// If you add a variant to [`Category`], this match breaks. Add it to the array too.
-fn category_index(category: Category) -> usize {
-    match category {
-        Category::Confirmation => 0,
-        Category::Oa => 1,
-        Category::Interview => 2,
-        Category::Offer => 3,
-        Category::Rejection => 4,
-        Category::Outreach => 5,
-        Category::Disregarded => 6,
+/// Rows are the first index of the key, columns the second; what each axis MEANS is the
+/// caption's job, because the two callers differ — `score` grades predictions against a human's
+/// labels, `diagnose` compares one machine verdict against another. Shared so that the layout
+/// and [`category_index`]'s compile-time guard have exactly one home.
+pub(super) fn print_matrix(caption: &str, matrix: &BTreeMap<(usize, usize), usize>) {
+    println!("{caption}");
+    print!("{:<14}", "");
+    for column in ALL_CATEGORIES {
+        print!("{:>8}", &column.as_str()[..column.as_str().len().min(7)]);
     }
+    println!();
+    for row in ALL_CATEGORIES {
+        print!("{:<14}", row.as_str());
+        for column in ALL_CATEGORIES {
+            let n = matrix.get(&(category_index(row), category_index(column))).copied().unwrap_or(0);
+            print!("{n:>8}");
+        }
+        println!();
+    }
+    println!();
 }
 
 fn parse_label(raw: &str) -> Option<Category> {
@@ -122,6 +141,35 @@ struct Row {
     snippet: String,
     /// Blank on export. One of [`ALL_CATEGORIES`] once a human has been through it.
     label: String,
+}
+
+/// One row of a committed fixture: a labelling sheet row plus the body production would read.
+///
+/// # Why this is not just a wider [`Row`]
+///
+/// `Row` is the EXPORT sheet. The `csv` crate derives its header from the struct, so adding a
+/// `body` column here would write one into every exported labelset — and message bodies are
+/// deliberately never stored (`gmail.rs`: "decoded, stripped, truncated, classified, and
+/// dropped"). A labelling sheet is not the place to start keeping them. Fixtures are invented
+/// text and carry theirs inline; real mail would fetch its body at grading time.
+///
+/// `#[serde(default)]` is what lets the original twelve-row `regression-set.csv`, which has no
+/// body column at all, keep parsing and keep meaning exactly what it meant.
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureRow {
+    gmail_message_id: String,
+    from: String,
+    subject: String,
+    snippet: String,
+    #[serde(default)]
+    body: String,
+    label: String,
+    /// Where this case came from — a dated live message, or a numbered defect. Never "seemed
+    /// plausible": the same agent writes these cases and the rules that grade them, so a row
+    /// that cannot cite its origin is deleted rather than argued about.
+    #[serde(default)]
+    #[allow(dead_code)]
+    why: String,
 }
 
 /// A message as the sync stored it, before a human has said what it is.
@@ -473,27 +521,41 @@ fn regressions(current: &Baseline, baseline: &Baseline) -> Vec<String> {
     worse
 }
 
-fn gate(update: bool) -> Result<()> {
-    let companies: Vec<String> = FIXTURE_COMPANIES
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    let context = classify::Context { known_companies: &companies };
-
-    let mut reader = csv::Reader::from_reader(FIXTURE_SET.as_bytes());
+/// Grade one committed fixture.
+///
+/// **The body is passed through, and that is the point.** `gate` and `score` both used to call
+/// `classify`, which hard-codes `body = None`, while production reads up to four thousand
+/// characters. So every rule retuned for bodies on 2026-09-11 was graded by a harness that
+/// could not exercise it, and the gate stayed green through the regressions that prompted the
+/// 2026-09-22 QC pass. Measured on the live corpus that day: **19 of 118 messages classify
+/// differently with and without their body, and 13 of the 16 rejections read as confirmations
+/// without one.**
+///
+/// A row with an empty body is classified from metadata alone, exactly as before, which is why
+/// the original twelve-row fixture and its committed baseline are untouched by this.
+fn grade_fixture(
+    fixture: &str,
+    context: &classify::Context<'_>,
+) -> Result<Vec<(Category, Category)>> {
+    // `#` lines are comments, so a fixture can carry the terms of its own use at the top of
+    // itself rather than in a sibling file nobody opens. The stress set's header says, in the
+    // file, that a green run means "no known failure shape regressed" and never "accuracy".
+    let mut reader = csv::ReaderBuilder::new()
+        .comment(Some(b'#'))
+        .from_reader(fixture.as_bytes());
     let mut graded: Vec<(Category, Category)> = Vec::new();
     for row in reader.deserialize() {
-        let row: Row = row?;
+        let row: FixtureRow = row?;
         let truth = parse_label(&row.label).ok_or_else(|| {
             anyhow::anyhow!("fixture row {} has an unknown label {:?}", row.gmail_message_id, row.label)
         })?;
-        let verdict = classify::classify(
+        let body = (!row.body.trim().is_empty()).then_some(row.body.as_str());
+        let verdict = classify::classify_with_body(
             Some(&row.from),
             Some(&row.subject),
             Some(&row.snippet),
-            &context,
+            body,
+            context,
         );
         if truth != verdict.category {
             // Named, not counted. A gate that says "one regression" without saying which row
@@ -508,30 +570,59 @@ fn gate(update: bool) -> Result<()> {
         }
         graded.push((truth, verdict.category));
     }
+    Ok(graded)
+}
 
-    let summary = summarize(&graded);
-    let current = Baseline::of(&summary);
+fn gate(update: bool) -> Result<()> {
+    let companies: Vec<String> = FIXTURE_COMPANIES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let context = classify::Context { known_companies: &companies };
 
-    if update {
-        let json = serde_json::to_string_pretty(&current)?;
-        println!("{json}");
-        println!("\n-- paste into data/inbox/regression-baseline.json --");
+    // Two fixtures, two baselines, compared separately and never summed.
+    //
+    // The original twelve rows are the metadata-only smoke test; the stress set is the
+    // body-aware failure-shape gate. Keeping them apart is what lets the first keep its
+    // committed baseline — and its recorded `syn-008` disagreement — byte for byte while the
+    // second grows. Neither is a statement about real mail, and both say so.
+    let fixtures: [(&str, &str, &str); 2] = [
+        ("SYNTHETIC fixture", FIXTURE_SET, FIXTURE_BASELINE),
+        ("STRESS set (body-aware)", STRESS_SET, STRESS_BASELINE),
+    ];
+
+    let mut failures = 0usize;
+    for (name, set, baseline_json) in fixtures {
+        println!("\n== {name} ==");
+        let graded = grade_fixture(set, &context)?;
+        let summary = summarize(&graded);
+        let current = Baseline::of(&summary);
+
+        if update {
+            println!("{}", serde_json::to_string_pretty(&current)?);
+            println!("-- paste into the baseline for: {name} --");
+            continue;
+        }
+
+        let baseline: Baseline = serde_json::from_str(baseline_json)?;
+        report(&format!("labelset gate — {name}"), &summary);
+        let worse = regressions(&current, &baseline);
+        if worse.is_empty() {
+            println!("\ngate: no failure mode regressed against the committed baseline");
+        } else {
+            for line in &worse {
+                eprintln!("gate: {line}");
+            }
+            failures += worse.len();
+        }
+    }
+
+    if update || failures == 0 {
         return Ok(());
     }
-
-    let baseline: Baseline = serde_json::from_str(FIXTURE_BASELINE)?;
-    report("labelset gate — SYNTHETIC fixture", &summary);
-
-    let worse = regressions(&current, &baseline);
-
-    if worse.is_empty() {
-        println!("\ngate: no failure mode regressed against the committed baseline");
-        return Ok(());
-    }
-    for line in &worse {
-        eprintln!("gate: {line}");
-    }
-    bail!("{} regression(s) against data/inbox/regression-baseline.json", worse.len())
+    bail!("{failures} regression(s) against the committed baselines")
 }
 
 async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
@@ -654,24 +745,10 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
     }
 
     if !held_out.is_empty() {
-        println!("Confusion matrix (held-out) — rows are truth, columns are what the rules said:");
-        print!("{:<14}", "");
-        for c in ALL_CATEGORIES {
-            print!("{:>8}", &c.as_str()[..c.as_str().len().min(7)]);
-        }
-        println!();
-        for truth in ALL_CATEGORIES {
-            print!("{:<14}", truth.as_str());
-            for predicted in ALL_CATEGORIES {
-                let n = matrix
-                    .get(&(category_index(truth), category_index(predicted)))
-                    .copied()
-                    .unwrap_or(0);
-                print!("{n:>8}");
-            }
-            println!();
-        }
-        println!();
+        print_matrix(
+            "Confusion matrix (held-out) — rows are truth, columns are what the rules said:",
+            &matrix,
+        );
     }
 
     // Recorded last, so a run that failed above does not burn the set.
@@ -690,6 +767,51 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+
+    /// The defect the whole 2026-09-22 pass turned on, made executable.
+    ///
+    /// `gate` and `score` graded with `classify`, which hard-codes `body = None`, while
+    /// production read four thousand characters. This row is the shape that proves it: a
+    /// subject and snippet that read as a polite confirmation, and a refusal that exists only
+    /// in the body. Nine real Microsoft rejections had exactly this shape, and the gate was
+    /// green through every one of them.
+    #[test]
+    fn a_refusal_that_exists_only_in_the_body_is_graded_as_one() {
+        let companies = ["example corp".to_string()];
+        let context = classify::Context { known_companies: &companies };
+        let header = "gmail_message_id,from,subject,snippet,body,label,why\n";
+        let lead = "t-1,careers@examplecorp.com,Thank you for your application!,\
+                    Thank you for applying to Example Corp.,";
+
+        let with_body = format!(
+            "{header}{lead}We have decided not to move forward with your application.,rejection,x\n"
+        );
+        let graded = grade_fixture(&with_body, &context).expect("grades");
+        assert_eq!(graded, vec![(Category::Rejection, Category::Rejection)]);
+
+        let without_body = format!("{header}{lead},rejection,x\n");
+        let graded = grade_fixture(&without_body, &context).expect("grades");
+        assert_eq!(
+            graded,
+            vec![(Category::Rejection, Category::Confirmation)],
+            "without its body this rejection reads as a confirmation — that is the blind spot"
+        );
+    }
+
+    /// The twelve-row fixture has no `body` column at all. `#[serde(default)]` is what keeps it
+    /// parsing, and keeps its committed baseline meaningful.
+    #[test]
+    fn the_original_fixture_still_parses_without_a_body_column() {
+        let companies: Vec<String> = FIXTURE_COMPANIES
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        let context = classify::Context { known_companies: &companies };
+        let graded = grade_fixture(FIXTURE_SET, &context).expect("the committed fixture parses");
+        assert_eq!(graded.len(), 12);
+    }
 
     fn base() -> Baseline {
         Baseline { graded: 12, agreed: 11, junk_leaked_to_outreach: 0, real_mail_disregarded: 1, pressing_missed: 0 }

@@ -73,7 +73,7 @@ pub struct Change {
 ///
 /// `None` when no account is connected or the token is dead. Re-classification still runs, from
 /// subject and snippet, and says so rather than silently doing less.
-async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client, String)> {
+pub(super) async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client, String)> {
     let user_id: String = sqlx::query_scalar("SELECT user_id FROM gmail_accounts LIMIT 1")
         .fetch_optional(pool)
         .await
@@ -95,7 +95,7 @@ async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client, String)> {
 const FETCH_PACING: std::time::Duration = std::time::Duration::from_millis(150);
 const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn fetch_body_politely(
+pub(super) async fn fetch_body_politely(
     client: &reqwest::Client,
     token: &str,
     gmail_id: &str,
@@ -121,11 +121,7 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
         );
     }
 
-    let companies: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT lower(company_name) FROM internship_postings WHERE company_name IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let companies = super::sync::known_companies(pool).await;
     let context = classify::Context {
         known_companies: &companies,
     };

@@ -131,13 +131,7 @@ pub async fn run(
     // The classifier is pure (rule 1), so what it may know about the world is passed in.
     // Loaded once per pass rather than per message: it is one query and a run is a hundred
     // messages.
-    let known_companies: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT lower(company_name) FROM internship_postings
-          UNION SELECT DISTINCT lower(company_name) FROM internship_applications",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let known_companies = known_companies(pool).await;
     let context = classify::Context { known_companies: &known_companies };
 
     // The applications an email can be matched to. Loaded once, like the company list — the
@@ -202,13 +196,7 @@ pub async fn run(
             // nothing. The verdict is NOT re-stored and the counts are not touched: those
             // measure new work, and inflating them would break rule 7's invariant.
             if let Some(ids) = &label_ids {
-                let verdict = classify::classify_with_body(
-            message.from.as_deref(),
-            message.subject.as_deref(),
-            message.snippet.as_deref(),
-            message.body.as_deref(),
-            &context,
-        );
+                let verdict = verdict_for(&message, &context);
                 if let Err(err) =
                     apply_label(pool, &client, &token, ids, &message, verdict.category, now).await
                 {
@@ -218,12 +206,7 @@ pub async fn run(
             continue;
         }
 
-        let verdict = classify::classify(
-            message.from.as_deref(),
-            message.subject.as_deref(),
-            message.snippet.as_deref(),
-            &context,
-        );
+        let verdict = verdict_for(&message, &context);
         report.classified += 1;
 
         // RULE 7: written for EVERY message, including the disregarded ones. A dropped email
@@ -313,6 +296,68 @@ pub async fn run(
     Ok(report)
 }
 
+/// Every company this agent may recognise by name — the classifier's whole world.
+///
+/// # Why this is one function
+///
+/// It was three queries. `sync` read postings **union the user's own applications**;
+/// `reclassify` and the labelling harness read postings alone. So a re-classification ran with
+/// a strictly smaller world than the sync it was correcting, and could only ever lose
+/// companies.
+///
+/// Six of them, on the live corpus of 2026-09-22: workiva, glencliff labs, percheron capital,
+/// oklahoma city thunder, chicago trading company, data solutions — every one an employer the
+/// user had applied to, none with a scraped posting to its name. The visible symptom was a
+/// Workiva recruiting mail classified `outreach` on the evidence "names **secure**", a
+/// different corpus company matched out of the words "Secure your spot" in its body, because
+/// the rules could not see "workiva" at all.
+///
+/// That is the module doc's own "silently doing less", in the tool written to prevent it.
+pub(super) async fn known_companies(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT lower(company_name) FROM internship_postings
+          WHERE company_name IS NOT NULL
+          UNION
+         SELECT DISTINCT lower(company_name) FROM internship_applications
+          WHERE company_name IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// The verdict for one fetched message — the ONLY place a sync classifies anything.
+///
+/// # Why this is a function and not two call sites
+///
+/// It was two call sites, and they called different classifiers. The branch that STORES a
+/// verdict for a new message called `classify` (no body); the branch sixteen lines above it,
+/// which exists only to re-apply a label to a message seen on an earlier pass, called
+/// `classify_with_body`. Same message, same context, same loop, two sets of rules.
+///
+/// That produced a standing drift generator rather than a one-off bug:
+///
+/// - every verdict in `email_verdicts` written by a live sync was decided from a ~200-character
+///   snippet, and the body fetch added on 2026-09-11 reached nothing that was kept;
+/// - the label applied in that pass was snippet-only too, while the label re-applied on the
+///   NEXT pass was body-aware, so the stored verdict and the mailbox disagreed by construction;
+/// - `inbox reclassify` kept finding work because it was the only body-aware writer.
+///
+/// Measured with `inbox diagnose` on 2026-09-22, before this change: 19 of 118 stored messages
+/// classify differently with and without their body, and **13 of the 16 rejections read as
+/// confirmations without one** — nine Microsoft "Thank you for your application!" messages
+/// whose refusal is only in the body, which every sync had therefore stored as confirmations
+/// until a reclassification corrected them. That is the missed-rejection complaint the QC pass
+/// started from, and it was one function call.
+fn verdict_for(message: &gmail::Message, context: &classify::Context<'_>) -> classify::EmailVerdict {
+    classify::classify_with_body(
+        message.from.as_deref(),
+        message.subject.as_deref(),
+        message.snippet.as_deref(),
+        message.body.as_deref(),
+        context,
+    )
+}
 async fn finish(
     pool: &SqlitePool,
     run_id: &str,
@@ -922,6 +967,52 @@ pub fn spawn(pool: SqlitePool, config: Option<crate::auth::GoogleOAuthConfig>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both sync branches classify through one call now. Before 2026-09-22 the branch that
+    /// STORED a verdict used `classify` (no body) while the branch that re-applied a label used
+    /// `classify_with_body`, so the database and the mailbox were produced by different rules.
+    #[test]
+    fn the_stored_verdict_reads_the_body_like_the_relabel_does() {
+        let companies = ["example corp".to_string()];
+        let context = classify::Context { known_companies: &companies };
+        let message = gmail::Message {
+            id: "m1".into(),
+            thread_id: None,
+            from: Some("careers@examplecorp.com".into()),
+            // A confirmation-shaped subject whose refusal is only in the body. Nine real
+            // Microsoft rejections had this shape, and every sync stored them as confirmations.
+            subject: Some("Thank you for your application!".into()),
+            received_at: None,
+            snippet: Some("Thank you for applying to Example Corp.".into()),
+            body: Some("We have decided not to move forward with your application.".into()),
+        };
+        assert_eq!(verdict_for(&message, &context).category, classify::Category::Rejection);
+    }
+
+    /// `sync` read postings UNION the user's own applications; `reclassify` read postings alone,
+    /// so re-classifying could only ever lose companies. Six live ones, including the employer
+    /// whose mail was then matched against the corpus name "secure" out of "Secure your spot".
+    #[tokio::test]
+    async fn the_company_world_includes_employers_you_applied_to_without_a_posting() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO internship_applications
+                 (id, user_id, company_name, title, url, snapshot_json, snapshot_at,
+                  status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES ('a1','u1','Workiva','SWE Intern','https://example.com/j','{}','2026-09-01',
+                     'applied','2026-09-01','2026-09-01','2026-09-01','2026-09-01')",
+        )
+        .execute(&pool)
+        .await
+        .expect("application");
+
+        let companies = known_companies(&pool).await;
+        assert!(
+            companies.iter().any(|c| c == "workiva"),
+            "an employer you applied to must be one the classifier can name: {companies:?}"
+        );
+    }
 
     async fn test_pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("inbox-{}.db", Uuid::new_v4()));

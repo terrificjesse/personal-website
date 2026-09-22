@@ -48,22 +48,41 @@ impl Category {
         matches!(self, Category::Oa | Category::Interview | Category::Offer)
     }
 
-    /// The inverse of [`as_str`](Category::as_str), for reading a stored verdict back.
+    /// Every category, in the order the matrices and reports use.
     ///
-    /// Exhaustive over the same match rather than a lookup table, so adding a category is a
-    /// compile error here instead of a silent `None` at the point something reads the database.
+    /// The doc on `parse` used to claim that adding a variant was "a compile error here", and
+    /// it was not: `parse` held an array literal, so a new variant would have compiled and
+    /// returned `None` for its own name at the point something read the database. The guard
+    /// that makes the claim true is [`Category::index`] below, which is a real exhaustive
+    /// match — the trick `labelset` had already used for the same list.
+    pub const ALL: [Category; 7] = [
+        Category::Confirmation,
+        Category::Oa,
+        Category::Interview,
+        Category::Offer,
+        Category::Rejection,
+        Category::Outreach,
+        Category::Disregarded,
+    ];
+
+    /// Sort order, and the compile-time guard on [`Category::ALL`].
+    ///
+    /// Add a variant and this match stops compiling. That is the whole job.
+    pub fn index(self) -> usize {
+        match self {
+            Category::Confirmation => 0,
+            Category::Oa => 1,
+            Category::Interview => 2,
+            Category::Offer => 3,
+            Category::Rejection => 4,
+            Category::Outreach => 5,
+            Category::Disregarded => 6,
+        }
+    }
+
+    /// The inverse of [`as_str`](Category::as_str), for reading a stored verdict back.
     pub fn parse(raw: &str) -> Option<Self> {
-        [
-            Category::Confirmation,
-            Category::Oa,
-            Category::Interview,
-            Category::Offer,
-            Category::Rejection,
-            Category::Outreach,
-            Category::Disregarded,
-        ]
-        .into_iter()
-        .find(|category| category.as_str() == raw)
+        Category::ALL.into_iter().find(|category| category.as_str() == raw)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -170,6 +189,53 @@ const ASSESSMENT_IS_DESCRIBED: &[&str] = &[
     " into our online",
 ];
 
+/// An assessment handed TO YOU, which outranks a describing phrase elsewhere in the same mail.
+///
+/// # Why a veto needed a counter-veto
+///
+/// [`ASSESSMENT_IS_DESCRIBED`] was written against a ~200-character snippet, where "learn about
+/// our assessments" really is the whole message. Against four thousand characters of body it
+/// became a **global** veto, and legal boilerplate at the foot of a genuine invitation switched
+/// the entire OA branch off.
+///
+/// Live, on 2026-09-22: an Optiver invitation reading "We would like to invite you to complete
+/// the Optiver assessments … Please complete the assessments by September 18, 2026" was
+/// classified `disregarded`, because 2,500 characters further down it also said "A note on
+/// assessment integrity: **our assessments** are designed to evaluate your skills". A real
+/// assessment with a real deadline, dropped by its own integrity notice. Rule 8 names that the
+/// costliest failure in the system, and this is what it looks like in practice.
+///
+/// So the gate is no longer "any describing phrase disqualifies". A describing phrase
+/// disqualifies **unless the same mail also tells you to go and do one**. Both halves stay
+/// narrow: this list is instructions addressed at the reader, never topic words.
+const ASSESSMENT_IS_ASSIGNED: &[&str] = &[
+    "invite you to complete",
+    "invite you to take",
+    "complete the assessment",
+    "complete your assessment",
+    "completed the assessment",
+    "completed your assessment",
+    "assessment invitation",
+    "assessments invitation",
+    "your assessment link",
+];
+
+/// Assessment platforms, which are evidence about the SENDER and never a verdict on their own.
+///
+/// These four were bare entries in [`ASSESSMENT`] until 2026-09-22, and the cost was live:
+/// "Verify your CodeSignal account" — an account-admin mail with no assessment in it — was
+/// stored `oa` at confidence 0.8 on the single marker "codesignal". Meanwhile "Assessment
+/// completed: Roblox Assessment", from the same platform, was `disregarded`, because the word
+/// "codesignal" happened not to appear in its text. One list, opposite errors, both wrong.
+///
+/// A platform name now needs [`ASSESSMENT_TOPIC`] beside it. That is the same corroboration
+/// rule the pair lists use, applied to a signal that reads the sender.
+const ASSESSMENT_PLATFORMS: &[&str] =
+    &["hackerrank", "codesignal", "codility", "karat", "coderpad", "hirevue"];
+
+/// Deliberately useless alone — admissible only as corroboration for a platform.
+const ASSESSMENT_TOPIC: &[&str] = &["assessment", "coding challenge", "coding test", "challenge"];
+
 /// "Unfortunately" plus something that makes it a decision about you.
 ///
 /// The word alone is a tone, not a verdict — a rejection, a scheduling apology and a broken link
@@ -270,10 +336,6 @@ const ASSESSMENT: &[&str] = &[
     "take home",
     "take-home",
     "technical screen",
-    "hackerrank",
-    "codesignal",
-    "codility",
-    "karat",
     // An assessment you already have and are about to LOSE. Real mail, disregarded:
     // "[Action Required] Your Roblox Assessments Expire in 24 hours". Rule 8 calls a disregarded
     // pressing message the costliest failure in the system, and an expiring OA is exactly that —
@@ -352,15 +414,46 @@ const BULK: &[&str] = &[
     "master's program",
     "masters program",
     "bootcamp",
-    // Event RSVPs and registrations. A recruiting event you replied to is not an application
-    // and not a role — and this one reached Hunt/Outreach only because the sender's domain
-    // was connect.roblox.com and the address did not happen to contain "noreply", which is a
-    // thin basis for deciding a human wrote to you.
+];
+
+/// Event registrations — matched against the SUBJECT only. See [`BULK`] for why the split.
+///
+/// # An event word in the subject is the event; in the body it is a mention
+///
+/// These lived in [`BULK`] and were matched body-wide. Live cost, 2026-09-22: a named recruiter
+/// at a company in the corpus wrote about an on-campus week, and the mail was `disregarded` on
+/// the marker "rsvp" — which appeared nowhere in her subject and only in the footer of her
+/// body. The relevance gate is checked before the outreach test, so a footer beat a person.
+///
+/// The subject is where a bulk sender says what the mail IS, which is the same headline/text
+/// distinction `classify_with_body` already draws for company guessing. The RSVP *receipt* this
+/// list was written for — "Thanks for RSVPing to …" — says so in its subject and is still
+/// caught.
+const BULK_EVENT: &[&str] = &[
     "rsvp",
     "thanks for your response to",
     "thank you for your response to",
     "you are registered",
     "thanks for registering",
+];
+
+/// Job-topic words. Useless alone, and never a verdict on their own.
+///
+/// This exists only to corroborate a machine sender at a known employer — the question it
+/// answers is "is this mail about employment at all", not "what kind of mail is it". Every
+/// entry is a word that appears in half the recruiting mail ever written, which is exactly why
+/// it may never decide anything by itself.
+const JOB_TOPIC: &[&str] = &[
+    "assessment",
+    "application",
+    "applied",
+    "interview",
+    "candidate",
+    "recruit",
+    "position",
+    "internship",
+    "hiring",
+    "job offer",
 ];
 
 /// Senders that are machines. Not junk by itself — most ATS mail is a no-reply — but it is the
@@ -466,22 +559,27 @@ const CONFIRMATION_PAIRS: &[(&str, &str)] = &[
     ("application", "was submitted"),
 ];
 
-fn hit_pair<'a>(text: &str, pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
-    pairs
-        .iter()
-        .copied()
-        .find(|(a, b)| text.contains(a) && text.contains(b))
-}
-
 /// How far apart two halves of a pair may sit and still be one statement.
 ///
 /// Roughly a long sentence. Unbounded co-occurrence was fine when the haystack was a subject
 /// and a 200-character snippet; across a whole body it is not. A real OA invitation says
 /// "unfortunately, we cannot send a new test link" in one paragraph and "we will not be able to
 /// proceed" in another, and an unbounded pair read those as a rejection.
+///
+/// **All three pair lists are bounded, as of 2026-09-22.** Only `REJECTION_PAIRS` was, because
+/// it was the list that produced the bug above; the other two kept an unbounded matcher across
+/// four thousand characters for another eleven days. Live evidence that this was not
+/// theoretical: an Optiver mail subject "Prepare for your application process" was stored
+/// `confirmation` on the pair "application" + "has been received", two phrases with no
+/// relationship to each other in that message. Right answer, unrelated reason — and because the
+/// confirmation branch carried no quote, the evidence could not be checked either.
 const PAIR_WINDOW: usize = 160;
 
-/// Like [`hit_pair`], but the two halves must appear within [`PAIR_WINDOW`] of each other.
+/// Both halves present, in either order, within [`PAIR_WINDOW`] of each other.
+///
+/// The unbounded variant this replaced is gone rather than deprecated: leaving it in the file
+/// is an invitation for the next list to be added with the wrong matcher, which is exactly how
+/// two of the three ended up unbounded.
 fn hit_pair_near<'a>(text: &str, pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
     pairs.iter().copied().find(|(a, b)| {
         text.match_indices(a).any(|(ai, _)| {
@@ -578,7 +676,11 @@ pub fn classify_with_body(
         );
     }
     if let Some(marker) = hit(&text, OFFER) {
-        return verdict(Category::Offer, 0.85, format!("offer marker: {marker:?}"));
+        return verdict(
+            Category::Offer,
+            0.85,
+            format!("offer marker: {marker:?} — {}", quote(marker)),
+        );
     }
 
     // Then the two that need a response from you. Interview before assessment: "interview" is
@@ -590,8 +692,11 @@ pub fn classify_with_body(
             format!("interview marker: {marker:?} — {}", quote(marker)),
         );
     }
-    // An assessment somebody is telling you about is not one you have been given.
-    let assessment_is_yours = hit(&text, ASSESSMENT_IS_DESCRIBED).is_none();
+    // An assessment somebody is telling you about is not one you have been given — unless the
+    // same mail also hands you one. See `ASSESSMENT_IS_ASSIGNED` for the invitation this veto
+    // was silently eating.
+    let assessment_is_yours = hit(&text, ASSESSMENT_IS_DESCRIBED).is_none()
+        || hit(&text, ASSESSMENT_IS_ASSIGNED).is_some();
     if assessment_is_yours
         && let Some(marker) = hit(&text, ASSESSMENT)
     {
@@ -601,24 +706,63 @@ pub fn classify_with_body(
             format!("assessment marker: {marker:?} — {}", quote(marker)),
         );
     }
+    // A platform's own mail, corroborated. Neither half is a verdict alone: the platform name
+    // by itself made an account-verification mail pressing, and the topic word by itself is in
+    // half the recruiting mail ever written.
     if assessment_is_yours
-        && let Some((a, b)) = hit_pair(&text, ASSESSMENT_PAIRS)
+        && let Some(platform) = hit(&sender, ASSESSMENT_PLATFORMS).or_else(|| hit(&text, ASSESSMENT_PLATFORMS))
+        && let Some(topic) = hit(&text, ASSESSMENT_TOPIC)
     {
-        return verdict(Category::Oa, 0.7, format!("assessment pair: {a:?} + {b:?}"));
+        return verdict(
+            Category::Oa,
+            0.75,
+            format!("assessment platform: {platform:?} + {topic:?} — {}", quote(topic)),
+        );
+    }
+    if assessment_is_yours
+        && let Some((a, b)) = hit_pair_near(&text, ASSESSMENT_PAIRS)
+    {
+        return verdict(
+            Category::Oa,
+            0.7,
+            format!("assessment pair: {a:?} + {b:?} — {} / {}", quote(a), quote(b)),
+        );
     }
 
     if let Some(marker) = hit(&text, CONFIRMATION) {
-        return verdict(Category::Confirmation, 0.85, format!("confirmation marker: {marker:?}"));
+        return verdict(
+            Category::Confirmation,
+            0.85,
+            format!("confirmation marker: {marker:?} — {}", quote(marker)),
+        );
     }
-    if let Some((a, b)) = hit_pair(&text, CONFIRMATION_PAIRS) {
-        return verdict(Category::Confirmation, 0.8, format!("confirmation pair: {a:?} + {b:?}"));
+    if let Some((a, b)) = hit_pair_near(&text, CONFIRMATION_PAIRS) {
+        return verdict(
+            Category::Confirmation,
+            0.8,
+            format!("confirmation pair: {a:?} + {b:?} — {} / {}", quote(a), quote(b)),
+        );
     }
 
     // The relevance gate. Checked AFTER the pressing categories, never before: a digest
     // subject line must not be able to swallow a real interview invite that happens to
     // contain the word "jobs".
+    //
+    // The event half is matched against the SUBJECT only — see `BULK_EVENT` for the recruiter
+    // this cost when it was matched body-wide.
+    if let Some(marker) = hit(&headline, BULK_EVENT) {
+        return verdict(
+            Category::Disregarded,
+            0.7,
+            format!("event marker in the subject: {marker:?} — {}", quote(marker)),
+        );
+    }
     if let Some(marker) = hit(&text, BULK) {
-        return verdict(Category::Disregarded, 0.7, format!("bulk mail marker: {marker:?}"));
+        return verdict(
+            Category::Disregarded,
+            0.7,
+            format!("bulk mail marker: {marker:?} — {}", quote(marker)),
+        );
     }
 
     // Job-specific and addressed to you, but about no application you made.
@@ -634,17 +778,54 @@ pub fn classify_with_body(
     // The fallback is still what names the employer on the verdict. Knowing WHICH company an
     // application belongs to, once we believe it is one, is a different question from whether
     // a stranger's email is about a job.
-    let named_company = best_company(&sender, &text, context);
+    let named_company = best_company_named(&sender, &headline, &text, context);
     let from_a_person = !sender.is_empty() && !is_machine_sender(&sender);
 
-    if from_ats || (named_company.is_some() && from_a_person) {
+    // An assessment platform only ever writes to you in a hiring context, so its mail belongs
+    // in the folder even when no branch above claimed it. "Verify your CodeSignal account" is
+    // not an assessment — that was the false `oa` this pass removed — but it is often the step
+    // that GATES one, and disregarding it is how you find out too late.
+    let from_a_platform = hit(&sender, ASSESSMENT_PLATFORMS);
+
+    if from_ats || from_a_platform.is_some() || (named_company.is_some() && from_a_person) {
+        // The evidence names the condition that actually opened the gate. Reporting the
+        // company first looks tidier and lies when a machine sent the mail: a dry run said
+        // "names reply in the sender, and a person sent it" about `no-reply@codesignal.com`,
+        // which was wrong twice over in one sentence.
+        let evidence = match (&named_company, from_a_platform) {
+            (Some((company, found_in)), _) if from_a_person => {
+                format!("names {company} in the {found_in}, and a person sent it")
+            }
+            (_, Some(platform)) => {
+                format!("from the assessment platform {platform:?}, but names no application")
+            }
+            _ => "from an ATS domain, but matches no application".to_string(),
+        };
+        return verdict(Category::Outreach, 0.5, evidence);
+    }
+
+    // A machine at an employer we have seen hiring, writing about employment.
+    //
+    // The gate above requires a human, so `no-reply@` mail from a real employer had no path at
+    // all and fell straight to disregarded. Live examples, 2026-09-22: a CodeSignal "Assessment
+    // completed", a Roblox "you have completed the assessments", an Optiver assessment-portal
+    // login code — all real, all dropped.
+    //
+    // **Three conditions at once, because any one of them alone is the junk leak.** The company
+    // must be a CORPUS company found in the sender or the subject — never body prose, never
+    // `employer_from_sender`, which is what moved junk-leaked-to-outreach from 0 to 2 when it
+    // was tried here. And `JOB_TOPIC` must corroborate, which is what keeps a Google security
+    // alert out: "google" really is in the corpus, and the alert says nothing about employment.
+    let named_by_the_sender_or_subject = named_company
+        .as_ref()
+        .filter(|(_, found_in)| !matches!(found_in, NamedIn::Body));
+    if let Some((company, _)) = named_by_the_sender_or_subject
+        && let Some(topic) = hit(&text, JOB_TOPIC)
+    {
         return verdict(
             Category::Outreach,
-            0.5,
-            match &named_company {
-                Some(company) => format!("names {company}, and a person sent it"),
-                None => "from an ATS domain, but matches no application".to_string(),
-            },
+            0.45,
+            format!("machine sender at {company}, job topic {topic:?} — {}", quote(topic)),
         );
     }
 
@@ -652,7 +833,12 @@ pub fn classify_with_body(
     verdict(
         Category::Disregarded,
         0.6,
-        "no application, employer or job-specific signal".to_string(),
+        match &named_company {
+            Some((company, found_in)) => format!(
+                "names {company} in the {found_in} but nothing job-specific, and a machine sent it"
+            ),
+            None => "no application, employer or job-specific signal".to_string(),
+        },
     )
 }
 
@@ -841,6 +1027,58 @@ fn clean_employer(raw: &str) -> Option<String> {
     }
 }
 
+/// Where a corpus company name turned up. Not cosmetic: it is the difference between "an
+/// employer wrote this" and "this mentions an employer", and only the first is evidence about
+/// a machine sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedIn {
+    Sender,
+    Subject,
+    Body,
+}
+
+impl std::fmt::Display for NamedIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NamedIn::Sender => "sender",
+            NamedIn::Subject => "subject",
+            NamedIn::Body => "body",
+        })
+    }
+}
+
+/// [`best_company`], but it says where it looked, and it filters the body the way
+/// `guess_company` already does.
+///
+/// # The asymmetry this fixes
+///
+/// The relevance gate used to pass the whole body-inclusive haystack to `best_company` with no
+/// length filter, while `guess_company`'s body pass filtered to names with a space or eight
+/// characters. So a short corpus name — the list really contains "Secure" — could decide the
+/// CATEGORY from body prose while being too flimsy to be reported as the company.
+///
+/// Live, 2026-09-22: "Join Workiva's Internship Information Session!" was classified Outreach
+/// with the evidence "names secure, and a person sent it", because its body said "**Secure**
+/// your spot at our upcoming session". Right category, by accident, for a reason that was
+/// nonsense — and the test that was supposed to cover this asserted only on `company_guess`,
+/// which the filter had already cleaned.
+fn best_company_named(
+    sender: &str,
+    headline: &str,
+    text: &str,
+    context: &Context<'_>,
+) -> Option<(String, NamedIn)> {
+    if let Some(name) = best_company(sender, "", context) {
+        return Some((name, NamedIn::Sender));
+    }
+    if let Some(name) = best_company("", headline, context) {
+        return Some((name, NamedIn::Subject));
+    }
+    best_company("", text, context)
+        .filter(|name| name.contains(' ') || name.len() >= 8)
+        .map(|name| (name, NamedIn::Body))
+}
+
 fn best_company(sender: &str, text: &str, context: &Context<'_>) -> Option<String> {
     let mut best: Option<&String> = None;
     for company in context.known_companies {
@@ -856,8 +1094,14 @@ fn best_company(sender: &str, text: &str, context: &Context<'_>) -> Option<Strin
             continue;
         }
         let squashed = company.replace(' ', "");
-        let mentioned =
-            contains_whole_word(text, company.as_str()) || contains_whole_word(sender, &squashed);
+        // A company name that is also a word addresses are built out of cannot be read off an
+        // address. The corpus really contains "Reply" — an Italian consultancy — and
+        // `no-reply@codesignal.com` offers it a clean whole-word match between a hyphen and an
+        // at-sign. `SENDER_ROLE_WORDS` already exists to name exactly these parts of an
+        // address, so the same list answers this question.
+        let names_a_role_not_a_company = SENDER_ROLE_WORDS.contains(&squashed.as_str());
+        let mentioned = contains_whole_word(text, company.as_str())
+            || (!names_a_role_not_a_company && contains_whole_word(sender, &squashed));
         if mentioned && best.is_none_or(|current| company.len() > current.len()) {
             best = Some(company);
         }
@@ -1072,9 +1316,6 @@ mod tests {
         );
         assert_eq!(verdict.category, Category::Outreach);
     }
-
-    // --- Shape --------------------------------------------------------------------------
-
 
     // --- Real snippets that the first version of these rules got wrong -------------------
 
@@ -1708,4 +1949,252 @@ mod tests {
         println!("\n{changed} of {} messages change category", rows.len());
         println!("new distribution: {after:?}");
     }
+
+    // --- The 2026-09-22 quality-control pass ---------------------------------------------
+    //
+    // Every case below is a real message from the burner inbox, PARAPHRASED — `labelsets/` is
+    // gitignored precisely so real subject lines never reach the repository, and a test file is
+    // not an exception. What is verbatim is the classifier's behaviour, which each of these
+    // reproduced before its fix landed.
+
+    /// A corpus company with a body long enough to be a real email.
+    fn classify_body(from: &str, subject: &str, body: &str) -> EmailVerdict {
+        let companies = companies();
+        let context = Context { known_companies: &companies };
+        classify_with_body(Some(from), Some(subject), None, Some(body), &context)
+    }
+
+    /// Integrity boilerplate at the foot of a genuine invitation used to switch the whole
+    /// assessment branch off, because `ASSESSMENT_IS_DESCRIBED` vetoed the entire haystack.
+    ///
+    /// The live message was an Optiver invitation with a stated deadline, classified
+    /// `disregarded`. Rule 8 calls a disregarded pressing email the costliest failure in this
+    /// system, so this is the most expensive defect the pass found.
+    #[test]
+    fn an_integrity_notice_does_not_cancel_the_assessment_it_is_attached_to() {
+        let body = "We would like to invite you to complete the assessments. Please complete \
+                    the assessment by next Friday. It takes about an hour. \
+                    A note on assessment integrity: our assessments are designed to evaluate \
+                    your own skills, so please do not seek outside help.";
+        let verdict = classify_body("Assessments <no-reply@tesla.com>", "Invitation for assessments", body);
+        assert_eq!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    /// The other half of the same gate: a describing phrase with nothing assigned to you still
+    /// disqualifies, which is what the veto was written for.
+    #[test]
+    fn an_email_describing_assessments_it_is_not_giving_you_is_still_not_an_assessment() {
+        let body = "Come along to our info session to learn about our assessments and what we \
+                    look for. Bring your laptop.";
+        let verdict = classify_body("Someone <someone@tesla.com>", "Info session next week", body);
+        assert_ne!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    /// "codesignal", "hackerrank", "karat" and "codility" were bare `ASSESSMENT` markers, so a
+    /// platform's account-admin mail was `oa` at 0.8 while its actual assessment mail —
+    /// which never says the platform's name — was `disregarded`. One list, opposite errors.
+    #[test]
+    fn a_platform_name_alone_is_not_an_assessment() {
+        let verdict = classify_body(
+            "CodeSignal <no-reply@codesignal.com>",
+            "Verify your CodeSignal account",
+            "Click below to confirm your email address and finish setting up your account.",
+        );
+        assert_ne!(verdict.category, Category::Oa, "{verdict:?}");
+        // Not dropped either: a verification link often gates the assessment itself.
+        assert_eq!(verdict.category, Category::Outreach, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_platform_name_with_an_assessment_beside_it_is_one() {
+        let verdict = classify_body(
+            "CodeSignal <no-reply@codesignal.com>",
+            "Assessment completed: Roblox Assessment",
+            "You have completed the Roblox assessment. Your results have been sent on.",
+        );
+        assert_eq!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    /// The outreach gate demanded a human, so `no-reply@` mail from a real employer had no path
+    /// at all. Three live messages fell straight through to disregarded this way.
+    #[test]
+    fn a_machine_at_a_known_employer_writing_about_hiring_is_outreach() {
+        let verdict = classify_body(
+            "Roblox Careers <donotreply@careers.roblox.com>",
+            "Welcome to Roblox Careers",
+            "Your profile is set up. You can now apply for openings and follow the recruiting \
+             process from your action center.",
+        );
+        assert_eq!(verdict.category, Category::Outreach, "{verdict:?}");
+    }
+
+    /// The guard that keeps the branch above from becoming the junk leak. "google" really is in
+    /// a corpus built from job postings, so a corpus match alone would sweep in every account
+    /// notice Google sends; the job-topic corroboration is what stops it.
+    #[test]
+    fn a_machine_at_a_known_employer_writing_about_your_account_is_not() {
+        let verdict = classify_body(
+            "Roblox <no-reply@accounts.roblox.com>",
+            "Security alert",
+            "A new sign-in on a Windows device. If this was you, no action is needed.",
+        );
+        assert_eq!(verdict.category, Category::Disregarded, "{verdict:?}");
+    }
+
+    /// An event word in the SUBJECT is the event. In the body it is a mention, and a named
+    /// recruiter was being disregarded on the word "rsvp" in her own footer.
+    #[test]
+    fn an_event_word_in_the_body_does_not_turn_a_recruiter_into_a_digest() {
+        let verdict = classify_body(
+            "Dana Whitfield <dwhitfield@roblox.com>",
+            "Roblox Week at CMU",
+            "Hi Jesse, I wanted to reach out since you are at the application stage with us. \
+             Our team is on campus next week. You can rsvp for any of the sessions here.",
+        );
+        assert_eq!(verdict.category, Category::Outreach, "{verdict:?}");
+    }
+
+    #[test]
+    fn an_event_word_in_the_subject_still_is_one() {
+        let verdict = classify_body(
+            "Campus Events <events@connect.roblox.com>",
+            "Thanks for RSVPing to Roblox Week",
+            "We have your response. See you there.",
+        );
+        assert_eq!(verdict.category, Category::Disregarded, "{verdict:?}");
+    }
+
+    /// The relevance gate matched company names in the body with no length filter, while the
+    /// company-naming pass beside it filtered to distinctive names. So a short corpus name
+    /// could decide the CATEGORY while being too flimsy to be reported as the company — live,
+    /// a Workiva mail was Outreach because its body said "Secure your spot".
+    ///
+    /// This asserts on the category, which is the assertion the older test was missing.
+    #[test]
+    fn a_short_company_name_in_body_prose_does_not_decide_the_category() {
+        let companies = ["secure".to_string(), "roblox".to_string()];
+        let context = Context { known_companies: &companies };
+        let verdict = classify_with_body(
+            Some("Events <hello@example.org>"),
+            Some("Join our information session"),
+            None,
+            Some("Secure your spot at our upcoming session. Doors open at six."),
+            &context,
+        );
+        assert_eq!(verdict.category, Category::Disregarded, "{verdict:?}");
+    }
+
+    /// `REJECTION_PAIRS` was bounded in 2026-09-11 after a real defect. The other two lists kept
+    /// an unbounded matcher across four thousand characters for another eleven days.
+    #[test]
+    fn an_assessment_pair_must_be_one_statement_not_two_paragraphs() {
+        let far = "x ".repeat(120);
+        let body = format!(
+            "We would like to invite you to our autumn information session. {far} \
+             Separately, here is some general reading about what an assessment involves."
+        );
+        let verdict = classify_body("Events <events@tesla.com>", "Information session", &body);
+        assert_ne!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_confirmation_pair_must_be_one_statement_not_two_paragraphs() {
+        let far = "x ".repeat(120);
+        let body = format!(
+            "Prepare for your application process with us. {far} \
+             Separately: once a referral has been received it is reviewed within a week."
+        );
+        let verdict = classify_body("Careers <no-reply@tesla.com>", "Preparing for your application", &body);
+        assert_ne!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
+    /// Seven of the eleven evidence branches named a marker and quoted nothing, so a verdict
+    /// could not be checked against the text that produced it — which is the entire reason the
+    /// `evidence` column exists.
+    #[test]
+    fn every_branch_quotes_the_text_that_convinced_it() {
+        let cases: &[(&str, &str, &str, Category)] = &[
+            ("a@tesla.com", "Update", "We regret to inform you that we are moving on.", Category::Rejection),
+            ("a@tesla.com", "Update", "Unfortunately we have decided to move forward with other candidates.", Category::Rejection),
+            ("a@tesla.com", "Good news", "We are pleased to offer you the internship.", Category::Offer),
+            ("a@tesla.com", "Next steps", "We would like to invite you to interview with the team.", Category::Interview),
+            ("a@tesla.com", "Next steps", "Please complete your online assessment this week.", Category::Oa),
+            ("no-reply@codesignal.com", "Done", "Your assessment has been submitted.", Category::Oa),
+            ("a@tesla.com", "Received", "Thank you for applying to our internship programme.", Category::Confirmation),
+            ("a@tesla.com", "Received", "We have received your application for the role.", Category::Confirmation),
+            ("a@example.org", "Weekly digest", "New jobs for you this week.", Category::Disregarded),
+            ("a@example.org", "Thanks for registering for our event", "See you there.", Category::Disregarded),
+        ];
+        for (from, subject, body, expected) in cases {
+            let verdict = classify_body(from, subject, body);
+            assert_eq!(verdict.category, *expected, "{subject:?} -> {verdict:?}");
+            assert!(
+                verdict.evidence.contains('…'),
+                "{subject:?} names a marker but quotes nothing: {:?}",
+                verdict.evidence
+            );
+        }
+    }
+
+    /// The corpus contains "Reply", and every no-reply address offers it a clean whole-word
+    /// match. Found by reading a dry run whose evidence read "names reply in the sender, and a
+    /// person sent it" — wrong about the company and wrong about the person.
+    #[test]
+    fn a_word_addresses_are_built_from_is_not_a_company_in_the_sender() {
+        let companies = ["reply".to_string(), "roblox".to_string()];
+        let context = Context { known_companies: &companies };
+        let verdict = classify_with_body(
+            Some("Someone <no-reply@somewhere.example>"),
+            Some("Your account"),
+            None,
+            Some("Confirm your email address to finish signing up."),
+            &context,
+        );
+        assert_eq!(verdict.category, Category::Disregarded, "{verdict:?}");
+        // The sender fallback may still name something off the display name — that is its job,
+        // and it is not a claim that the mail is job-related. What must not happen is the
+        // CORPUS matching "reply", because that is what opens the relevance gate.
+        assert_ne!(verdict.company_guess.as_deref(), Some("reply"), "{verdict:?}");
+    }
+
+    /// A machine is never described as a person, whichever condition opened the gate.
+    #[test]
+    fn the_outreach_evidence_never_calls_a_machine_a_person() {
+        let companies = ["roblox".to_string()];
+        let context = Context { known_companies: &companies };
+        let verdict = classify_with_body(
+            Some("Roblox <no-reply@notifications.roblox.com>"),
+            Some("Your application"),
+            None,
+            Some("We have your application on file for the internship."),
+            &context,
+        );
+        assert!(
+            !verdict.evidence.contains("a person sent it"),
+            "a no-reply sender is not a person: {:?}",
+            verdict.evidence
+        );
+    }
+
+    /// `parse` held an array literal while its doc claimed adding a variant was a compile error.
+    /// `Category::index` is the exhaustive match that makes the claim true; these are the tests
+    /// the function never had.
+    #[test]
+    fn every_category_parses_back_from_the_name_it_stores() {
+        for category in Category::ALL {
+            assert_eq!(Category::parse(category.as_str()), Some(category));
+        }
+        assert_eq!(Category::ALL.len(), 7);
+        assert_eq!(Category::parse("rejections"), None);
+        assert_eq!(Category::parse(""), None);
+        assert_eq!(Category::parse("Rejection"), None);
+    }
+
+    #[test]
+    fn no_two_categories_share_an_index() {
+        let mut seen = Category::ALL.map(Category::index);
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1, 2, 3, 4, 5, 6]);
+    }
+
 }
