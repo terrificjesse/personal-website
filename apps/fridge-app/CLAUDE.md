@@ -274,10 +274,34 @@ Deliberate choices worth not "fixing":
   actually changed.
 - **`PORT`** (default 8080) lets a second backend run alongside the usual one — how Phase 6 was
   verified against a throwaway database without stopping the running instance.
-- **`cargo fmt` reformats the whole crate, `[learn]` files included.** It stripped a leading
-  blank line from `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs`, and
-  `rerank.rs` during Phase 6 and had to be reverted by hand. Format single files
-  (`rustfmt src/foo.rs`) or check the diff afterwards.
+- **Do not format this crate. Not `cargo fmt`, and not `rustfmt` on one file either.**
+  `cargo fmt` reformats everything, `[learn]` files included — it stripped a leading blank line
+  from `nlp.rs`, `expiration.rs`, `recommend.rs`, `recommend_recipes.rs` and `rerank.rs` during
+  Phase 6 and had to be reverted by hand.
+
+  **This entry used to recommend `rustfmt src/foo.rs` as the safe alternative. It is not, and
+  that advice caused the damage it was written to prevent.** `rustfmt` follows `mod`
+  declarations out of the file it is pointed at: on 2026-09-22, `rustfmt src/inbox/classify.rs`
+  rewrote all 56 source files in the crate and every one of the six `[learn]` files. Recovered
+  with `git checkout -- src/`, which is the right move — separating churn from substance hunk by
+  hunk is not. Keep a copy of any heavily-edited file *before* you format, so re-applying your
+  work onto the HEAD version is a `cp` rather than a rewrite.
+
+  There is also nothing to comply with: the repo has **no `rustfmt.toml`** and
+  `.github/workflows/checks.yml` runs **no format check**. The code is hand-styled wider than
+  rustfmt's default, so formatting it produces hundreds of lines of re-wrapping that fight the
+  existing style and bury the real diff — one pass turned a 787-line change into 1547. Match the
+  surrounding style by hand. `cargo clippy --release --all-targets` is the check that matters,
+  and it says nothing about layout.
+
+  If something did get formatted, verify recovery explicitly before committing — a clean
+  `cargo test` does not prove a `[learn]` file is untouched, only that it still compiles:
+
+  ```bash
+  git diff --name-only -- src/auth.rs src/nlp.rs src/expiration.rs src/recommend.rs src/recommend_recipes.rs src/rerank.rs
+  ```
+
+  Any output at all means one is still modified. Silence is the pass.
 - Backend binds `0.0.0.0` on purpose. Every data route now requires a session, but
   `COOKIE_SECURE` defaults to off (plain HTTP on a LAN), so still trusted networks only.
 - `apps/fridge-app/backend/.env.example` documents every env var; `.env` is gitignored.
