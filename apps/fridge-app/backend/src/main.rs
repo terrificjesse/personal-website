@@ -46,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
         Some("inbox") if args.get(1).map(String::as_str) == Some("diagnose") => {
             return inbox::diagnose::main(&pool, &args[1..]).await;
         }
+        Some("inbox") if args.get(1).map(String::as_str) == Some("backfill-status") => {
+            return inbox::backfill_status::main(&pool, &args[1..]).await;
+        }
         Some("inbox") => return inbox::untracked::main(&pool, &args[1..]).await,
         _ => {}
     }

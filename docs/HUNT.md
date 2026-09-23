@@ -744,6 +744,65 @@ the market; `internship_applications` is the record of what you did. The join to
 `LEFT` and enrichment-only — an `INNER JOIN` here silently drops applications whose posting was
 pruned, which is trap 1 in `routes/internships.rs` arriving through a new door.
 
+### The outcomes panel was right and unfed — 2026-09-23
+
+Reported as **47 no response, 1 rejected, 1 OA** while the mailbox held 17 rejections and 12
+OAs. Nothing in this contract was wrong and neither was its SQL. Only two `application_events`
+rows existed after creation, so `metrics_for` folded exactly what it was given.
+
+**The break was upstream, and it was the same shape as the classifier defect one day earlier.**
+`propose_status` was private to `sync` and reachable only from the new-message branch, so:
+
+- a verdict corrected by `inbox reclassify` never reached the tracker — and fifteen of the
+  seventeen rejections existed *only* because of a correction; and
+- the ones that did arrive by sync arrived body-blind, so nine Microsoft rejections whose
+  refusal is only in the body were classified `confirmation`, implied `applied`, and were
+  refused by `may_advance` as a same-status no-op. Four status proposals had ever been written.
+
+`propose_status` is now `pub(super)` and called by `sync`, by `reclassify` as it corrects, and
+by a new `inbox backfill-status`. Every gate stays inside it, so no caller can reach the tracker
+without passing rule 3 and rule 2.
+
+#### Two matcher defects the backfill found, both by refusing to guess
+
+The first dry run proposed **75** changes. It had re-derived each verdict with `classify` — no
+body — to recover the company guess, so every Microsoft rejection came back `confirmation`. The
+backfill written to fix a body-blind bug had reintroduced it one file over. It now takes the
+**stored** category and re-classifies only for the company name; re-deciding a category is
+`reclassify`'s job and it fetches bodies to do it.
+
+The second was worse, because it was silent. Three rejections naming three different Microsoft
+roles all proposed against one application. `match_application` compares roles by exact key and
+falls back to company-only when the email names none — and `title_from_subject` was discarding
+these roles at its 120-character gate, because the trailing `(Job number: 200042195)` pushed
+them over. Stripping a requisition parenthetical before the gate recovered the role; stripping
+the words that introduce it inside `role_key` made the two sides comparable at all, since a
+tracked title carries `(Job number: …)` and an email's copy of the same role does not. Eleven
+rejections now resolve to **eleven distinct applications**.
+
+Both were found by reading the dry run rather than trusting its count, which is the only reason
+the command prints every row and separates "already proposed" from "matched nothing" from
+"refused by rule 3".
+
+#### One question per application per move
+
+An assessment sends an invitation, a reminder, an expiry warning and a completion. Each implies
+`oa` for the same application, and each was proposing separately — the live database already
+held two duplicate `applied -> oa` rows from before the backfill existed. Accepting one makes
+the rest no-ops by rule 3, so the extras were never wrong, only noise in the one queue whose
+value is being short enough to read. `propose_status` now refuses a move that already has an
+unreviewed proposal, and the dry run suppresses the same duplicates the real run would, so the
+two numbers agree.
+
+#### What this did not change
+
+`INBOX_AUTO_APPLY_CONFIDENCE` is still unset and `may_auto_apply` still refuses every terminal
+status at any confidence, so **every one of the eleven rejections is a human decision**. The
+queue moved from the bottom of `/internships` to the applications page, above the tracker —
+`StatusProposals.tsx`, the same treatment and the same reasoning as `UntrackedApplications`,
+because a panel reporting "1 rejected" while eleven rejections sat one scroll below it is the
+placement bug repeated.
+
 ### Cohort semantics — `from`/`to` filter the APPLICATION, not the event
 
 The window is compared against `internship_applications.applied_at`. An application made in June

@@ -34,6 +34,7 @@
 //! no tools — and every write happens in Rust outside the model call.
 
 pub mod advance;
+pub mod backfill_status;
 pub mod classify;
 pub mod diagnose;
 pub mod due_dates;

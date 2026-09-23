@@ -121,7 +121,27 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
         );
     }
 
+    // Whose tracker a correction may propose against. One account today, and the same
+    // `LIMIT 1` the session lookup uses — a proposal written against the wrong user's
+    // applications would be worse than none.
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM gmail_accounts LIMIT 1")
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .unwrap_or_default();
+
     let companies = super::sync::known_companies(pool).await;
+
+    // The applications a corrected verdict can be attached to. Loaded once per pass, like the
+    // company list and for the same reason: `match_application` is pure and everything it needs
+    // arrives as an argument.
+    let applications: Vec<super::advance::TrackedApplication> = sqlx::query_as(
+        "SELECT id, company_name AS company, title FROM internship_applications WHERE user_id = ?",
+    )
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
     let context = classify::Context {
         known_companies: &companies,
     };
@@ -203,6 +223,36 @@ pub async fn reclassify(pool: &SqlitePool, dry_run: bool) -> Result<Vec<Change>>
             .bind(now.to_rfc3339())
             .execute(pool)
             .await?;
+        }
+
+        // **The correction reaches the tracker, which is what this tool never did.**
+        //
+        // A re-classification appended a corrected verdict and stopped. Until 2026-09-23 the
+        // only caller of `propose_status` was the new-message branch of a live sync, so fifteen
+        // of seventeen rejections — every one that exists because of a correction — never
+        // produced a proposal, and the Application outcomes panel showed 1 rejected against 17
+        // in the mailbox.
+        //
+        // Writing a proposal is not applying it: `may_auto_apply` refuses every terminal status
+        // at any confidence, so a rejection still waits for a human. Rule 2 is intact.
+        if !dry_run
+            && let Err(err) = super::sync::propose_status(
+                pool,
+                &user_id,
+                super::sync::MessageFacts {
+                    gmail_message_id: gmail_id,
+                    subject: subject.as_deref(),
+                    snippet: snippet.as_deref(),
+                },
+                &verdict,
+                &applications,
+                super::sync::auto_apply_threshold(),
+                now,
+                true,
+            )
+            .await
+        {
+            eprintln!("reclassify: could not record a status proposal: {err:?}");
         }
 
         changes.push(Change {
