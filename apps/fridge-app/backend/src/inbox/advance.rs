@@ -115,6 +115,9 @@ pub fn match_application<'a>(
     let wanted_role = super::untracked::role_key(role_guess);
 
     let mut best: Option<(&str, f64)> = None;
+    // How many applications clear the company bar, which decides whether a roleless email has
+    // one obvious home or several possible ones.
+    let mut candidates = 0usize;
     for TrackedApplication { id, company, title } in applications {
         let key = company_key(company);
         if key.is_empty() {
@@ -145,6 +148,27 @@ pub fn match_application<'a>(
         if score >= 0.9 && best.is_none_or(|(_, current)| score > current) {
             best = Some((id.as_str(), score));
         }
+        if score >= 0.9 {
+            candidates += 1;
+        }
+    }
+
+    // **When the email names no role and the company has several applications, decline.**
+    //
+    // The roleless fallback above exists so that an autoresponder naming no role still reaches
+    // the one application it can only be about. With more than one candidate it stops being a
+    // fallback and becomes a coin toss, and the coin was landing badly: a Microsoft HackerRank
+    // invitation for "Full Stack Product (Web + Services) Req ID (200042195)" — a role with no
+    // tracked application at all — was attached to the Data Platform/Analytics one, proposed
+    // `oa` against it, and that acceptance is what moved a correctly-rejected application
+    // backwards on 2026-09-26.
+    //
+    // "Names no role" here means none could be READ, which is not the same as none being
+    // present; `title_from_subject` does not know that phrasing. Either way the safe answer is
+    // the same, and rule 8 already makes a no-match harmless: the email is still classified,
+    // still labelled, still alerted if pressing. A wrong match is the expensive direction.
+    if wanted_role.is_empty() && candidates > 1 {
+        return None;
     }
     best.map(|(id, _)| id)
 }
@@ -152,6 +176,50 @@ pub fn match_application<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A roleless email with one possible home still finds it; with several it declines.
+    ///
+    /// The fallback exists for the first case — an autoresponder that names no role can only be
+    /// about the one application. The second was a coin toss, and on 2026-09-26 it landed on the
+    /// wrong Microsoft application, proposed `oa` against a correctly-rejected one, and that
+    /// acceptance walked the tracker backwards.
+    #[test]
+    fn a_roleless_email_declines_between_several_applications_at_one_company() {
+        let one = vec![TrackedApplication {
+            id: "a1".into(),
+            company: "Microsoft".into(),
+            title: Some("Software Engineer: Data Platform".into()),
+        }];
+        assert_eq!(match_application(Some("microsoft"), None, &one), Some("a1"));
+
+        let several = vec![
+            TrackedApplication {
+                id: "a1".into(),
+                company: "Microsoft".into(),
+                title: Some("Software Engineer: Data Platform".into()),
+            },
+            TrackedApplication {
+                id: "a2".into(),
+                company: "Microsoft".into(),
+                title: Some("Software Engineer: Security & Identity".into()),
+            },
+        ];
+        assert_eq!(
+            match_application(Some("microsoft"), None, &several),
+            None,
+            "guessing between two applications is how the wrong one got rejected"
+        );
+
+        // Naming the role still resolves it, which is the whole point of keeping both paths.
+        assert_eq!(
+            match_application(
+                Some("microsoft"),
+                Some("Software Engineer: Security & Identity"),
+                &several
+            ),
+            Some("a2")
+        );
+    }
     use ApplicationStatus::*;
 
     #[test]

@@ -794,6 +794,63 @@ value is being short enough to read. `propose_status` now refuses a move that al
 unreviewed proposal, and the dry run suppresses the same duplicates the real run would, so the
 two numbers agree.
 
+#### Rule 3 was enforced on creation and not on acceptance — found 2026-09-26
+
+A validation sweep two days later found the pipeline closed and running: 0 unproposed verdicts,
+`application-events verify` at 53/53 with no mismatches, and a fresh Optiver `oa → interview`
+proposal raised by a live sync — the first interview the classifier has ever caught. One row was
+wrong.
+
+`routes::inbox::decide` read `application_id`, `from_status` and `to_status` **from the proposal**
+and wrote `status = to_status`. It never read the application's live status and never asked
+`advance::may_advance`. So a proposal raised while an application was `applied` could be accepted
+after that application had become `rejected`, and it moved it backwards out of a terminal status —
+the transition `may_advance`'s own comment refuses, "An offer does not become a rejection because
+a late autoresponder arrived".
+
+**The backfill is what made the gap reachable.** Thirteen proposals written at once and then
+accepted in a batch, so several were stale by the time they applied. One Microsoft application
+showed `oa` despite an accepted rejection; it was the only one, confirmed by querying every
+accepted proposal against its application's status.
+
+`decide` now asks rule 3 inside the existing transaction and answers **409** when it refuses,
+marking the proposal reviewed and `accepted = 0` — the question has been answered, and a queue
+that re-offers a move which can never apply is its own defect. 409 and never 401: `apiFetch`
+raises `UnauthorizedError` on 401 alone and `useApiError` redirects that to `/login`, so a
+signed-in reader would be bounced by a status meant to say "this has moved".
+
+**The undo needed the opposite guard.** An undo is a backwards move by design, so `may_advance`
+would refuse every one — the first attempt broke two existing tests by doing exactly that. What
+it must check is that the application is still where *this* proposal put it; otherwise "reject"
+clobbers whatever moved it since instead of reversing what this proposal did.
+
+#### And the matcher stopped guessing between applications
+
+The OA emails that overwrote the rejection were for "Full Stack Product (Web + Services) Req ID
+(200042195)" — a Microsoft role with no tracked application. `title_from_subject` cannot read a
+role from that phrasing, so `wanted_role` was empty, the role filter was skipped entirely, and
+company-only matching attached the mail to whichever Microsoft application came first.
+
+`match_application` now declines when the email names no readable role **and** the company has
+more than one candidate. One application is still matched on company alone, which is the
+roleless-autoresponder case the fallback was written for. Rule 8 already makes a no-match
+harmless — the email is classified, labelled and alerted regardless — and a wrong match is the
+expensive direction. `backfill-status` prints the candidate count beside each unmatched row, so
+"company not tracked" and "several applications and no readable role" stop looking identical.
+
+Teaching the extractor the "Req ID" and "Technical Screen:" phrasings would catch more
+legitimately and is deliberately left for its own change; this makes the current failure safe
+rather than wrong.
+
+#### `application-events repair`
+
+The damaged row was corrected with a new verb rather than an `UPDATE`, because
+`internship_applications.status` is the cached fold of `application_events` and `verify` exists to
+assert they agree — a hand-written fix moves the column and leaves the history describing a
+different application, breaking the one invariant this module is for, silently. `repair` writes
+both in one transaction with `Actor::Manual` and no cause, since no email caused it. Tracker after:
+36 applied, 12 rejected, 5 OA, and `verify` still 53/53.
+
 #### What this did not change
 
 `INBOX_AUTO_APPLY_CONFIDENCE` is still unset and `may_auto_apply` still refuses every terminal

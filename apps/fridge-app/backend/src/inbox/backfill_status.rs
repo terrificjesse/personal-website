@@ -156,10 +156,23 @@ async fn backfill(pool: &SqlitePool, apply: bool) -> Result<Tally> {
         // matcher problem. Printing the key the matcher actually compared is what turns a
         // guess about which one it is into a reading.
         let role = super::untracked::role_from(row.subject.as_deref(), row.snippet.as_deref());
+        // How many applications the company has, because "company not tracked" and "several
+        // applications and no readable role" are different problems with the same symptom, and
+        // only the second is something a better extractor would fix.
+        let company_key = verdict
+            .company_guess
+            .as_deref()
+            .map(crate::internships::normalize::company_key)
+            .unwrap_or_default();
+        let at_this_company = applications
+            .iter()
+            .filter(|a| crate::internships::normalize::company_key(&a.company) == company_key)
+            .count();
         let unmatched_line = format!(
-            "  {:<12} {:<22} role={}",
+            "  {:<12} {:<22} ({} tracked) role={}",
             category.as_str(),
             verdict.company_guess.as_deref().unwrap_or("(no company)"),
+            at_this_company,
             role.as_deref().unwrap_or("(none extracted)")
         );
         let title = matched

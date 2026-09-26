@@ -20,13 +20,13 @@ use axum::{
     response::Redirect,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::auth::GoogleOAuthConfig;
-use crate::inbox::{oauth, sync, untracked};
+use crate::inbox::{advance, oauth, sync, untracked};
 use crate::internships::application_events::{self, Actor, Cause, NewApplicationEvent};
 use crate::internships::models::ApplicationStatus;
 use crate::routes::auth::CurrentUser;
@@ -253,6 +253,7 @@ pub async fn disconnect(
         .map_err(internal("disconnecting Gmail"))?;
     Ok(StatusCode::NO_CONTENT)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -527,8 +528,9 @@ async fn decide(
     // needed inside this transaction, and the read it replaces ended in `.ok().flatten()` —
     // so a failing lookup was indistinguishable from a proposal that had no previous status,
     // and the undo silently did nothing.
-    let row: Option<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT p.application_id, p.from_status, p.to_status, p.applied_automatically
+    let row: Option<(String, String, String, i64, String)> = sqlx::query_as(
+        "SELECT p.application_id, p.from_status, p.to_status, p.applied_automatically,
+                a.status AS current_status
            FROM status_proposals p
            JOIN internship_applications a ON a.id = p.application_id
           WHERE p.id = ? AND a.user_id = ? AND p.reviewed_at IS NULL",
@@ -542,7 +544,7 @@ async fn decide(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let Some((application_id, from_status, to_status, was_auto)) = row else {
+    let Some((application_id, from_status, to_status, was_auto, current_status)) = row else {
         return Err(StatusCode::NOT_FOUND);
     };
     let now = Utc::now();
@@ -555,12 +557,44 @@ async fn decide(
     // `(where it ends up, where it came from)` — the second is what the event records as
     // `from_status`. Accepting moves it to the proposal's `to_status`; undoing puts it back,
     // so the pair is reversed.
+    // **Rule 3, asked here and not only where the proposal was made.**
+    //
+    // `from_status` on the row describes the application as it was when the classifier saw it.
+    // By the time somebody clicks, it may have moved — a second email, or another proposal
+    // accepted first — and applying `to_status` blindly then walks the tracker backwards.
+    //
+    // Live on 2026-09-26: a Microsoft application read `oa` although a genuine rejection for it
+    // had been accepted, because an `applied -> oa` proposal raised earlier was accepted after
+    // the rejection landed. `advance::may_advance` already refuses exactly that — "An offer does
+    // not become a rejection because a late autoresponder arrived" — and this path had never
+    // asked it. `inbox backfill-status` is what made the gap reachable: thirteen proposals
+    // written at once and then accepted in a batch, so several were stale on arrival.
+    let Some(current) = ApplicationStatus::parse(&current_status) else {
+        eprintln!("inbox: application {application_id} holds status {current_status:?}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
     let next = if accept {
-        if ApplicationStatus::parse(&to_status).is_none() {
+        let Some(target) = ApplicationStatus::parse(&to_status) else {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        // Already there is the no-op this path has always allowed, and it is what makes
+        // pressing accept twice safe. Only a move that rule 3 forbids is a conflict.
+        if current != target && !advance::may_advance(current, target) {
+            return settle_unapplicable(tx, id, now, current).await;
         }
         Some((to_status, from_status))
     } else if was_auto == 1 {
+        // An undo is a backwards move by definition, so `may_advance` is the wrong question
+        // here — it would refuse every one of them. The right question is whether the
+        // application is still where THIS proposal put it: if something else has moved it since,
+        // restoring `from_status` would clobber that instead of reversing this.
+        if ApplicationStatus::parse(&from_status).is_none() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        if current.as_str() != to_status {
+            return settle_unapplicable(tx, id, now, current).await;
+        }
         Some((from_status, to_status))
     } else {
         None
@@ -651,6 +685,40 @@ async fn decide(
     })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Settle a proposal whose move rule 3 will not allow, and say so as a conflict.
+///
+/// Marked reviewed and `accepted = 0` rather than left pending: the question has been answered,
+/// and a queue that keeps re-offering a move which can never apply is its own defect. **409 and
+/// never 500** — a stale proposal is a legitimate state, not a fault — and never 401, because
+/// `apiFetch` raises `UnauthorizedError` on 401 alone and `useApiError` turns that into a
+/// redirect, so a signed-in reader would be bounced to `/login` by a status meant to say "this
+/// application has moved".
+async fn settle_unapplicable(
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    now: DateTime<Utc>,
+    current: ApplicationStatus,
+) -> Result<StatusCode, StatusCode> {
+    sqlx::query("UPDATE status_proposals SET reviewed_at = ?1, accepted = 0 WHERE id = ?2")
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| {
+            eprintln!("inbox: settling an unapplicable proposal failed: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    tx.commit().await.map_err(|err| {
+        eprintln!("inbox: committing an unapplicable proposal failed: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    eprintln!(
+        "inbox: proposal {id} no longer applies — the application is now {}",
+        current.as_str()
+    );
+    Err(StatusCode::CONFLICT)
 }
 
 #[cfg(test)]
@@ -944,7 +1012,92 @@ mod decide_tests {
         tx.commit().await.unwrap();
     }
 
+/// The undo's own version of the same hazard.
+    ///
+    /// An undo is a backwards move by design, so `may_advance` cannot be its guard. What it must
+    /// check is that the application is still where this proposal put it — otherwise "reject"
+    /// would clobber whatever moved it since rather than reversing what this proposal did.
     #[tokio::test]
+    async fn an_undo_does_not_clobber_a_move_it_did_not_make() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "oa").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 1).await;
+
+        // Something else advanced it past where this proposal left it.
+        sqlx::query("UPDATE internship_applications SET status = 'offer' WHERE id = ?")
+            .bind(&app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(decide(&pool, &user_id, &proposal_id, false).await, Err(StatusCode::CONFLICT));
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM internship_applications WHERE id = ?")
+                .bind(&app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "offer", "the undo must not reach past its own change");
+    }
+
+    /// **Rule 3 on the path a human actually uses.**
+    ///
+    /// Live on 2026-09-26: a Microsoft application showed `oa` although a genuine rejection for
+    /// it had been accepted. Rule 3 is enforced where a proposal is CREATED — `may_advance`
+    /// inside `sync::propose_status` — and the accept path had no such check, so it wrote
+    /// `status = to_status` from a row that described the application as it had been. A proposal
+    /// raised while it was `applied` moved it backwards out of a terminal status.
+    ///
+    /// `inbox backfill-status` made that reachable rather than theoretical: thirteen proposals
+    /// written at once, then accepted in a batch, so several were stale by the time they applied.
+    #[tokio::test]
+    async fn a_proposal_cannot_move_an_application_that_has_since_moved() {
+        let pool = pool().await;
+        let user_id = user(&pool).await;
+        let app_id = application(&pool, &user_id, "applied").await;
+        let proposal_id = proposal(&pool, &user_id, &app_id, "applied", "oa", 0).await;
+
+        // The application is rejected behind the proposal's back — a second email, or another
+        // proposal accepted first, which is exactly what happened live.
+        sqlx::query("UPDATE internship_applications SET status = 'rejected' WHERE id = ?")
+            .bind(&app_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = decide(&pool, &user_id, &proposal_id, true).await;
+        assert_eq!(
+            outcome,
+            Err(StatusCode::CONFLICT),
+            "a stale proposal must be refused, not applied"
+        );
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM internship_applications WHERE id = ?")
+                .bind(&app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "rejected", "the terminal status must survive");
+
+        // Answered, not left pending: re-offering a move that can never apply is its own bug.
+        let (reviewed, accepted): (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT reviewed_at, accepted FROM status_proposals WHERE id = ?",
+        )
+        .bind(&proposal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(reviewed.is_some(), "the proposal should be settled");
+        assert_eq!(accepted, Some(0));
+
+        // And nothing was logged, because nothing moved.
+        assert!(events_for(&pool, &app_id).await.is_empty());
+    }
+
+        #[tokio::test]
     async fn accepting_a_proposal_records_one_manual_event() {
         let pool = pool().await;
         let user_id = user(&pool).await;

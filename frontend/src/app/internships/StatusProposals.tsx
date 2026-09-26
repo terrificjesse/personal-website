@@ -23,7 +23,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { useApiError } from "@/lib/useApiError";
 import { UnauthorizedError } from "@/lib/apiClient";
-import { decideProposal, listProposals, type StatusProposal } from "@/lib/internshipsApi";
+import {
+  ProposalStaleError,
+  decideProposal,
+  listProposals,
+  type StatusProposal,
+} from "@/lib/internshipsApi";
 
 /** Above this many pending rejections, reviewing them one at a time stops being reading. */
 const BULK_THRESHOLD = 3;
@@ -88,6 +93,14 @@ export function StatusProposals({
       onDecided?.();
       setMessage(accept ? "Applied to your tracker." : "Left as it was.");
     } catch (err) {
+      // Stale is not a failure. The proposal has been settled server-side, so reloading is what
+      // makes the queue agree with that.
+      if (err instanceof ProposalStaleError) {
+        await load();
+        onDecided?.();
+        setMessage(err.message);
+        return;
+      }
       setMessage(handleError(err, "Could not record that decision"));
     } finally {
       setBusy(false);
@@ -111,12 +124,25 @@ export function StatusProposals({
     setBusy(true);
     setMessage(null);
     let done = 0;
+    let skipped = 0;
     try {
       for (const item of rejections) {
-        await decideProposal(item.id, true);
-        done += 1;
+        try {
+          await decideProposal(item.id, true);
+          done += 1;
+        } catch (err) {
+          // One application having moved is no reason to abandon the other ten. Counted and
+          // reported, never swallowed — a bulk action that quietly drops rows is worse than one
+          // that stops.
+          if (err instanceof ProposalStaleError) {
+            skipped += 1;
+            continue;
+          }
+          throw err;
+        }
       }
-      setMessage(`Applied ${done} rejection${done === 1 ? "" : "s"} to your tracker.`);
+      const tail = skipped > 0 ? `, and skipped ${skipped} that had already moved` : "";
+      setMessage(`Applied ${done} rejection${done === 1 ? "" : "s"}${tail}.`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : "unknown error";
       setMessage(`Applied ${done} of ${rejections.length}, then stopped: ${reason}`);
