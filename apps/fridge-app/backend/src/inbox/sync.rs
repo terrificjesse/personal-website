@@ -131,13 +131,7 @@ pub async fn run(
     // The classifier is pure (rule 1), so what it may know about the world is passed in.
     // Loaded once per pass rather than per message: it is one query and a run is a hundred
     // messages.
-    let known_companies: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT lower(company_name) FROM internship_postings
-          UNION SELECT DISTINCT lower(company_name) FROM internship_applications",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let known_companies = known_companies(pool).await;
     let context = classify::Context { known_companies: &known_companies };
 
     // The applications an email can be matched to. Loaded once, like the company list — the
@@ -202,13 +196,7 @@ pub async fn run(
             // nothing. The verdict is NOT re-stored and the counts are not touched: those
             // measure new work, and inflating them would break rule 7's invariant.
             if let Some(ids) = &label_ids {
-                let verdict = classify::classify_with_body(
-            message.from.as_deref(),
-            message.subject.as_deref(),
-            message.snippet.as_deref(),
-            message.body.as_deref(),
-            &context,
-        );
+                let verdict = verdict_for(&message, &context);
                 if let Err(err) =
                     apply_label(pool, &client, &token, ids, &message, verdict.category, now).await
                 {
@@ -218,12 +206,7 @@ pub async fn run(
             continue;
         }
 
-        let verdict = classify::classify(
-            message.from.as_deref(),
-            message.subject.as_deref(),
-            message.snippet.as_deref(),
-            &context,
-        );
+        let verdict = verdict_for(&message, &context);
         report.classified += 1;
 
         // RULE 7: written for EVERY message, including the disregarded ones. A dropped email
@@ -255,7 +238,21 @@ pub async fn run(
 
         // 8c, the reversible half: propose a status change, never make one silently.
         if let Err(err) =
-            propose_status(pool, user_id, &message, &verdict, &applications, threshold, now).await
+            propose_status(
+                pool,
+                user_id,
+                MessageFacts {
+                    gmail_message_id: &message.id,
+                    subject: message.subject.as_deref(),
+                    snippet: message.snippet.as_deref(),
+                },
+                &verdict,
+                &applications,
+                threshold,
+                now,
+                true,
+            )
+            .await
         {
             eprintln!("inbox: could not record a status proposal: {err:?}");
         }
@@ -313,6 +310,68 @@ pub async fn run(
     Ok(report)
 }
 
+/// Every company this agent may recognise by name — the classifier's whole world.
+///
+/// # Why this is one function
+///
+/// It was three queries. `sync` read postings **union the user's own applications**;
+/// `reclassify` and the labelling harness read postings alone. So a re-classification ran with
+/// a strictly smaller world than the sync it was correcting, and could only ever lose
+/// companies.
+///
+/// Six of them, on the live corpus of 2026-09-22: workiva, glencliff labs, percheron capital,
+/// oklahoma city thunder, chicago trading company, data solutions — every one an employer the
+/// user had applied to, none with a scraped posting to its name. The visible symptom was a
+/// Workiva recruiting mail classified `outreach` on the evidence "names **secure**", a
+/// different corpus company matched out of the words "Secure your spot" in its body, because
+/// the rules could not see "workiva" at all.
+///
+/// That is the module doc's own "silently doing less", in the tool written to prevent it.
+pub(super) async fn known_companies(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT lower(company_name) FROM internship_postings
+          WHERE company_name IS NOT NULL
+          UNION
+         SELECT DISTINCT lower(company_name) FROM internship_applications
+          WHERE company_name IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// The verdict for one fetched message — the ONLY place a sync classifies anything.
+///
+/// # Why this is a function and not two call sites
+///
+/// It was two call sites, and they called different classifiers. The branch that STORES a
+/// verdict for a new message called `classify` (no body); the branch sixteen lines above it,
+/// which exists only to re-apply a label to a message seen on an earlier pass, called
+/// `classify_with_body`. Same message, same context, same loop, two sets of rules.
+///
+/// That produced a standing drift generator rather than a one-off bug:
+///
+/// - every verdict in `email_verdicts` written by a live sync was decided from a ~200-character
+///   snippet, and the body fetch added on 2026-09-11 reached nothing that was kept;
+/// - the label applied in that pass was snippet-only too, while the label re-applied on the
+///   NEXT pass was body-aware, so the stored verdict and the mailbox disagreed by construction;
+/// - `inbox reclassify` kept finding work because it was the only body-aware writer.
+///
+/// Measured with `inbox diagnose` on 2026-09-22, before this change: 19 of 118 stored messages
+/// classify differently with and without their body, and **13 of the 16 rejections read as
+/// confirmations without one** — nine Microsoft "Thank you for your application!" messages
+/// whose refusal is only in the body, which every sync had therefore stored as confirmations
+/// until a reclassification corrected them. That is the missed-rejection complaint the QC pass
+/// started from, and it was one function call.
+fn verdict_for(message: &gmail::Message, context: &classify::Context<'_>) -> classify::EmailVerdict {
+    classify::classify_with_body(
+        message.from.as_deref(),
+        message.subject.as_deref(),
+        message.snippet.as_deref(),
+        message.body.as_deref(),
+        context,
+    )
+}
 async fn finish(
     pool: &SqlitePool,
     run_id: &str,
@@ -483,7 +542,7 @@ async fn apply_label(
 /// `apps/hunt-extension/CLAUDE.md` says to set this after 8b gives real numbers, and 8b's
 /// checkpoint is not met — guessing it would be inventing the measurement it is meant to come
 /// from. Set `INBOX_AUTO_APPLY_CONFIDENCE` to enable it once there is a number.
-fn auto_apply_threshold() -> Option<f64> {
+pub(super) fn auto_apply_threshold() -> Option<f64> {
     std::env::var("INBOX_AUTO_APPLY_CONFIDENCE")
         .ok()
         .and_then(|raw| raw.trim().parse::<f64>().ok())
@@ -515,22 +574,88 @@ async fn verdict_id_for(pool: &SqlitePool, gmail_message_id: &str) -> Result<Opt
     .await?)
 }
 
-async fn propose_status(
+/// The parts of a message the status path reads.
+///
+/// A struct rather than five parameters, and deliberately **not** `gmail::Message`: of the
+/// three callers only `sync` has one. `reclassify` and `backfill_status` work from stored
+/// columns, and making them fabricate a `gmail::Message` with four fields nobody reads would be
+/// ceremony that hides which inputs actually matter.
+/// What the status path decided, so a caller can report it without re-deriving it.
+///
+/// A bare `bool` was enough while `sync` was the only caller and ignored it anyway. It is not
+/// enough for a backfill: "refused because the application is already past this status" and
+/// "matched nothing" and "wrote a proposal" are three different facts, and a dry run that
+/// reports them as one count overstates its own effect — the first dry run of
+/// `backfill-status` claimed 75 proposals where 29 were real, because it had guessed at the
+/// gates instead of asking them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Proposed {
+    /// A proposal was written, or would be. Carries the application so a caller running in
+    /// dry mode can suppress the duplicates the real run would suppress by reading the rows it
+    /// has not written — without that, dry and apply disagree and the dry number is the lie.
+    Yes { application: String, from: ApplicationStatus, to: ApplicationStatus },
+    /// The category implies no status at all — outreach, disregarded.
+    NoStatusImplied,
+    /// Rule 3 refused it: same status, or backwards from a terminal one.
+    AlreadyThere { from: ApplicationStatus, to: ApplicationStatus },
+    /// No tracked application to attach it to. An untracked-application proposal may have been
+    /// raised instead; that is a different queue and a different question.
+    NoMatch,
+    /// An unreviewed proposal for this same move is already waiting.
+    AlreadyPending { to: ApplicationStatus },
+    /// The plumbing could not complete — no verdict row, or the application vanished.
+    Incomplete,
+}
+
+pub(super) struct MessageFacts<'a> {
+    pub gmail_message_id: &'a str,
+    pub subject: Option<&'a str>,
+    pub snippet: Option<&'a str>,
+}
+
+/// Propose the status change an email implies — the ONLY path from a verdict to the tracker.
+///
+/// # Why this is `pub(super)`
+///
+/// It was private to `sync` and reachable only from the new-message branch, so a verdict
+/// corrected by `inbox reclassify` never reached the tracker at all. Measured on 2026-09-23:
+/// **17 rejections and 12 OAs in the mailbox against 1 rejected and 2 OA applications**, and
+/// four status proposals ever created. Fifteen of the seventeen rejections existed only because
+/// of a re-classification, so every one of them stopped here.
+///
+/// The Application outcomes panel was reporting that faithfully — `routes/analytics.rs` folds
+/// `application_events` after creation, and there were two. Nothing downstream was broken; it
+/// was never fed.
+///
+/// **Nothing about the gates changes by sharing this.** Rule 3 (`may_advance`) and rule 2
+/// (a proposal is written, the change is not applied unless `may_auto_apply` allows it, and it
+/// never allows a terminal status) are inside this function, so every caller gets them.
+///
+/// `write = false` evaluates every gate and writes nothing, returning what it *would* do. A
+/// dry run therefore asks the real rules instead of a copy of them, which is the difference
+/// between `backfill-status`'s first dry run claiming 75 proposals and its real answer.
+// Eight arguments, and clippy is right that it is a lot. They are not grouped because each is
+// loaded from a different place and at a different frequency — the pool per process, the
+// applications and threshold once per pass, the facts and verdict per message — and a struct
+// bundling them would hide that a caller who rebuilt one per message was doing needless work.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn propose_status(
     pool: &SqlitePool,
     user_id: &str,
-    message: &gmail::Message,
+    message: MessageFacts<'_>,
     verdict: &classify::EmailVerdict,
     applications: &[advance::TrackedApplication],
     threshold: Option<f64>,
     now: DateTime<Utc>,
-) -> Result<bool> {
+    write: bool,
+) -> Result<Proposed> {
     let Some(to_status) = advance::implied_status(verdict.category) else {
-        return Ok(false);
+        return Ok(Proposed::NoStatusImplied);
     };
     let Some(application_id) =
         advance::match_application(
             verdict.company_guess.as_deref(),
-            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
+            untracked::role_from(message.subject, message.snippet).as_deref(),
             applications,
         )
     else {
@@ -543,21 +668,25 @@ async fn propose_status(
         // tracker holding two rows. So the second case asks a question instead of dropping the
         // fact — see `untracked`, which proposes and never creates.
         let Some(company) = verdict.company_guess.as_deref() else {
-            return Ok(false);
+            return Ok(Proposed::NoMatch);
         };
-        let Some(verdict_id) = verdict_id_for(pool, &message.id).await? else {
-            return Ok(false);
+        if !write {
+            return Ok(Proposed::NoMatch);
+        }
+        let Some(verdict_id) = verdict_id_for(pool, message.gmail_message_id).await? else {
+            return Ok(Proposed::NoMatch);
         };
-        return untracked::propose(
+        untracked::propose(
             pool,
             user_id,
             &verdict_id,
             company,
-            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
+            untracked::role_from(message.subject, message.snippet).as_deref(),
             to_status,
             now,
         )
-        .await;
+        .await?;
+        return Ok(Proposed::NoMatch);
     };
 
     let current: Option<String> = sqlx::query_scalar(
@@ -570,16 +699,48 @@ async fn propose_status(
     .flatten();
 
     let Some(from_status) = current.as_deref().and_then(ApplicationStatus::parse) else {
-        return Ok(false);
+        return Ok(Proposed::Incomplete);
     };
 
     // Rule 3, applied before anything is written.
     if !advance::may_advance(from_status, to_status) {
-        return Ok(false);
+        return Ok(Proposed::AlreadyThere { from: from_status, to: to_status });
     }
 
-    let Some(verdict_id) = verdict_id_for(pool, &message.id).await? else {
-        return Ok(false);
+    // One question per application per move, however many emails ask it.
+    //
+    // A single assessment produces a stream: the invitation, a reminder, an expiry warning,
+    // the expiry itself, the completion. Each implies `oa` for the same application, and each
+    // was proposing separately — five rows in the review queue for one fact, and the live
+    // database already held two duplicate `applied -> oa` proposals from before this backfill
+    // existed. Accepting one makes the rest no-ops by rule 3, so the extras were never wrong,
+    // only noise in the one queue whose whole value is being short enough to read.
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM status_proposals
+          WHERE application_id = ?1 AND to_status = ?2 AND reviewed_at IS NULL
+          LIMIT 1",
+    )
+    .bind(application_id)
+    .bind(to_status.as_str())
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    if pending.is_some() {
+        return Ok(Proposed::AlreadyPending { to: to_status });
+    }
+
+    // Everything above is a question. Below this line the answer gets written, so a dry run
+    // stops here having asked exactly the same gates a real one does.
+    if !write {
+        return Ok(Proposed::Yes {
+            application: application_id.to_string(),
+            from: from_status,
+            to: to_status,
+        });
+    }
+
+    let Some(verdict_id) = verdict_id_for(pool, message.gmail_message_id).await? else {
+        return Ok(Proposed::Incomplete);
     };
 
     let auto = advance::may_auto_apply(to_status, verdict.confidence, threshold);
@@ -657,7 +818,11 @@ async fn propose_status(
 
     tx.commit().await?;
 
-    Ok(true)
+    Ok(Proposed::Yes {
+        application: application_id.to_string(),
+        from: from_status,
+        to: to_status,
+    })
 }
 
 /// Store a due date if the message appears to carry one. **Rule 1: a pure extraction, and
@@ -704,7 +869,8 @@ async fn record_deadline(
     let application_id =
         advance::match_application(
             verdict.company_guess.as_deref(),
-            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref()).as_deref(),
+            untracked::role_from(message.subject.as_deref(), message.snippet.as_deref())
+                .as_deref(),
             applications,
         );
 
@@ -922,6 +1088,216 @@ pub fn spawn(pool: SqlitePool, config: Option<crate::auth::GoogleOAuthConfig>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn tracked_application(pool: &SqlitePool, id: &str, company: &str, title: &str) {
+        sqlx::query(
+            "INSERT INTO internship_applications
+                 (id, user_id, company_name, title, url, snapshot_json, snapshot_at,
+                  status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1,'u1',?2,?3,'https://example.com/j','{}','2026-09-01',
+                     'applied','2026-09-01','2026-09-01','2026-09-01','2026-09-01')",
+        )
+        .bind(id)
+        .bind(company)
+        .bind(title)
+        .execute(pool)
+        .await
+        .expect("application");
+    }
+
+    fn rejection_of(company: &str) -> classify::EmailVerdict {
+        classify::EmailVerdict {
+            category: classify::Category::Rejection,
+            confidence: 0.9,
+            company_guess: Some(company.to_string()),
+            evidence: String::new(),
+        }
+    }
+
+    /// A dry run asks the real gates and writes nothing. The first version of
+    /// `backfill-status` guessed at them instead and reported 75 proposals where 29 were real.
+    #[tokio::test]
+    async fn a_dry_proposal_decides_the_same_thing_and_writes_nothing() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        tracked_application(&pool, "a1", "Roblox", "Software Engineer Intern").await;
+        let applications: Vec<advance::TrackedApplication> =
+            sqlx::query_as("SELECT id, company_name AS company, title FROM internship_applications")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        let facts = MessageFacts {
+            gmail_message_id: "g1",
+            subject: Some("Application update"),
+            snippet: None,
+        };
+        let dry = propose_status(
+            &pool, "u1", facts, &rejection_of("roblox"), &applications, None,
+            chrono::Utc::now(), false,
+        )
+        .await
+        .expect("dry run");
+
+        assert_eq!(
+            dry,
+            Proposed::Yes {
+                application: "a1".to_string(),
+                from: ApplicationStatus::Applied,
+                to: ApplicationStatus::Rejected,
+            }
+        );
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM status_proposals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "a dry run wrote a row");
+    }
+
+    /// Rule 3's refusal is reported as itself. "Already at that status" is correct behaviour,
+    /// and counting it as either a success or a failure is how the original gap hid.
+    #[tokio::test]
+    async fn an_application_already_at_that_status_is_reported_not_counted() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        tracked_application(&pool, "a1", "Roblox", "Software Engineer Intern").await;
+        let applications: Vec<advance::TrackedApplication> =
+            sqlx::query_as("SELECT id, company_name AS company, title FROM internship_applications")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        let confirmation = classify::EmailVerdict {
+            category: classify::Category::Confirmation,
+            confidence: 0.85,
+            company_guess: Some("roblox".to_string()),
+            evidence: String::new(),
+        };
+        let outcome = propose_status(
+            &pool,
+            "u1",
+            MessageFacts { gmail_message_id: "g1", subject: Some("Received"), snippet: None },
+            &confirmation,
+            &applications,
+            None,
+            chrono::Utc::now(),
+            false,
+        )
+        .await
+        .expect("decides");
+        assert_eq!(
+            outcome,
+            Proposed::AlreadyThere {
+                from: ApplicationStatus::Applied,
+                to: ApplicationStatus::Applied
+            }
+        );
+    }
+
+    /// One question per application per move, however many emails ask it. An assessment sends
+    /// an invitation, a reminder, an expiry warning and a completion — four rows in a queue
+    /// whose only value is being short enough to read.
+    #[tokio::test]
+    async fn a_second_email_about_the_same_move_does_not_ask_twice() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        tracked_application(&pool, "a1", "Roblox", "Software Engineer Intern").await;
+        let applications: Vec<advance::TrackedApplication> =
+            sqlx::query_as("SELECT id, company_name AS company, title FROM internship_applications")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        // The verdict row the proposal points at; `propose_status` looks it up by gmail id.
+        sqlx::query(
+            "INSERT INTO email_messages (id, user_id, gmail_message_id, subject, created_at)
+             VALUES ('m1','u1','g1','Assessment','2026-09-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO email_verdicts (id, message_id, category, classifier, created_at)
+             VALUES ('v1','m1','oa','rules','2026-09-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let oa = classify::EmailVerdict {
+            category: classify::Category::Oa,
+            confidence: 0.8,
+            company_guess: Some("roblox".to_string()),
+            evidence: String::new(),
+        };
+        let facts = || MessageFacts {
+            gmail_message_id: "g1",
+            subject: Some("Your assessment"),
+            snippet: None,
+        };
+        let now = chrono::Utc::now();
+
+        let first = propose_status(&pool, "u1", facts(), &oa, &applications, None, now, true)
+            .await
+            .expect("first");
+        assert!(matches!(first, Proposed::Yes { .. }), "{first:?}");
+
+        let second = propose_status(&pool, "u1", facts(), &oa, &applications, None, now, true)
+            .await
+            .expect("second");
+        assert_eq!(second, Proposed::AlreadyPending { to: ApplicationStatus::Oa });
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM status_proposals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "one move, one question");
+    }
+
+    /// Both sync branches classify through one call now. Before 2026-09-22 the branch that
+    /// STORED a verdict used `classify` (no body) while the branch that re-applied a label used
+    /// `classify_with_body`, so the database and the mailbox were produced by different rules.
+    #[test]
+    fn the_stored_verdict_reads_the_body_like_the_relabel_does() {
+        let companies = ["example corp".to_string()];
+        let context = classify::Context { known_companies: &companies };
+        let message = gmail::Message {
+            id: "m1".into(),
+            thread_id: None,
+            from: Some("careers@examplecorp.com".into()),
+            // A confirmation-shaped subject whose refusal is only in the body. Nine real
+            // Microsoft rejections had this shape, and every sync stored them as confirmations.
+            subject: Some("Thank you for your application!".into()),
+            received_at: None,
+            snippet: Some("Thank you for applying to Example Corp.".into()),
+            body: Some("We have decided not to move forward with your application.".into()),
+        };
+        assert_eq!(verdict_for(&message, &context).category, classify::Category::Rejection);
+    }
+
+    /// `sync` read postings UNION the user's own applications; `reclassify` read postings alone,
+    /// so re-classifying could only ever lose companies. Six live ones, including the employer
+    /// whose mail was then matched against the corpus name "secure" out of "Secure your spot".
+    #[tokio::test]
+    async fn the_company_world_includes_employers_you_applied_to_without_a_posting() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO internship_applications
+                 (id, user_id, company_name, title, url, snapshot_json, snapshot_at,
+                  status, applied_at, status_changed_at, created_at, updated_at)
+             VALUES ('a1','u1','Workiva','SWE Intern','https://example.com/j','{}','2026-09-01',
+                     'applied','2026-09-01','2026-09-01','2026-09-01','2026-09-01')",
+        )
+        .execute(&pool)
+        .await
+        .expect("application");
+
+        let companies = known_companies(&pool).await;
+        assert!(
+            companies.iter().any(|c| c == "workiva"),
+            "an employer you applied to must be one the classifier can name: {companies:?}"
+        );
+    }
 
     async fn test_pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("inbox-{}.db", Uuid::new_v4()));

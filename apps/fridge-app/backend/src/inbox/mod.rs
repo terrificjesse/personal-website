@@ -22,6 +22,8 @@
 //! - [`advance`] — matching, and what an email may do to a status. Rules 2 and 3, pure.
 //! - [`labelset`] — 8b's measurement harness. Tooling, not pipeline: it never runs during a
 //!   sync and never writes to a mailbox or to our own tables.
+//! - [`diagnose`] — what the rules said, what they say now, and what the harness cannot
+//!   see. Read-only, and the same tooling-not-pipeline rule applies.
 //!
 //! # Email is untrusted content — rule 1
 //!
@@ -32,7 +34,9 @@
 //! no tools — and every write happens in Rust outside the model call.
 
 pub mod advance;
+pub mod backfill_status;
 pub mod classify;
+pub mod diagnose;
 pub mod due_dates;
 pub mod gmail;
 pub mod labels;

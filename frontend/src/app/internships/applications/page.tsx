@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useApiError } from "@/lib/useApiError";
 import { UntrackedApplications } from "../UntrackedApplications";
+import { StatusProposals } from "../StatusProposals";
 import {
   APPLICATION_STATUSES,
   APPLICATION_STATUS_LABELS,
@@ -114,6 +115,7 @@ export default function ApplicationsPage() {
       {/* Above the list on purpose. This queue answers "does this application exist?", which
           is exactly the question someone reading this page is asking — and it used to live at
           the bottom of a different route, where it was never seen. */}
+      <StatusProposals onDecided={reload} />
       <UntrackedApplications onAccepted={reload} />
 
       {applications === null ? (

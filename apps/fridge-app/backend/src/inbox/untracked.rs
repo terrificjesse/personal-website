@@ -244,10 +244,31 @@ pub fn role_key(role: Option<&str>) -> String {
         // Drop a trailing requisition id. Tesla sent the same opening twice, once as
         // "…Access Control Systems (Fall 2026), 277192" and once without, and a key that kept
         // the number proposed one application as two.
-        let end = words
+        let mut end = words
             .iter()
             .rposition(|word| !word.chars().all(|c| c.is_ascii_digit()) || word.len() < 5)
             .map_or(0, |i| i + 1);
+        // …and the words that introduced it, but ONLY if an id was actually dropped.
+        //
+        // This key is compared across two sources that punctuate differently. A tracked title
+        // carries the posting's "(Job number: 200042200)"; the same role read out of an email
+        // does not. Splitting on non-alphanumerics turns the parenthetical into the words
+        // "job number 200042200", so stripping the digits alone left the two keys differing by
+        // "job number" — and on 2026-09-23 seven Microsoft rejections whose role matched the
+        // tracked title character for character were reported as matching no application.
+        //
+        // Conditional on an id having been found, so a role that genuinely ends in "Job" keeps
+        // it.
+        if end < words.len() {
+            while end > 0
+                && matches!(
+                    words[end - 1].to_lowercase().as_str(),
+                    "job" | "number" | "no" | "req" | "id" | "requisition" | "ref" | "posting"
+                )
+            {
+                end -= 1;
+            }
+        }
         words[..end]
             .iter()
             .map(|word| word.to_lowercase())
@@ -329,6 +350,26 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
             let tail = [" and are ", " and we ", " and you ", " What happens", " what happens"]
                 .iter()
                 .fold(tail, |acc, cut| acc.split(cut).next().unwrap_or(acc));
+            // A requisition id in a trailing parenthetical is not part of the role's name, and
+            // carrying it costs more than the twenty characters it occupies.
+            //
+            // Microsoft's rejections read "…Intern Opportunities for University Students,
+            // (Job number: 200042195)". With the parenthetical kept, that title is 123
+            // characters and the 120 gate below discards it — so `role_from` returned `None`,
+            // `match_application` fell back to company-only, and on 2026-09-23 three rejections
+            // for three different Microsoft roles all proposed against the same application.
+            // `role_key` already strips a trailing requisition id; doing it here too is what
+            // lets the title survive long enough to reach it.
+            let tail = match (tail.rfind('('), tail.rfind(')')) {
+                (Some(open), Some(close))
+                    if close > open
+                        && tail[open + 1..close].chars().any(|c| c.is_ascii_digit())
+                        && tail[open + 1..close].len() <= 30 =>
+                {
+                    tail[..open].trim_end()
+                }
+                _ => tail,
+            };
             let mut tail = tail.trim_end().trim_end_matches(['.', '!', '?', ';', ',', ' ']);
             loop {
                 let before = tail;
@@ -786,6 +827,64 @@ async fn untracked_cli(pool: &SqlitePool, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tracked title carries the posting's requisition parenthetical and the same role read
+    /// out of an email does not. The key has to erase that difference or the two never meet —
+    /// seven Microsoft rejections whose role matched character for character were reported as
+    /// matching no application until it did.
+    #[test]
+    fn a_requisition_parenthetical_does_not_make_two_keys_of_one_role() {
+        let from_posting = role_key(Some(
+            "Software Engineer: Data Platform/Analytics Intern Opportunities for University \
+             Students, Redmond (Job number: 200042200)",
+        ));
+        let from_email = role_key(Some(
+            "Software Engineer: Data Platform/Analytics Intern Opportunities for University \
+             Students, Redmond",
+        ));
+        assert_eq!(from_posting, from_email);
+        assert!(!from_posting.is_empty());
+    }
+
+    /// The strip is conditional on an id actually being present, so a role that ends in one of
+    /// the label words keeps it.
+    #[test]
+    fn a_role_that_merely_ends_in_a_label_word_keeps_it() {
+        assert_eq!(role_key(Some("Summer Analyst, Job")), "summer analyst job");
+        assert_eq!(role_key(Some("Reference Data Engineer")), "reference data engineer");
+    }
+
+    /// Microsoft's rejections put the role in the snippet, and eight of them share one subject.
+    /// If the role does not come back out, `match_application` falls through to company-only
+    /// and every one of them lands on whichever Microsoft application it sees first — which is
+    /// what `inbox backfill-status` found on 2026-09-23: three rejections for three different
+    /// roles proposed against the same application.
+    #[test]
+    fn three_roles_in_three_snippets_are_three_different_roles() {
+        let snippets = [
+            "\u{feff} Hi, Thank you for taking the time to submit your application for Software \
+             Engineer: Data Platform/Analytics Intern Opportunities for University Students, \
+             Redmond (Job number: 200042200). We",
+            "\u{feff} Hi, Thank you for taking the time to submit your application for Software \
+             Engineer: Fullstack Product (Web + Services) Intern Opportunities for University \
+             Students, (Job number: 200042195). We",
+            "\u{feff} Hi, Thank you for taking the time to submit your application for Software \
+             Engineer: Cloud &amp; Distributed Backend Intern Opportunities for University Stud",
+        ];
+        let roles: Vec<Option<String>> = snippets
+            .iter()
+            .map(|snippet| role_from(Some("Thank you for your application!"), Some(snippet)))
+            .collect();
+
+        for (snippet, role) in snippets.iter().zip(&roles) {
+            assert!(role.is_some(), "no role extracted from: {snippet}");
+        }
+        let keys: Vec<String> = roles.iter().map(|r| role_key(r.as_deref())).collect();
+        assert!(keys.iter().all(|k| !k.is_empty()), "empty role key in {keys:?}");
+        assert_ne!(keys[0], keys[1], "{keys:?}");
+        assert_ne!(keys[0], keys[2], "{keys:?}");
+        assert_ne!(keys[1], keys[2], "{keys:?}");
+    }
 
     #[test]
     fn the_generic_word_the_corpus_already_refuses_is_not_a_company() {

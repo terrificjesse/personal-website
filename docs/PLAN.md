@@ -2284,12 +2284,15 @@ reason. This week is the point of the other three.
 
 | # | Task | Tag | Lane | Primary | Swap | Est. |
 |---|---|---|---|---|---|---|
-| 13a | `cargo run --release -- labelset export` over everything the month accumulated | `[you]` | A | You | ⛔ | 30m |
-| 13b | Hand-label the sheet | `[you]` | — | You | ⛔ **by construction** — labels from the author of the rules measure the tuning, not the classifier | 3–4h |
+| 13a ✅ | `labelset export` over everything the month accumulated. Done 2026-09-22: `labelsets/sealed-2026-09.csv`, 30 rows, frozen **before** any rule changed | `[you]` | A | Claude Code | ✅ | 30m |
+| 13b | Hand-label `labelsets/sealed-2026-09.csv` (30 rows). Its README names four sender templates that were read before the seal and are therefore spent — grade those separately | `[you]` | — | You | ⛔ **by construction** — labels from the author of the rules measure the tuning, not the classifier | 2–3h |
 | 13c | `labelset score`; report both failure modes against **separate denominators** | `[gen]` | A | ~~Codex~~ Claude Code | ⛔ needs 13b's labels | 1h |
-| 13d | Diagnose and fix; pin every real string as a test | `[gen]` | A | Claude Code | ✅ | 4–6h |
+| 13c′ ✅ | `inbox diagnose` — stored verdict vs the rules today vs the rules without a body, with totals and two matrices. Read-only, and it redacts sealed rows. The 13c that needs no labels | `[gen]` | A | Claude Code | ✅ | — |
+| 13d″ ✅ | Validation sweep 2026-09-26: pipeline closed (0 unproposed, verify 53/53, a live `oa → interview` proposal). Found rule 3 unenforced on the ACCEPT path — one row had moved backwards out of `rejected`; fixed, pinned, and repaired | `[gen]` | A | Claude Code | ✅ | — |
+| 13d′ ✅ | `inbox backfill-status`: the corrected verdicts reach the tracker. 13 proposals, 11 rejections across 11 distinct applications, all awaiting review — see `docs/HUNT.md` § "The outcomes panel was right and unfed" | `[gen]` | A | Claude Code | ✅ | — |
+| 13d ✅ | Diagnose and fix; pin every real string as a test. Done 2026-09-22 — see `docs/HUNT.md` § "The quality-control pass of 2026-09-22". Fifteen tests, each verified red without its fix | `[gen]` | A | Claude Code | ✅ | 4–6h |
 | 13e | Set `INBOX_AUTO_APPLY_CONFIDENCE` from the measured numbers | `[you]` | — | You | ⛔ it is a risk threshold, not a parameter | 1h |
-| 13f ✅ | Regression gate: `labelset gate` in CI, failing on a regression. Built 2026-09-03 against a **synthetic** fixture; point it at the sealed set once 13b exists | `[gen]` | A | ~~Codex~~ Claude Code | ✅ | 3–4h |
+| 13f ✅ | Regression gate: `labelset gate` in CI. Built 2026-09-03 against a **synthetic** fixture; **2026-09-22 it gained a second, body-aware fixture** (`data/inbox/stress-set.csv`) because the first graded `classify`, which never reads a body, while production does. Point both at the sealed set once 13b exists | `[gen]` | A | ~~Codex~~ Claude Code | ✅ | 3–4h |
 | 13g | Write the phase up: what the real corpus caught that the tests could not | `[gen]` | C | Claude Code | ✅ | 2h |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 5h, you ≈ 5h. The lightest week for the agents and the

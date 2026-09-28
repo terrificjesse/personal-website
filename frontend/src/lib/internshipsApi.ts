@@ -920,11 +920,30 @@ export async function listProposals(): Promise<StatusProposal[]> {
   return res.json();
 }
 
+/**
+ * A proposal that no longer describes its application.
+ *
+ * The backend answers 409 when the status has moved since the proposal was made — a second email
+ * arrived, or another proposal was accepted first — so applying it would walk the tracker
+ * backwards. That is a legitimate state rather than a fault, which is why it gets its own type:
+ * a bulk action must be able to skip one and carry on, and the reader must be told "this moved"
+ * rather than "something went wrong".
+ *
+ * Deliberately not an `UnauthorizedError`, which `useApiError` redirects to `/login`.
+ */
+export class ProposalStaleError extends Error {
+  constructor() {
+    super("This application has moved since this change was proposed.");
+    this.name = "ProposalStaleError";
+  }
+}
+
 export async function decideProposal(id: string, accept: boolean): Promise<void> {
   const res = await apiFetch(
     `/hunt/proposals/${encodeURIComponent(id)}/${accept ? "accept" : "reject"}`,
     { method: "POST" },
   );
+  if (res.status === 409) throw new ProposalStaleError();
   if (!res.ok) throw new Error(`Could not record that decision (${res.status})`);
 }
 

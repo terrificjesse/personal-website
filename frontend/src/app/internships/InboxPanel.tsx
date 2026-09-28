@@ -20,8 +20,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useApiError } from "@/lib/useApiError";
+import { StatusProposals } from "./StatusProposals";
 import {
-  decideProposal,
   getInboxStatus,
   listProposals,
   type InboxStatus,
@@ -47,7 +47,6 @@ export function InboxPanel() {
   const [status, setStatus] = useState<InboxStatus | null>(null);
   const [proposals, setProposals] = useState<StatusProposal[]>([]);
   const [message, setMessage] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -83,20 +82,11 @@ export function InboxPanel() {
     };
   }, [handleError]);
 
-  async function decide(id: string, accept: boolean) {
-    setBusy(true);
-    setMessage(null);
-    try {
-      await decideProposal(id, accept);
-      await refresh();
-      setMessage(accept ? "Applied." : "Left alone.");
-    } catch (err) {
-      setMessage(handleError(err, "Could not record that decision"));
-    } finally {
-      setBusy(false);
-    }
-  }
 
+  // `proposals` is still fetched here for this one decision: a panel that says "not
+  // connected" while changes are waiting would be wrong, and only this component knows
+  // whether the account exists. `StatusProposals` below fetches its own and renders nothing
+  // when the queue is empty.
   if (!status?.account && proposals.length === 0) {
     // Nothing connected and nothing pending: say so in one line rather than rendering an
     // empty panel that looks broken.
@@ -162,81 +152,10 @@ export function InboxPanel() {
 
       {message && <p className="mt-2 text-sm text-neutral-600">{message}</p>}
 
-      {proposals.length === 0 ? (
-        <p className="mt-2 text-sm text-neutral-500">No status changes waiting.</p>
-      ) : (
-        <ul className="mt-3 space-y-3">
-          {proposals.map((proposal) => (
-            <li
-              key={proposal.id}
-              className="border-t border-neutral-200 pt-2 text-sm dark:border-neutral-800"
-            >
-              <div>
-                <span className="font-medium">{proposal.company_name}</span>{" "}
-                <span className="text-neutral-500">— {proposal.title}</span>
-              </div>
-              <div className="mt-0.5">
-                <code className="rounded bg-neutral-100 px-1 dark:bg-neutral-900">
-                  {proposal.from_status}
-                </code>{" "}
-                →{" "}
-                <code className="rounded bg-neutral-100 px-1 dark:bg-neutral-900">
-                  {proposal.to_status}
-                </code>
-                {proposal.applied_automatically && (
-                  <span className="ml-2 text-xs text-amber-700 dark:text-amber-400">
-                    already applied — rejecting undoes it
-                  </span>
-                )}
-              </div>
-
-              {/* The email that caused it. Without this the panel asks you to approve a change
-                  you have no way to check. */}
-              {proposal.evidence_available ? (
-                <div className="mt-1 text-xs text-neutral-500">
-                  {proposal.from_address && <div>from: {proposal.from_address}</div>}
-                  {proposal.subject && <div>subject: {proposal.subject}</div>}
-                  {proposal.evidence && <div>matched: {proposal.evidence}</div>}
-                </div>
-              ) : (
-                /* Said outright rather than left as three missing lines. A terse email and a
-                   missing one look identical otherwise, and only one of them means "you cannot
-                   check this". Both buttons stay enabled: the proposal itself is intact, and
-                   refusing to let it be accepted would decide for the reader that it is wrong,
-                   which is not something this panel knows. */
-                <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-                  The email behind this proposal is no longer in the database, so there is
-                  nothing to check it against. The change itself is still described above.
-                </div>
-              )}
-
-              <div className="mt-1 flex gap-2">
-                <button
-                  type="button"
-                  className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-50 dark:border-neutral-700"
-                  onClick={() => decide(proposal.id, true)}
-                  disabled={busy}
-                >
-                  Accept
-                </button>
-                <button
-                  type="button"
-                  className="rounded border border-neutral-300 px-2 py-0.5 text-xs disabled:opacity-50 dark:border-neutral-700"
-                  onClick={() => decide(proposal.id, false)}
-                  disabled={busy}
-                >
-                  Reject
-                </button>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {/* The same queue the tracker shows, so the panel does not disagree with the page it
-          links to. One implementation — see `UntrackedApplications`. */}
-      <UntrackedApplications onAccepted={refresh} />
-
+      {/* The same queue the applications page shows, and literally the same component: two
+          lists over one endpoint would drift, and the drift would be about which changes you
+          have already answered. */}
+      <StatusProposals onDecided={refresh} />
     </section>
   );
 }

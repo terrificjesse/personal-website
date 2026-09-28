@@ -209,7 +209,101 @@ application-events — rebuild the append-only application status history
   application-events verify
       Assert that every non-empty event history folds to its application's cached status.
       Fails when applications exist but none has an event history to check.
+
+  application-events repair --application <id> --to <status> [--apply]
+      Correct one application's status and record the correction as an event, in one
+      transaction. Dry by default. For undoing a status change that should never have been
+      applied — the event row is the part a hand-written UPDATE forgets, and forgetting it
+      breaks the invariant `verify` checks.
 ";
+
+/// The value after a named flag. Same positional scan the other dev-tooling verbs use.
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let position = args.iter().position(|a| a == name)?;
+    args.get(position + 1).cloned()
+}
+
+/// Correct one application's status, recording the correction rather than hiding it.
+///
+/// # Why this is a command and not a hand-written `UPDATE`
+///
+/// `internship_applications.status` is the cached fold of `application_events`, and `verify`
+/// exists to assert the two agree. A repair done in `sqlite3` moves the column and leaves the
+/// history describing a different application — breaking the one invariant this module is for,
+/// and doing it silently.
+///
+/// Written for 2026-09-26, when an `applied -> oa` proposal was accepted after the same
+/// application had already been correctly rejected, and the accept path applied it without
+/// asking rule 3. The code path that allowed it is closed; this puts the row back.
+///
+/// Actor `Manual`: a person decided this, and no email caused it. `cause` is `None` for the same
+/// reason — inventing a cause would make the correction look like something the classifier did.
+async fn repair(
+    pool: &SqlitePool,
+    application_id: &str,
+    target: ApplicationStatus,
+    apply: bool,
+) -> Result<String> {
+    let current: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, company_name FROM internship_applications WHERE id = ?",
+    )
+    .bind(application_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((current, company)) = current else {
+        bail!("no application {application_id}")
+    };
+    let Some(from) = ApplicationStatus::parse(&current) else {
+        bail!("application {application_id} holds an unparseable status {current:?}")
+    };
+    if from == target {
+        bail!(
+            "application {application_id} ({company}) is already {} — nothing to repair",
+            target.as_str()
+        )
+    }
+
+    let summary = format!(
+        "{company} {application_id}: {} -> {}",
+        from.as_str(),
+        target.as_str()
+    );
+    if !apply {
+        return Ok(format!("would repair {summary}"));
+    }
+
+    let now = Utc::now();
+    let mut tx = crate::db::begin_write(pool).await?;
+    let moved = sqlx::query(
+        "UPDATE internship_applications
+            SET status = ?1, status_changed_at = ?2, updated_at = ?2
+          WHERE id = ?3",
+    )
+    .bind(target.as_str())
+    .bind(now.to_rfc3339())
+    .bind(application_id)
+    .execute(&mut *tx)
+    .await?;
+    if moved.rows_affected() != 1 {
+        bail!("repairing {application_id} matched {} rows, expected 1", moved.rows_affected())
+    }
+
+    record(
+        &mut tx,
+        NewApplicationEvent {
+            application_id,
+            from_status: Some(from),
+            to_status: target,
+            actor: Actor::Manual,
+            cause: None,
+            at: now,
+            note: Some("manual repair: a stale proposal had moved this backwards"),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(format!("repaired {summary}"))
+}
 
 /// Dispatch for the `application-events` server-binary subcommand.
 pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
@@ -267,6 +361,20 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
             }
         }
         "verify" => bail!("application-events verify takes no arguments"),
+        "repair" => {
+            let application = flag(args, "--application")
+                .context("repair needs --application <id>")?;
+            let to = flag(args, "--to").context("repair needs --to <status>")?;
+            let apply = args.iter().any(|a| a == "--apply");
+            let target = ApplicationStatus::parse(&to)
+                .with_context(|| format!("{to:?} is not an application status"))?;
+            let report = repair(pool, &application, target, apply).await?;
+            println!("{report}");
+            if !apply {
+                println!("\n  re-run with --apply to write it.");
+            }
+            Ok(())
+        }
         other => {
             print!("{USAGE}");
             bail!("unknown application-events command: {other}")
