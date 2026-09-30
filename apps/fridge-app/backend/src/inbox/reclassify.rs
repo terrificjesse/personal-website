@@ -355,8 +355,41 @@ pub async fn relabel(pool: &SqlitePool, changes: &[Change]) -> Result<Vec<String
     let mut stale = Vec::new();
     for change in changes {
         let Some(name) = labels::label_for(change.now) else {
-            // Disregarded projects no label. Rule 7: the inbox stays untouched, and that holds
-            // just as much when the correction is *toward* disregarded.
+            // Disregarded projects no label — so a label this agent put there earlier has to
+            // come OFF, or rule 7's "gets no Gmail label" is broken by our own stale write.
+            // This used to `continue`, reading the rule's other clause ("the inbox stays
+            // untouched") alone; see `SupersededLabel::withdrawn` for why that was the wrong
+            // half. Nothing to add first, so this is the one path that only removes.
+            if let Some(withdrawn) = labels::SupersededLabel::withdrawn(change.stale_label.as_deref())
+            {
+                match ids.get(withdrawn.name()) {
+                    Some(old_id) => {
+                        labels::remove_superseded(
+                            &client,
+                            &token,
+                            &change.gmail_message_id,
+                            old_id,
+                            &withdrawn,
+                        )
+                        .await?;
+                        stale.push(format!("{} withdrawn from: {}", withdrawn.name(), change.subject));
+                    }
+                    None => stale.push(format!(
+                        "{} recorded but not in Gmail, left alone: {}",
+                        withdrawn.name(),
+                        change.subject
+                    )),
+                }
+                // NULL, not "": it now carries none of our labels, which is what NULL has always
+                // meant in this column for a message that was never labelled.
+                sqlx::query(
+                    "UPDATE email_messages SET labels_applied = NULL, labels_applied_at = ?2 WHERE id = ?1",
+                )
+                .bind(&change.message_id)
+                .bind(Utc::now().to_rfc3339())
+                .execute(pool)
+                .await?;
+            }
             continue;
         };
         let Some(label_id) = ids.get(name) else {
@@ -428,11 +461,16 @@ pub async fn label_drift(pool: &SqlitePool) -> Result<Vec<Change>> {
         let Some(category) = Category::parse(&row.category) else {
             continue;
         };
-        let Some(should_be) = labels::label_for(category) else {
-            continue;
-        };
-        if row.labels_applied.as_deref() == Some(should_be) {
-            continue;
+        match labels::label_for(category) {
+            Some(should_be) if row.labels_applied.as_deref() == Some(should_be) => continue,
+            Some(_) => {}
+            // Disregarded should carry nothing of ours. This `continue`d unconditionally, so a
+            // stale label on mail since judged junk was invisible to the one check written to
+            // find drift — the defect and its detector shared the same blind spot.
+            None if labels::SupersededLabel::withdrawn(row.labels_applied.as_deref()).is_none() => {
+                continue
+            }
+            None => {}
         }
         drifted.push(Change {
             message_id: row.id.clone(),
@@ -521,4 +559,69 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
         println!("  {line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! `reclassify.rs` had no tests at all. These cover the one query in it that can be checked
+    //! without a live Gmail session: what `label_drift` is able to see.
+
+    use super::*;
+
+    async fn pool_with_message(category: &str, labels_applied: Option<&str>) -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("reclassify-{}.db", Uuid::new_v4()));
+        let pool = crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations");
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES ('u1','u1@example.com','2026-09-01')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO email_messages (id, user_id, gmail_message_id, subject, labels_applied, created_at)
+             VALUES ('m1','u1','g1','An assessment', ?1, '2026-09-01')",
+        )
+        .bind(labels_applied)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO email_verdicts (id, message_id, category, classifier, created_at)
+             VALUES ('v1','m1',?1,'rules','2026-09-01')",
+        )
+        .bind(category)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// A message corrected toward `disregarded` while still carrying a label this agent applied.
+    ///
+    /// Before 2026-09-30 `label_drift` skipped every disregarded message, so this was invisible
+    /// to the one check written to find drift — the defect and its detector shared a blind spot.
+    #[tokio::test]
+    async fn a_stale_label_on_disregarded_mail_is_drift() {
+        let oa = labels::label_for(Category::Oa).unwrap();
+        let pool = pool_with_message("disregarded", Some(oa)).await;
+        let drifted = label_drift(&pool).await.unwrap();
+        assert_eq!(drifted.len(), 1, "a disregarded message wearing {oa} is drift");
+        assert_eq!(drifted[0].now, Category::Disregarded);
+        assert_eq!(drifted[0].stale_label.as_deref(), Some(oa));
+    }
+
+    /// And the ownership rule holds: a label we never project is not ours to withdraw, so it is
+    /// not drift either — it is somebody's hand-applied label.
+    #[tokio::test]
+    async fn a_label_that_is_not_ours_is_left_alone() {
+        let pool = pool_with_message("disregarded", Some("Starred")).await;
+        assert!(label_drift(&pool).await.unwrap().is_empty());
+    }
+
+    /// Disregarded mail carrying nothing is exactly right, and must not be reported.
+    #[tokio::test]
+    async fn disregarded_mail_with_no_label_is_not_drift() {
+        let pool = pool_with_message("disregarded", None).await;
+        assert!(label_drift(&pool).await.unwrap().is_empty());
+    }
 }

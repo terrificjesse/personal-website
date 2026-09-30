@@ -213,6 +213,26 @@ impl SupersededLabel {
         Some(SupersededLabel(recorded.to_string()))
     }
 
+    /// A recorded label with nothing to replace it — the message's category now projects none.
+    ///
+    /// Rule 7 has two clauses, and a correction *toward* `disregarded` is where they meet: a
+    /// disregarded email "gets **no** Gmail label", and "the inbox stays untouched". Reading the
+    /// second alone left a stale `Hunt/OA` on mail since judged junk — a false pressing signal
+    /// in the one folder whose job is to be trusted, which is exactly what the first clause
+    /// forbids. The second was written about the first classification, not about undoing this
+    /// agent's own mistake.
+    ///
+    /// **The guarantee is unchanged, and that is why this is safe.** Same guards as
+    /// [`from_recorded`](Self::from_recorded): built only from the agent's own record, and only
+    /// for a name it projects. A label you applied by hand is still unconstructible here.
+    pub fn withdrawn(recorded: Option<&str>) -> Option<Self> {
+        let recorded = recorded?.trim();
+        if recorded.is_empty() || !is_ours(recorded) {
+            return None;
+        }
+        Some(SupersededLabel(recorded.to_string()))
+    }
+
     pub fn name(&self) -> &str {
         &self.0
     }
@@ -343,7 +363,19 @@ fn code_only(source: &str) -> String {
         }
     }
 
+/// Withdrawing is removal with no replacement, under the same ownership rule.
     #[test]
+    fn only_our_own_label_can_be_withdrawn() {
+        let ours = label_for(Category::Oa).unwrap();
+        assert_eq!(SupersededLabel::withdrawn(Some(ours)).map(|l| l.name().to_string()),
+                   Some(ours.to_string()));
+        assert!(SupersededLabel::withdrawn(None).is_none(), "never labelled");
+        assert!(SupersededLabel::withdrawn(Some("")).is_none(), "nothing recorded");
+        assert!(SupersededLabel::withdrawn(Some("Important")).is_none(), "not ours");
+        assert!(SupersededLabel::withdrawn(Some("Starred")).is_none(), "not ours");
+    }
+
+        #[test]
     fn removal_needs_a_label_this_agent_recorded_applying() {
         // The whole safety property, and the reason it is a type. Each `None` here is a
         // removal that cannot be expressed, not one a caller is trusted to avoid.
