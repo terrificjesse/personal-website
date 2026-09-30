@@ -57,6 +57,46 @@ nothing extra — see `docs/INTERNSHIP_SCRAPING.md` § A.2.
 boards. Only `greenhouse`, `lever` and `ashby` are polled today; the rest are recorded because
 harvesting them was free and re-deriving them is not.
 
+### Regenerated 2026-09-30, with `boards discover`
+
+The table above is the 2026-09-05 harvest, and it went three weeks without being regenerated.
+`BoardDirectory::merge` and `simplify::extract_board_slugs` were both written for discovery and
+both were only ever called from tests, so at runtime the collector polled this frozen file and
+nothing else — every employer Simplify began listing after 2026-09-05 was invisible to the ATS
+sources.
+
+```
+cargo run --release -- boards discover            # report
+cargo run --release -- boards discover --apply    # write this file, then rebuild
+```
+
+It harvests from the URLs **already in the database** — every source's `posting_sightings`, and
+your tracked applications — so it makes no network request. That also means it only ever adds
+boards that have actually carried an internship the collector accepted, which is a higher bar
+than the original harvest's "every URL in `listings.json`".
+
+The first run added **170 boards, 118 of them on an ATS that is polled**:
+
+| ATS | added | now |
+|---|---|---|
+| ashby | +58 | 342 |
+| greenhouse | +41 | 504 |
+| lever | +10 | 165 |
+| workable | +9 | 52 |
+| smartrecruiters | +10 | 132 (recorded, not polled) |
+| workday | +42 | 1,021 (recorded, not polled) |
+
+**Four harvested boards were retired ones and were not added back** — `ashby/atomicsemi`,
+`ashby/whatnot`, `greenhouse/embed`, `greenhouse/glossgenius`. The comparison is
+case-insensitive, because Ashby answers to `AtomicSemi` and `atomicsemi` alike and a
+case-sensitive check would have resurrected the first. An earlier measurement that read
+`retired-slugs.json` wrongly would have added all four; `retired-slugs.json` exists for exactly
+that, and a test now pins it.
+
+`--apply` writes this file in its own format — one-space indent, no trailing newline — and a
+test renders the committed file and asserts the bytes are identical, so an application diffs as
+the lines it added and nothing else.
+
 **All slugs are kept, not just the ones with an active listing today.** A board with nothing
 open this week routinely has something open next week, and — more importantly — the polled list
 must be **stable across runs**. Drop a slug and every posting on that board goes unobserved,

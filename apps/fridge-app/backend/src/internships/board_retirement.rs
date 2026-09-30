@@ -43,10 +43,14 @@ use sqlx::SqlitePool;
 pub const RETIREMENT_RUNS: i64 = 3;
 
 const USAGE: &str = "\
-usage: boards retire [--runs N]
+usage:
+  boards retire [--runs N]
+      Lists board slugs whose last N verdicts were all 404. Reports only; retiring a slug is an
+      edit to data/internships/board-slugs.json and stays a human's decision.
 
-Lists board slugs whose last N verdicts were all 404. Reports only; retiring a slug is an edit
-to data/internships/board-slugs.json and stays a human's decision.
+  boards discover [--apply]
+      The other direction: boards named by URLs already in the database that the directory
+      does not contain. Never adds back a retired one. Dry unless --apply.
 ";
 
 /// One slug's standing.
@@ -154,6 +158,7 @@ pub async fn windows(pool: &SqlitePool) -> Result<Vec<Window>> {
 pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("retire") => {}
+        Some("discover") => return super::board_discovery::main(pool, &args[1..]).await,
         _ => {
             print!("{USAGE}");
             return Ok(());

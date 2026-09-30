@@ -953,6 +953,26 @@ ceiling, at far higher cost (§ A.1: POST, N+1 detail fetches, useless list payl
 public internship list, or looking up boards for the companies in `company-tiers.json` directly.
 That is a different task from writing another adapter, and it is where the remaining coverage is.
 
+#### What looking beyond Simplify found (measured 2026-09-30)
+
+Harvesting board slugs from **every** URL the collector has already seen — vanshb03, the ATS
+sources themselves, WeWorkRemotely, and the owner's tracked applications — reaches **3 boards**
+that Simplify does not name: `ashby/ethglobal`, `greenhouse/rendezvousrobotics`,
+`greenhouse/skhynixmemorysolutionsamericainc`. The sources already in this corpus are not
+independent of Simplify in any useful sense. The ceiling above stands.
+
+**But it was the lower of two ceilings.** The directory itself was a Simplify snapshot from
+2026-09-05 that had never been regenerated, and it was missing **115 boards Simplify had listed
+since** — 118 pollable in total with the three above. That was the larger coverage gap by a
+factor of forty, and it was a stale file rather than a structural limit.
+`boards discover` closes it; see `data/internships/README.md`.
+
+So the remaining structural work is unchanged in kind and smaller in expected value than it
+looked: new employers at scale still need a list that does not start from Simplify, and the
+corpus contains none. Probing `company-tiers.json` names directly would be one, but it is
+guessing rather than harvesting, and § A.1 says why the answer to "how do I discover a board" is
+to harvest it.
+
 ### Operating rules
 
 - **Fail fast per source, never per run.** Each source is one unit: a 4xx, a timeout, a parse
