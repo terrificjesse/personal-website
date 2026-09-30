@@ -1096,7 +1096,7 @@ to, and found out at the first restore. Unified on 10i's naming.
 | 10h | **In progress.** Everything that is not a secret is in `deploy/` and `docs/DEPLOY.md`; the `[you]` half is listed at the end of that runbook |
 | 10i | `790669c` (Codex). SQLite online-backup API, `integrity_check` and migration-ledger verification, atomic publish, a daily timer, and a drill performed against the dev database |
 | 10d, 10f | `da0ed0a`, `e3f6c28` (Codex). The table, `record()`, the backfill and the fold verification |
-| 10k | Outstanding with the user, and 10h names it as a gate |
+| 10k | Decided 2026-09-03: `INBOX_APPLY_LABELS` is **ON** — see the 10k row above. This line said "outstanding" until 2026-09-30, contradicting that row |
 
 **Load:** Claude Code ≈ 8h, Codex ≈ 10h, you ≈ 10h of deploy. Neither agent blocks the other:
 10c is the only ordering constraint, and it is a doc.

@@ -448,16 +448,19 @@ Repo root, branch `main`, remote `origin` →
 
 ## Next up
 
-Nothing blocking. In rough priority:
+Nothing blocking for the fridge tab. The one open item:
 
-1. **Fix `require_admin`'s stale doc comment** in `src/auth.rs` — it still calls itself an
-   unimplemented placeholder that denies everyone. `[learn]` file, so it's yours.
-2. **A third blog stress pass**, if wanted. Both passes are closed with every finding fixed;
-   what is left unexplored is frontmatter fuzzing beyond what was covered (symlinks,
-   megabyte single-line files) and the frontend beyond the first pass.
-   `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
-3. **Two pre-existing frontend lint errors** (`react-hooks/set-state-in-effect` in
-   `GroceryListPopup.tsx:18` and `recipes/page.tsx:54`). Both predate Phase 5 — re-verified
-   2026-08-19.
+- **A third blog stress pass**, if wanted. Both passes are closed with every finding fixed;
+  what is left unexplored is frontmatter fuzzing beyond what was covered (symlinks,
+  megabyte single-line files) and the frontend beyond the first pass.
+  `docs/BLOG_STRESS_TEST_PLAN.md` has the method.
 
-`docs/TODO.md` holds four deferred ideas.
+Closed since this list was written, re-verified 2026-09-30:
+
+- `require_admin`'s doc comment now describes what the function does (`472e60a`, yours —
+  `src/auth.rs` is a `[learn]` file).
+- The two `react-hooks/set-state-in-effect` errors in `GroceryListPopup.tsx` and
+  `recipes/page.tsx` are fixed (`341d3d5`); `eslint src` reports none anywhere.
+
+`docs/TODO.md` holds five deferred ideas. The site-wide queue — deployment, measurement,
+the inbox agent — lives in `docs/PLAN.md`, not here.
