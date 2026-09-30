@@ -57,7 +57,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::classify::{self, Category};
@@ -151,7 +151,7 @@ struct Row {
 /// `body` column here would write one into every exported labelset — and message bodies are
 /// deliberately never stored (`gmail.rs`: "decoded, stripped, truncated, classified, and
 /// dropped"). A labelling sheet is not the place to start keeping them. Fixtures are invented
-/// text and carry theirs inline; real mail would fetch its body at grading time.
+/// text and carry theirs inline; real mail has its body fetched at grading time — see `grade`.
 ///
 /// `#[serde(default)]` is what lets the original twelve-row `regression-set.csv`, which has no
 /// body column at all, keep parsing and keep meaning exactly what it meant.
@@ -523,8 +523,8 @@ fn regressions(current: &Baseline, baseline: &Baseline) -> Vec<String> {
 
 /// Grade one committed fixture.
 ///
-/// **The body is passed through, and that is the point.** `gate` and `score` both used to call
-/// `classify`, which hard-codes `body = None`, while production reads up to four thousand
+/// **The body is passed through, and that is the point.** `gate` used to call `classify`, which
+/// hard-codes `body = None`, while production reads up to four thousand
 /// characters. So every rule retuned for bodies on 2026-09-11 was graded by a harness that
 /// could not exercise it, and the gate stayed green through the regressions that prompted the
 /// 2026-09-22 QC pass. Measured on the live corpus that day: **19 of 118 messages classify
@@ -533,6 +533,10 @@ fn regressions(current: &Baseline, baseline: &Baseline) -> Vec<String> {
 ///
 /// A row with an empty body is classified from metadata alone, exactly as before, which is why
 /// the original twelve-row fixture and its committed baseline are untouched by this.
+///
+/// **This is `gate` only.** An earlier version of this comment said "`gate` and `score` both
+/// used to", which read as though `score` had been fixed too. It had not: it went on calling
+/// `classify` until 2026-09-30. Its body-aware grading is `grade`, below.
 fn grade_fixture(
     fixture: &str,
     context: &classify::Context<'_>,
@@ -625,6 +629,79 @@ fn gate(update: bool) -> Result<()> {
     bail!("{failures} regression(s) against the committed baselines")
 }
 
+/// One grading run, split the ways the report needs it.
+struct Grading<'a> {
+    held_out: Vec<(Category, Category)>,
+    spent: Vec<(Category, Category)>,
+    disagreements: Vec<(&'a Row, Category, Category)>,
+    matrix: BTreeMap<(usize, usize), usize>,
+    /// Rows whose body could not be read. Excluded from every count.
+    unreadable: Vec<&'a Row>,
+    /// Exactly the rows graded as held out in this run — the only ones it may mark as spent.
+    graded_ids: Vec<String>,
+}
+
+/// Grade labelled rows against the rules, given the bodies that could be fetched.
+///
+/// Pure, and separate from `score`, so that the rule about what the ledger may record can be
+/// tested without a mailbox.
+///
+/// # What a run may spend
+///
+/// The ledger used to record every labelled row as graded under the current fingerprint. That
+/// was harmless while every row was graded, and stops being harmless the moment one can fail to
+/// be — which, now that grading fetches bodies, one can. A row recorded but not measured is held-
+/// out material thrown away: it becomes in-sample the next time the rules move, and can never
+/// be graded honestly. So a run records the rows it graded as held out, and nothing else. Spent
+/// rows are already spent by an earlier entry; unreadable rows were not measured at all.
+fn grade<'a>(
+    labelled: &'a [(Row, Category)],
+    bodies: &HashMap<String, Option<String>>,
+    ledger: &Ledger,
+    fingerprint: &str,
+    context: &classify::Context<'_>,
+) -> Grading<'a> {
+    let mut grading = Grading {
+        held_out: Vec::new(),
+        spent: Vec::new(),
+        disagreements: Vec::new(),
+        matrix: BTreeMap::new(),
+        unreadable: Vec::new(),
+        graded_ids: Vec::new(),
+    };
+    for (row, truth) in labelled {
+        let Some(body) = bodies.get(&row.gmail_message_id) else {
+            // Skipped, never graded from the snippet instead: the same rule `reclassify` states,
+            // for the same reason. A snippet-only verdict is a different classifier's answer.
+            grading.unreadable.push(row);
+            continue;
+        };
+        let predicted = classify::classify_with_body(
+            Some(&row.from),
+            Some(&row.subject),
+            Some(&row.snippet),
+            body.as_deref(),
+            context,
+        )
+        .category;
+
+        if ledger.is_spent(&row.gmail_message_id, fingerprint) {
+            grading.spent.push((*truth, predicted));
+        } else {
+            grading.held_out.push((*truth, predicted));
+            grading.graded_ids.push(row.gmail_message_id.clone());
+            *grading
+                .matrix
+                .entry((category_index(*truth), category_index(predicted)))
+                .or_insert(0) += 1;
+            if *truth != predicted {
+                grading.disagreements.push((row, *truth, predicted));
+            }
+        }
+    }
+    grading
+}
+
 async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
     let mut reader = csv::Reader::from_path(labels)?;
     let mut rows: Vec<Row> = Vec::new();
@@ -657,53 +734,63 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
         bail!("no labelled rows in {} — fill the `label` column first", labels.display());
     }
 
-    // The same world the sync gives the classifier, loaded the same way. A different company
+    // The same world the sync gives the classifier, from the same function. A different company
     // list is a different classifier, and would make this measure something else.
-    let known_companies: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT lower(company_name) FROM internship_postings
-          UNION SELECT DISTINCT lower(company_name) FROM internship_applications",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let known_companies = super::sync::known_companies(pool).await;
     let context = classify::Context { known_companies: &known_companies };
 
     let fingerprint = rules_fingerprint();
     let ledger_file = ledger_path(labels);
     let mut ledger = Ledger::load(&ledger_file)?;
 
-    let mut held_out: Vec<(Category, Category)> = Vec::new();
-    let mut spent: Vec<(Category, Category)> = Vec::new();
-    let mut disagreements: Vec<(&Row, Category, Category)> = Vec::new();
-    let mut matrix: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-
-    for (row, truth) in &labelled {
-        let verdict = classify::classify(
-            Some(&row.from),
-            Some(&row.subject),
-            Some(&row.snippet),
-            &context,
+    // **Graded with the body, because production classifies with it.**
+    //
+    // This called `classify`, which reads no body, for three weeks after production started
+    // reading four thousand characters — and the 2026-09-22 pass made `gate` body-aware while
+    // leaving this path as it was. So the one command that produces the real measurement would
+    // have graded a classifier nothing runs: 13 of 16 live rejections read as confirmations
+    // without their body.
+    //
+    // **No session is a refusal, not a fallback.** A set can be graded once. Grading it
+    // body-blind spends it on the wrong classifier, and there is no un-spending it.
+    let Some((client, token)) = super::reclassify::gmail_session(pool).await else {
+        bail!(
+            "no live Gmail session. `score` grades with message bodies because production \
+             classifies with them, and a labelled set can only be graded once — grading it \
+             without them would spend it measuring a classifier nothing runs. Reconnect Gmail \
+             and re-run."
         );
-        let predicted = verdict.category;
-
-        if ledger.is_spent(&row.gmail_message_id, &fingerprint) {
-            spent.push((*truth, predicted));
-        } else {
-            held_out.push((*truth, predicted));
-            *matrix
-                .entry((category_index(*truth), category_index(predicted)))
-                .or_insert(0) += 1;
-            if *truth != predicted {
-                disagreements.push((row, *truth, predicted));
+    };
+    // Absent from this map means unreadable; `None` inside it means the message has no body.
+    let mut bodies: HashMap<String, Option<String>> = HashMap::new();
+    for (row, _) in &labelled {
+        match super::reclassify::fetch_body_politely(&client, &token, &row.gmail_message_id).await {
+            Ok(message) => {
+                bodies.insert(row.gmail_message_id.clone(), message.body);
             }
+            Err(error) => eprintln!("score: could not read {}: {error}", row.gmail_message_id),
         }
     }
+
+    let Grading { held_out, spent, disagreements, matrix, unreadable, graded_ids } =
+        grade(&labelled, &bodies, &ledger, &fingerprint, &context);
 
     println!("labels        {}", labels.display());
     println!("rules         {fingerprint}");
     println!("labelled      {}", labelled.len());
     if unlabelled > 0 {
         println!("unlabelled    {unlabelled} (excluded, not counted against anything)");
+    }
+    if !unreadable.is_empty() {
+        // Named, not just counted: these are rows you labelled that were not measured, and
+        // they stay unspent so a later run can measure them.
+        println!(
+            "unreadable    {} (body could not be fetched — excluded, and NOT recorded as graded)",
+            unreadable.len()
+        );
+        for row in &unreadable {
+            println!("                {}  {}", row.gmail_message_id, row.subject);
+        }
     }
     println!();
 
@@ -755,7 +842,7 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
     ledger.entries.push(LedgerEntry {
         graded_at: chrono::Utc::now().to_rfc3339(),
         fingerprint: fingerprint.clone(),
-        message_ids: labelled.iter().map(|(r, _)| r.gmail_message_id.clone()).collect(),
+        message_ids: graded_ids,
     });
     ledger.save(&ledger_file)?;
     println!("recorded this grading in {}", ledger_file.display());
@@ -767,6 +854,73 @@ async fn score(pool: &SqlitePool, labels: &Path) -> Result<()> {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+
+    fn labelled(id: &str, truth: Category) -> (Row, Category) {
+        (
+            Row {
+                gmail_message_id: id.to_string(),
+                received_at: "2026-09-01T00:00:00+00:00".to_string(),
+                from: "careers@examplecorp.com".to_string(),
+                subject: "Thank you for your application!".to_string(),
+                snippet: "Thank you for applying to Example Corp.".to_string(),
+                label: truth.as_str().to_string(),
+            },
+            truth,
+        )
+    }
+
+    /// `score` grades with the body, as production classifies. It called `classify` — no body —
+    /// until 2026-09-30, a week after the gate was fixed, so the real measurement would have
+    /// graded a classifier nothing runs.
+    #[test]
+    fn score_grades_a_refusal_that_is_only_in_the_body() {
+        let companies = ["example corp".to_string()];
+        let context = classify::Context { known_companies: &companies };
+        let rows = vec![labelled("m1", Category::Rejection)];
+        let bodies = HashMap::from([(
+            "m1".to_string(),
+            Some("We have decided not to move forward with your application.".to_string()),
+        )]);
+        let grading = grade(&rows, &bodies, &Ledger::default(), "f1", &context);
+        assert_eq!(grading.held_out, vec![(Category::Rejection, Category::Rejection)]);
+    }
+
+    /// A row whose body could not be read is not measured, so it must not be spent. Recording it
+    /// would make it in-sample the next time the rules move, without it ever having been graded.
+    #[test]
+    fn an_unreadable_row_is_excluded_and_not_recorded() {
+        let companies: Vec<String> = Vec::new();
+        let context = classify::Context { known_companies: &companies };
+        let rows = vec![labelled("read", Category::Confirmation), labelled("unread", Category::Oa)];
+        let bodies = HashMap::from([("read".to_string(), None)]);
+        let grading = grade(&rows, &bodies, &Ledger::default(), "f1", &context);
+
+        assert_eq!(grading.held_out.len(), 1, "only the readable row is graded");
+        assert_eq!(grading.unreadable.len(), 1);
+        assert_eq!(grading.graded_ids, vec!["read".to_string()]);
+    }
+
+    /// A spent row was graded under earlier rules; re-recording it proves nothing and it is not
+    /// a measurement. Only held-out rows belong in this run's entry.
+    #[test]
+    fn a_spent_row_is_reported_but_not_recorded_again() {
+        let companies: Vec<String> = Vec::new();
+        let context = classify::Context { known_companies: &companies };
+        let rows = vec![labelled("old", Category::Confirmation), labelled("new", Category::Confirmation)];
+        let bodies = HashMap::from([("old".to_string(), None), ("new".to_string(), None)]);
+        let ledger = Ledger {
+            entries: vec![LedgerEntry {
+                graded_at: "2026-09-01T00:00:00+00:00".to_string(),
+                fingerprint: "an-older-rules-file".to_string(),
+                message_ids: vec!["old".to_string()],
+            }],
+        };
+        let grading = grade(&rows, &bodies, &ledger, "the-current-rules", &context);
+
+        assert_eq!(grading.spent.len(), 1);
+        assert_eq!(grading.held_out.len(), 1);
+        assert_eq!(grading.graded_ids, vec!["new".to_string()]);
+    }
 
     /// The defect the whole 2026-09-22 pass turned on, made executable.
     ///
