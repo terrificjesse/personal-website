@@ -114,28 +114,18 @@ pub fn match_application<'a>(
     // is not the same as "a different role" — see the filter below.
     let wanted_role = super::untracked::role_key(role_guess);
 
-    let mut best: Option<(&str, f64)> = None;
-    // How many applications clear the company bar, which decides whether a roleless email has
-    // one obvious home or several possible ones.
-    let mut candidates = 0usize;
+    // One bucket per kind of role agreement, so the decision below can prefer the strongest
+    // evidence rather than whichever application happened to be listed first.
+    let mut roleless: Option<(&str, f64)> = None;
+    let mut roleless_candidates = 0usize;
+    let mut exact: Option<(&str, f64)> = None;
+    let mut prefixed: Vec<&str> = Vec::new();
+    let mut untitled: Option<(&str, f64)> = None;
+
     for TrackedApplication { id, company, title } in applications {
         let key = company_key(company);
         if key.is_empty() {
             continue;
-        }
-        // **An application is a (company, role) pair, not a company.** Nine Microsoft
-        // confirmations for nine different roles all matched the one tracked Microsoft
-        // application, so eight real applications were never proposed and the tracker read 14
-        // when it should have read far more.
-        //
-        // Asymmetric on purpose: when the email names no role we fall back to company-only
-        // matching, because refusing to match there would propose a duplicate for every
-        // roleless autoresponder. When it DOES name one, it has to agree.
-        if !wanted_role.is_empty() {
-            let their_role = super::untracked::role_key(title.as_deref());
-            if !their_role.is_empty() && their_role != wanted_role {
-                continue;
-            }
         }
         let score = if key == wanted {
             1.0
@@ -145,37 +135,185 @@ pub fn match_application<'a>(
         // A high bar on purpose. The cost of a wrong match is an email attached to somebody
         // else's application, which then proposes a status change on it — far worse than the
         // no-match case, which rule 8 already makes safe.
-        if score >= 0.9 && best.is_none_or(|(_, current)| score > current) {
-            best = Some((id.as_str(), score));
+        if score < 0.9 {
+            continue;
         }
-        if score >= 0.9 {
-            candidates += 1;
+        let keep = |slot: &mut Option<(&'a str, f64)>| {
+            if slot.is_none_or(|(_, current)| score > current) {
+                *slot = Some((id.as_str(), score));
+            }
+        };
+
+        // **An application is a (company, role) pair, not a company.** Nine Microsoft
+        // confirmations for nine different roles all matched the one tracked Microsoft
+        // application, so eight real applications were never proposed and the tracker read 14
+        // when it should have read far more.
+        //
+        // Asymmetric on purpose: when the email names no role we fall back to company-only
+        // matching, because refusing to match there would propose a duplicate for every
+        // roleless autoresponder. When it DOES name one, it has to agree.
+        if wanted_role.is_empty() {
+            roleless_candidates += 1;
+            keep(&mut roleless);
+            continue;
+        }
+        match role_fit(&wanted_role, &super::untracked::role_key(title.as_deref())) {
+            Some(RoleFit::Exact) => keep(&mut exact),
+            Some(RoleFit::Prefix) => prefixed.push(id.as_str()),
+            Some(RoleFit::Untitled) => keep(&mut untitled),
+            None => {}
         }
     }
 
-    // **When the email names no role and the company has several applications, decline.**
-    //
-    // The roleless fallback above exists so that an autoresponder naming no role still reaches
-    // the one application it can only be about. With more than one candidate it stops being a
-    // fallback and becomes a coin toss, and the coin was landing badly: a Microsoft HackerRank
-    // invitation for "Full Stack Product (Web + Services) Req ID (200042195)" — a role with no
-    // tracked application at all — was attached to the Data Platform/Analytics one, proposed
-    // `oa` against it, and that acceptance is what moved a correctly-rejected application
-    // backwards on 2026-09-26.
-    //
-    // "Names no role" here means none could be READ, which is not the same as none being
-    // present; `title_from_subject` does not know that phrasing. Either way the safe answer is
-    // the same, and rule 8 already makes a no-match harmless: the email is still classified,
-    // still labelled, still alerted if pressing. A wrong match is the expensive direction.
-    if wanted_role.is_empty() && candidates > 1 {
-        return None;
+    if wanted_role.is_empty() {
+        // **When the email names no role and the company has several applications, decline.**
+        //
+        // The roleless fallback exists so that an autoresponder naming no role still reaches
+        // the one application it can only be about. With more than one candidate it stops being
+        // a fallback and becomes a coin toss, and the coin was landing badly: a Microsoft
+        // HackerRank invitation for "Full Stack Product (Web + Services) Req ID (200042195)" — a
+        // role with no tracked application at all — was attached to the Data Platform/Analytics
+        // one, proposed `oa` against it, and that acceptance is what moved a correctly-rejected
+        // application backwards on 2026-09-26.
+        //
+        // "Names no role" here means none could be READ, which is not the same as none being
+        // present. Either way the safe answer is the same, and rule 8 already makes a no-match
+        // harmless: the email is still classified, still labelled, still alerted if pressing.
+        if roleless_candidates > 1 {
+            return None;
+        }
+        return roleless.map(|(id, _)| id);
     }
-    best.map(|(id, _)| id)
+
+    // Strongest evidence first. An exact role wins outright; a prefix only when it is the one
+    // application it could be; an untitled application last, because it agrees with anything.
+    if let Some((id, _)) = exact {
+        return Some(id);
+    }
+    match prefixed.as_slice() {
+        [only] => return Some(only),
+        [_, _, ..] => return None,
+        [] => {}
+    }
+    untitled.map(|(id, _)| id)
+}
+
+/// How an email's role agrees with a tracked application's, once both are keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleFit {
+    Exact,
+    /// One is the other cut short at a word boundary.
+    Prefix,
+    /// The application has no title, so it cannot disagree.
+    Untitled,
+}
+
+/// Whether two role keys describe the same role.
+///
+/// # Why a prefix counts
+///
+/// Gmail's preview stops at about two hundred characters and titles are long, so a role read
+/// out of a snippet is routinely the real title cut short: "Software Engineering Internship
+/// (Summer 2027)" arrives as "software engineering internship". The tracker's own titles were
+/// extracted from mail the same way, so the truncation runs in both directions — Two Sigma's is
+/// stored as "Quantitative Researcher - Intern [2027 Summer". Exact equality could never match
+/// either, however good the extraction.
+///
+/// **Word boundary and three words**, so "software" is not a prefix of "software engineer
+/// intern", and a two-word stub like "software engineer" — which begins half the titles at any
+/// company — does not qualify. The caller then refuses a prefix that fits more than one
+/// application, which is what keeps this from reintroducing the guess the roleless path just
+/// stopped making.
+fn role_fit(wanted: &str, theirs: &str) -> Option<RoleFit> {
+    if theirs.is_empty() {
+        return Some(RoleFit::Untitled);
+    }
+    if wanted == theirs {
+        return Some(RoleFit::Exact);
+    }
+    let (short, long) = if wanted.len() < theirs.len() {
+        (wanted, theirs)
+    } else {
+        (theirs, wanted)
+    };
+    let at_a_word_boundary = long.starts_with(short) && long[short.len()..].starts_with(' ');
+    if at_a_word_boundary && short.split(' ').count() >= 3 {
+        return Some(RoleFit::Prefix);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gmail's preview truncates, and so did the extraction that created the tracker's own
+    /// titles. A role cut short at a word boundary is the same role.
+    #[test]
+    fn a_title_cut_short_by_the_preview_still_finds_its_application() {
+        let apps = vec![
+            app("a1", "Two Sigma", Some("Software Engineering Internship (Summer 2027)")),
+            app("a2", "Two Sigma", Some("Quantitative Researcher - Intern [2027 Summer")),
+        ];
+        // The email's copy, truncated.
+        assert_eq!(
+            match_application(Some("two sigma"), Some("Software Engineering Internship"), &apps),
+            Some("a1")
+        );
+        // The tracker's copy truncated instead: a full title from mail still finds it.
+        assert_eq!(
+            match_application(
+                Some("two sigma"),
+                Some("Quantitative Researcher - Intern [2027 Summer]"),
+                &apps
+            ),
+            Some("a2")
+        );
+    }
+
+    /// A prefix that fits two applications is a guess, and the matcher stopped guessing.
+    #[test]
+    fn a_prefix_that_fits_two_applications_matches_neither() {
+        let apps = vec![
+            app("a1", "Microsoft", Some("Software Engineer Intern Opportunities Redmond")),
+            app("a2", "Microsoft", Some("Software Engineer Intern Opportunities Boston")),
+        ];
+        assert_eq!(
+            match_application(
+                Some("microsoft"),
+                Some("Software Engineer Intern Opportunities"),
+                &apps
+            ),
+            None
+        );
+    }
+
+    /// Two words is not enough to be a prefix: "software engineer" begins half the titles at any
+    /// company. And a partial word never counts.
+    #[test]
+    fn a_short_or_mid_word_prefix_is_not_the_same_role() {
+        let apps = vec![app("a1", "Tesla", Some("Software Engineer Intern"))];
+        assert_eq!(match_application(Some("tesla"), Some("Software Engineer"), &apps), None);
+        let apps = vec![app("a1", "Tesla", Some("Software Engineering Intern Summer"))];
+        assert_eq!(
+            match_application(Some("tesla"), Some("Software Engineer Intern"), &apps),
+            None,
+            "'engineer' is not a prefix of 'engineering' for this purpose"
+        );
+    }
+
+    /// An exact role beats a prefix, however many prefixes there are.
+    #[test]
+    fn an_exact_role_outranks_a_prefix() {
+        let apps = vec![
+            app("a1", "Amazon", Some("Software Development Engineer Intern Robotics 2027")),
+            app("a2", "Amazon", Some("Software Development Engineer Intern")),
+        ];
+        assert_eq!(
+            match_application(Some("amazon"), Some("Software Development Engineer Intern"), &apps),
+            Some("a2")
+        );
+    }
 
     /// A roleless email with one possible home still finds it; with several it declines.
     ///

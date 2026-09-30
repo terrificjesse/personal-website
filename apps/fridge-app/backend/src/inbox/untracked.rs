@@ -278,6 +278,22 @@ pub fn role_key(role: Option<&str>) -> String {
     .unwrap_or_default()
 }
 
+/// Whether `text` carries a requisition id: a run of at least five digits.
+///
+/// Five because a year is four, and years appear in role names as terms — "(Summer 2027)" —
+/// that must survive. Every live requisition id seen so far is longer: 200042195, 10529525,
+/// 277192.
+fn has_requisition_id(text: &str) -> bool {
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c.is_ascii_digit() { run + 1 } else { 0 };
+        if run >= 5 {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
     // Real mail is HTML-escaped, so a role reaches this as "Summer &#39;27" and would be stored
     // with the entity in it, in the column the tracker renders.
@@ -296,6 +312,16 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
         "position: ",
         "for the position of ",
         "interest in the ",
+        // Added 2026-09-30 from the phrasings `backfill-status` could not read. Each is guarded
+        // by the "intern" gate below, which is what stops "your interest in Two Sigma!" from
+        // yielding "Two Sigma" as a role: these markers are broad on purpose, and the gate is
+        // what makes that safe.
+        //   Amazon:  "Thank you for your interest in Software Development Engineer Intern, …"
+        //   HRT:     "Thank you for your interest in Hudson River Trading's Summer 2027 …"
+        //   Microsoft: "Thank you for applying for the Microsoft Full Stack Product … Req ID (…)"
+        "your interest in ",
+        "applying for the ",
+        "applying for ",
     ] {
         if let Some(at) = lower.find(marker) {
             let tail = subject[at + marker.len()..].trim();
@@ -305,6 +331,22 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
                 .next()
                 .unwrap_or(tail)
                 .trim();
+            // A leading company possessive: "Hudson River Trading's Summer 2027 Algorithm
+            // Development Internship". The owner is the employer, not part of the role, and
+            // keeping it means the title can never agree with the posting's. Once only, and only
+            // for a short digit-free owner, so a role that merely contains a possessive later on
+            // — a "Master's" programme — keeps it.
+            let tail = match tail.find("'s ").map(|at| (at, "'s ".len())).or_else(|| {
+                tail.find("\u{2019}s ").map(|at| (at, "\u{2019}s ".len()))
+            }) {
+                Some((at, width))
+                    if (1..=4).contains(&tail[..at].split_whitespace().count())
+                        && !tail[..at].chars().any(|c| c.is_ascii_digit()) =>
+                {
+                    tail[at + width..].trim_start()
+                }
+                _ => tail,
+            };
             // Leading noise the surrounding sentence leaves behind: an article, a possessive,
             // or a requisition number the ATS prefixes to the title. All real —
             // "our [Summer 2027] Software Engineer Intern", "R171519 2027 Intern - …".
@@ -360,16 +402,51 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
             // for three different Microsoft roles all proposed against the same application.
             // `role_key` already strips a trailing requisition id; doing it here too is what
             // lets the title survive long enough to reach it.
+            //
+            // **A requisition id, not any number.** This first matched on "contains a digit",
+            // which also stripped terms — "(Fall 2026)", "(Summer 2027)" — and took whatever
+            // followed them. Tesla's rejection named "…Access Control Systems (Fall 2026)
+            // position"; the term went, the key no longer equalled the tracked title's, and the
+            // rejection sat unmatched from 2026-09-23 to 2026-09-30. An id is a run of five or
+            // more digits. A year is four.
             let tail = match (tail.rfind('('), tail.rfind(')')) {
                 (Some(open), Some(close))
                     if close > open
-                        && tail[open + 1..close].chars().any(|c| c.is_ascii_digit())
+                        && has_requisition_id(&tail[open + 1..close])
                         && tail[open + 1..close].len() <= 30 =>
                 {
                     tail[..open].trim_end()
                 }
                 _ => tail,
             };
+            // An opening bracket that never closes is where the snippet was cut, not part of the
+            // role. Gmail's preview stops at ~200 characters, so "Software Engineering Internship
+            // (Summer 2027)" arrives as "…Internship (Summer 2", and the fragment "summer 2"
+            // matches no word of the real title. Cutting it leaves a clean prefix, which the
+            // matcher can then recognise as one — see `advance::match_application`.
+            let tail = match (tail.rfind(['(', '[']), tail.rfind([')', ']'])) {
+                (Some(open), close) if close.is_none_or(|close| close < open) => {
+                    tail[..open].trim_end()
+                }
+                _ => tail,
+            };
+            // Requisition residue the parenthetical leaves behind: "…(Web + Services) Req ID"
+            // once "(200042195)" is gone, or "Software Engineer Req #2" in a screen invitation.
+            let mut tail = tail.trim_end();
+            loop {
+                let before = tail;
+                if let Some((head, last)) = tail.rsplit_once(' ') {
+                    let last = last.trim_end_matches([',', '.', ':']);
+                    let is_residue = matches!(last.to_lowercase().as_str(), "req" | "id" | "#")
+                        || (last.starts_with('#') && last[1..].chars().all(|c| c.is_ascii_digit()));
+                    if is_residue {
+                        tail = head.trim_end();
+                    }
+                }
+                if tail == before {
+                    break;
+                }
+            }
             let mut tail = tail.trim_end().trim_end_matches(['.', '!', '?', ';', ',', ' ']);
             loop {
                 let before = tail;
@@ -827,6 +904,86 @@ async fn untracked_cli(pool: &SqlitePool, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phrasings `backfill-status` could not read a role from on 2026-09-30, paraphrased. Each
+    /// returned `None` before the markers and cleanup it names were added.
+    #[test]
+    fn roles_read_from_the_phrasings_that_used_to_yield_nothing() {
+        let cases = [
+            // "your interest in <Role>" — only "interest in the" was known.
+            (
+                "Thank you for your interest in Software Development Engineer Intern, ROBOTICS - \
+                 2027 (ID: 10529525). If you have completed",
+                "Software Development Engineer Intern, ROBOTICS - 2027",
+            ),
+            // A company possessive in front of the role.
+            (
+                "Thank you for your interest in Hudson River Trading&#39;s Summer 2027 Algorithm \
+                 Development Internship! Please see below",
+                "Summer 2027 Algorithm Development Internship",
+            ),
+            // A bracket the 200-character preview cut open.
+            (
+                "We&#39;ve successfully received your application for the following position: \
+                 Software Engineering Internship (Summer 2",
+                "Software Engineering Internship",
+            ),
+        ];
+        for (snippet, expected) in cases {
+            assert_eq!(
+                role_from(Some("Thank you"), Some(snippet)).as_deref(),
+                Some(expected),
+                "{snippet}"
+            );
+        }
+    }
+
+    /// The broad new markers are safe only because of the "intern" gate. These must stay `None`:
+    /// the first names a company, the second a role that does not say it is an internship, and
+    /// the third a position at a company rather than a role.
+    #[test]
+    fn a_broad_marker_still_refuses_what_is_not_an_internship_role() {
+        for snippet in [
+            "Thank you for your interest in Two Sigma! We have received your application",
+            "Thank you for applying for the Full Stack Product (Web + Services) Req ID (200042195).",
+            "Thank you for submitting your application for a position at Roblox! Please click",
+        ] {
+            assert_eq!(role_from(Some("Thank you"), Some(snippet)), None, "{snippet}");
+        }
+    }
+
+    /// A term is part of the role; a requisition id is not. Tesla's rejection lost "(Fall 2026)"
+    /// to a rule that stripped any parenthetical with a digit in it, and with it the exact match
+    /// against the tracked title.
+    #[test]
+    fn a_term_in_brackets_survives_and_a_requisition_id_does_not() {
+        assert_eq!(
+            role_from(
+                None,
+                Some("your interest in the Integration Engineer Intern (Fall 2026) position at Tesla.")
+            ),
+            Some("Integration Engineer Intern (Fall 2026)".to_string())
+        );
+        assert_eq!(
+            role_from(None, Some("your application for Firmware Engineering INTERN (Job number: 200051878).")),
+            Some("Firmware Engineering INTERN".to_string())
+        );
+        assert!(has_requisition_id("Job number: 200051878"));
+        assert!(!has_requisition_id("Summer 2027"));
+    }
+
+    /// Requisition residue is not part of the role, in either of its live shapes.
+    #[test]
+    fn requisition_residue_is_trimmed_from_the_end() {
+        assert_eq!(
+            role_from(None, Some("your application for Data Engineering Intern Req ID (99887766).")),
+            Some("Data Engineering Intern".to_string())
+        );
+        assert_eq!(
+            role_from(None, Some("your application for Software Engineering Intern Req #2.")),
+            Some("Software Engineering Intern".to_string())
+        );
+    }
 
     /// A tracked title carries the posting's requisition parenthetical and the same role read
     /// out of an email does not. The key has to erase that difference or the two never meet —
