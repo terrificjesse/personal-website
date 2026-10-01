@@ -93,6 +93,19 @@ case-sensitive check would have resurrected the first. An earlier measurement th
 `retired-slugs.json` wrongly would have added all four; `retired-slugs.json` exists for exactly
 that, and a test now pins it.
 
+**What the first collection after it returned** (2026-10-01, 14:33–14:42 UTC). Every one of the
+118 new boards was polled and answered — none gone, 117 listing at least one job, 4,604 jobs
+between them before filtering. They carried **202 internship postings**:
+
+- **143 were already known from Simplify.** Not wasted: a second sighting from the board itself
+  is what lets the sweep expire a posting only when every sighting agrees (§ D of
+  `docs/INTERNSHIP_SCRAPING.md`).
+- **57 are reachable only through these boards** — internships Simplify does not list, across
+  24 companies.
+- **6 of those companies had no posting in the corpus at all** before this run: Acron Aviation,
+  Antares, SK hynix Memory Solutions America, SwarmAero, Talos Trading, Xcimer. SK hynix is one of
+  the three boards found without Simplify.
+
 `--apply` writes this file in its own format — one-space indent, no trailing newline — and a
 test renders the committed file and asserts the bytes are identical, so an application diffs as
 the lines it added and nothing else.
