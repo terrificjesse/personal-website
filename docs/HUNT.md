@@ -892,6 +892,14 @@ makes an hour before midnight. If that ever matters, it is a parameter, not a re
 
 ### 11e's nudge producer — and the migration nobody has budgeted for
 
+> **Off by default since 2026-10-19, at the owner's request.** In seven weeks the producer raised
+> 85 nudges and not one was acknowledged. A reminder nobody acts on is noise on the same channel
+> that carries OA and interview alerts, and once the site has users other than the owner, "you
+> have not heard back in 14 days" is a judgement they should opt into rather than have to
+> silence. `HUNT_NUDGE_INTERVAL_SECS` now turns it **on** (21600 is a sensible value); unset or
+> `0` leaves it off. The 85 outstanding nudges were acknowledged rather than deleted, so the
+> record of what was raised survives. Everything below still describes how it works when on.
+
 The trap `docs/PLAN.md` § Phase 11 names is real, and there is a second one under it.
 
 **The key.** `hunt_events` has `UNIQUE (kind, subject_id)`, which is what makes alert dedup

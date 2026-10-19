@@ -40,12 +40,6 @@ use crate::internships::application_events::HAS_RESPONDED;
 /// should not be swallowed by having already sent the first.
 const DEFAULT_THRESHOLDS: &[i64] = &[14, 30];
 
-/// How often the sweep runs when `HUNT_NUDGE_INTERVAL_SECS` is unset.
-///
-/// Six hours, not minutes: the thing being measured moves in days, and the dedup key means a
-/// faster sweep would only re-find rows it has already emitted for.
-const DEFAULT_INTERVAL_SECS: u64 = 6 * 60 * 60;
-
 /// One application that has gone unanswered past a threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stale {
@@ -158,24 +152,26 @@ pub async fn sweep(pool: &SqlitePool, now: DateTime<Utc>) -> Result<NudgeReport>
 /// The background worker. Same shape as the blog watcher and the inbox sync: cadence from an
 /// env var, `0` disables, spawned rather than awaited, and **never called from a request
 /// handler**.
+///
+/// # Off unless asked for — decided 2026-10-19
+///
+/// This was on by default, and it is not any more. In seven weeks it raised **85 nudges and
+/// not one was acknowledged**: a reminder nobody acts on is noise, and noise on the alert
+/// channel is how the OA and interview alerts on the same channel stop being read. The owner
+/// asked not to receive them.
+///
+/// It also reads differently once the site has users who are not the owner. "You have not
+/// heard back in 14 days" is a judgement about how somebody runs their search, and it should
+/// be something they opt into rather than something they have to find a way to silence.
+///
+/// So the variable now turns it ON: set `HUNT_NUDGE_INTERVAL_SECS` (21600 is a sensible
+/// cadence) and, optionally, `HUNT_NUDGE_DAYS`. Unset or `0` leaves it off, and says so at
+/// startup rather than silently.
 pub fn spawn(pool: SqlitePool) {
-    let interval = match std::env::var("HUNT_NUDGE_INTERVAL_SECS") {
-        Err(_) => Some(std::time::Duration::from_secs(DEFAULT_INTERVAL_SECS)),
-        Ok(value) => match value.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
-            Err(_) => {
-                eprintln!(
-                    "hunt: HUNT_NUDGE_INTERVAL_SECS={value:?} is not a number — nudges disabled; \
-                     use 0 to disable deliberately"
-                );
-                None
-            }
-        },
-    };
+    let interval = interval_from(std::env::var("HUNT_NUDGE_INTERVAL_SECS").ok().as_deref());
 
     let Some(interval) = interval else {
-        println!("hunt: follow-up nudges disabled");
+        println!("hunt: follow-up nudges off (set HUNT_NUDGE_INTERVAL_SECS to turn them on)");
         return;
     };
 
@@ -203,6 +199,26 @@ pub fn spawn(pool: SqlitePool) {
             }
         }
     });
+}
+
+/// The sweep cadence from `HUNT_NUDGE_INTERVAL_SECS`, or `None` for off.
+///
+/// **Unset is off.** Six hours (21600) is a sensible value for anyone turning it on: what is
+/// measured moves in days, and the dedup key means a faster sweep only re-finds rows it has
+/// already emitted for.
+fn interval_from(raw: Option<&str>) -> Option<std::time::Duration> {
+    let value = raw?;
+    match value.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+        Err(_) => {
+            eprintln!(
+                "hunt: HUNT_NUDGE_INTERVAL_SECS={value:?} is not a number — nudges stay off; \
+                 use 0 to turn them off deliberately"
+            );
+            None
+        }
+    }
 }
 
 /// Thresholds from `HUNT_NUDGE_DAYS`, e.g. `"14,30"`. Unparseable entries are dropped with a
@@ -248,6 +264,16 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off unless asked for. It was on by default until 2026-10-19 and raised 85 reminders, none
+    /// acknowledged; the owner asked not to receive them.
+    #[test]
+    fn nudges_are_off_unless_an_interval_is_set() {
+        assert_eq!(interval_from(None), None, "unset must mean off");
+        assert_eq!(interval_from(Some("0")), None);
+        assert_eq!(interval_from(Some("soon")), None, "garbage stays off rather than guessing");
+        assert_eq!(interval_from(Some("21600")), Some(std::time::Duration::from_secs(21_600)));
+    }
     use crate::internships::application_events::{self, Actor, NewApplicationEvent};
     use crate::internships::models::ApplicationStatus;
     use uuid::Uuid;
