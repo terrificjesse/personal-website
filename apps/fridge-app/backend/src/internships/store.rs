@@ -510,3 +510,63 @@ mod tests {
         assert_eq!(live_source_names(&pool).await.unwrap(), vec!["greenhouse"]);
     }
 }
+
+/// What a visitor sees first, on a copy of the live database. Never in CI.
+///
+/// The listing endpoint needs a session, and the ranking is only ever wrong on real data — the
+/// module's own lesson is that four scoring functions shipped green while ordering real data
+/// badly. This runs the handler's three calls (`load_live_postings`, `load_company_signals`,
+/// `rank_postings`) with the filters a first visit sends — none — and prints the head of it.
+///
+/// ```text
+/// sqlite3 fridge.db ".backup '/tmp/rank.db'"
+/// RANK_PROBE_DB=/tmp/rank.db cargo test --release probe_the_default_ranking -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod rank_probe {
+    use super::*;
+    use crate::internships::rank::{InternshipFilters, SortBy, rank_postings};
+
+    #[tokio::test]
+    #[ignore = "reads a copy of the live database named by RANK_PROBE_DB"]
+    async fn probe_the_default_ranking() {
+        let path = std::env::var("RANK_PROBE_DB").expect("set RANK_PROBE_DB to a copy of fridge.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&format!("sqlite://{path}?mode=ro"))
+            .await
+            .expect("opens the copy");
+        let postings = load_live_postings(&pool, None).await.unwrap();
+        let signals = load_company_signals(&pool).await.unwrap();
+        let ranked = rank_postings(
+            &postings,
+            &signals,
+            &InternshipFilters::default(),
+            SortBy::Composite,
+            chrono::Utc::now(),
+        );
+        let top: usize = std::env::var("RANK_PROBE_TOP").ok().and_then(|n| n.parse().ok()).unwrap_or(40);
+        println!("live {}  ranked {}", postings.len(), ranked.len());
+        for (i, r) in ranked.iter().take(top).enumerate() {
+            let p = &r.posting;
+            let term = format!(
+                "{} {}",
+                p.term_season.map(|s| format!("{s:?}")).unwrap_or_else(|| "?".into()),
+                p.term_year.map(|y| y.to_string()).unwrap_or_else(|| "?".into())
+            );
+            println!(
+                "{:>3} {:.3} {:<26} {:<48} {:<12} posted {} | prest {:.2} rec {:.2} pay {:.2} dl {:.2} loc {:.2}",
+                i + 1,
+                r.score,
+                p.company_name.chars().take(26).collect::<String>(),
+                p.title.chars().take(48).collect::<String>(),
+                term,
+                p.posted_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "-".into()),
+                r.breakdown.prestige.value,
+                r.breakdown.recency.value,
+                r.breakdown.pay.value,
+                r.breakdown.deadline.value,
+                r.breakdown.location.value,
+            );
+        }
+    }
+}

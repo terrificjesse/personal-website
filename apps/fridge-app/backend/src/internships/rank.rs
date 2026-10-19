@@ -77,7 +77,7 @@
 //! | Posted date | `posted_at: None` | neutral | …was posted [`POSTED_HALFLIFE_DAYS`] ago |
 //! | Posted date | `posted_at_is_estimated: true` | decay from the estimate, **capped at neutral** | …is at least that old — see below |
 //! | Deadline | `deadline: None` (most postings) | neutral | …closes midway down the urgency ramp |
-//! | Location | `is_remote: None` | neutral, which is the exact midpoint of [`LOCATION_REMOTE_SCORE`] and [`LOCATION_ONSITE_SCORE`] | …is half remote, which is what "we don't know" means here |
+//! | Location | `is_remote: None` | neutral, the same as [`LOCATION_ONSITE_SCORE`] | …is onsite, which 85% of live postings with no stated remoteness are — see that constant |
 //! | Prestige | `prestige: None`, or no `company_signals` row at all | neutral | …is a company with an average derived signal |
 //!
 //! Two of those deserve their reasoning spelled out:
@@ -273,14 +273,27 @@ pub const DEADLINE_PASSED_SCORE: f64 = SCORE_MIN;
 
 /// What a posting known to be remote scores on the location input.
 pub const LOCATION_REMOTE_SCORE: f64 = SCORE_MAX;
-/// What a posting known to be onsite scores on the location input.
+/// What a posting known to be onsite scores on the location input: **the same as not knowing.**
 ///
 /// With no location *preference* in scope (see [`InternshipFilters`] — location is a hard
 /// filter here, never a weight), the only intrinsic ordering available is accessibility: a
-/// remote posting is open to the reader wherever they are and an onsite one may not be. If
-/// the tab later grows a stated location preference, this is the input that preference
-/// replaces.
-pub const LOCATION_ONSITE_SCORE: f64 = SCORE_MIN;
+/// remote posting is open to the reader wherever they are. So remote earns a bonus. If the tab
+/// later grows a stated location preference, this is the input that preference replaces.
+///
+/// # Why onsite is no longer the floor — changed 2026-10-19
+///
+/// This was `SCORE_MIN`, with "unknown" imputed to the midpoint on the theory that a posting
+/// whose remoteness the source did not state is half remote. **Measured, it is not.** Of 2,929
+/// live postings, 85% have unknown remoteness, 11% are stated onsite and 4% stated remote — and
+/// the "unknown" ones overwhelmingly name a city ("San Jose, CA", "NYC", "Seattle, WA"). They
+/// are onsite in all but the flag.
+///
+/// So the old scale charged 0.05 of composite score to the 325 postings whose source happened
+/// to *say* "onsite", against identical jobs whose source said nothing. That is more
+/// information producing a lower rank, and 0.05 is not small here: the whole top forty sat
+/// within 0.07 of each other. Saying "onsite" now costs nothing; being remote still earns the
+/// bonus.
+pub const LOCATION_ONSITE_SCORE: f64 = UNKNOWN_SCORE;
 
 // ------------------------------------------------------------------------------------------
 // Hard filters
@@ -1281,16 +1294,18 @@ mod tests {
         ));
     }
 
+    /// Stating "onsite" must not cost a posting anything against one whose source said nothing.
+    /// It did: onsite was the floor and unknown the midpoint, so 325 live postings ranked 0.05
+    /// below identical jobs for the crime of being described more completely.
     #[test]
-    fn an_unknown_location_scores_exactly_between_remote_and_onsite() {
-        let mut remote = blank("p1");
-        remote.location.is_remote = Some(true);
-        let mut onsite = blank("p2");
+    fn saying_onsite_costs_nothing_against_saying_nothing() {
+        let mut onsite = blank("p1");
         onsite.location.is_remote = Some(false);
-        let unknown = blank("p3");
-        let midpoint =
-            (breakdown_of(&remote).location.value + breakdown_of(&onsite).location.value) / 2.0;
-        assert!(close(breakdown_of(&unknown).location.value, midpoint));
+        let unknown = blank("p2");
+        assert!(close(
+            breakdown_of(&onsite).location.value,
+            breakdown_of(&unknown).location.value
+        ));
     }
 
     // --- the headline requirement ---------------------------------------------------------
