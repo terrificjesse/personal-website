@@ -88,17 +88,16 @@ export function InboxPanel() {
   // whether the account exists. `StatusProposals` below fetches its own and renders nothing
   // when the queue is empty.
   if (!status?.account && proposals.length === 0) {
-    // Nothing connected and nothing pending: say so in one line rather than rendering an
-    // empty panel that looks broken.
+    // **Optional, and presented as optional — decided 2026-10-19.** Most people using the site
+    // will never connect an inbox, so this is an offer, not a status: one muted line, no box,
+    // no "not connected", which read as something being wrong.
     return (
-      <section className="rounded border border-neutral-300 p-4 text-sm dark:border-neutral-700">
-        <span className="font-semibold">Inbox agent</span>{" "}
-        <span className="text-neutral-500">
-          — not connected.{" "}
-          <a className="underline" href={GMAIL_CONNECT_URL}>
-            Connect a Gmail account
-          </a>
-        </span>
+      <section className="text-sm text-neutral-500 dark:text-neutral-400">
+        Optional:{" "}
+        <a className="underline" href={GMAIL_CONNECT_URL}>
+          connect Gmail
+        </a>{" "}
+        to track replies to your applications automatically.
         {/* Disconnecting the account does not make already-proposed applications stop
             existing, and they are still worth answering. */}
         <UntrackedApplications onAccepted={refresh} />
@@ -107,12 +106,14 @@ export function InboxPanel() {
   }
 
   return (
-    <section className="rounded border border-neutral-300 p-4 dark:border-neutral-700">
-      <h2 className="font-semibold">Inbox agent</h2>
-
-      <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
+    <section className="text-sm">
+      <p className="text-neutral-600 dark:text-neutral-400">
+        <span className="font-medium">Email sync</span>
+        {" · "}
         {status?.account ?? "not connected"}
-        {status?.last_run && (
+        {/* Only a run that worked is summarised here. A failed one is the quiet line below,
+            and printing "failed" in red up here as well was the loudest thing on the panel. */}
+        {status?.last_run && !status.last_run.error && (
           <>
             {" — last run "}
             <span className={outcomeTone(status.last_run.outcome)}>
@@ -132,10 +133,15 @@ export function InboxPanel() {
         </p>
       )}
 
-      {/* The line rule 5 exists for. A stopped agent must not read as a quiet inbox. */}
+      {/* The line rule 5 exists for. A stopped agent must not read as a quiet inbox.
+
+          **Quiet since 2026-10-19.** This was a red box. Email sync is optional, and a lapse in
+          it is a chore rather than an incident — Google expires the token weekly while the app
+          is in Testing — so it is a grey line now. Still visible, still says what to do, and the
+          full reason is one click away in the details. */}
       {status?.last_run?.error && !status.last_run.superseded_by_reconnect && (
-        <div className="mt-1 rounded border border-red-500/40 bg-red-500/5 px-2 py-1 text-sm text-red-700 dark:text-red-400">
-          <p>{status.last_run.error}</p>
+        <div className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
+          Email sync is paused.{" "}
           {/* An error with no way to act on it is half a message.
               
               Google expires refresh tokens after 7 days while the OAuth app is in Testing, so
@@ -144,9 +150,13 @@ export function InboxPanel() {
               branch below) was never reachable when it was actually needed. Reconnecting is
               always safe: the callback overwrites the stored token, and `prompt=consent` is
               what makes Google re-issue a refresh token rather than silently returning none. */}
-          <a className="mt-0.5 inline-block font-medium underline" href={GMAIL_CONNECT_URL}>
-            Reconnect this account
+          <a className="underline" href={GMAIL_CONNECT_URL}>
+            Reconnect
           </a>
+          <details className="mt-0.5 text-xs text-neutral-500">
+            <summary className="cursor-pointer">Why</summary>
+            {status.last_run.error}
+          </details>
         </div>
       )}
 

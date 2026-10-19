@@ -647,13 +647,18 @@ saveAnswersButton?.addEventListener("click", async () => {
 
 
 /*
- * The inbox agent's state, in the place you already look.
+ * Email sync's state, in the place you already look — quietly.
  *
  * Rule 5 says a broken sync must be visible, and until now "visible" meant a JSON endpoint
  * nobody opens. This matters on a clock: Google expires refresh tokens after seven days while
  * the OAuth app is in Testing, so the agent WILL stop — and a stopped agent produces exactly
- * the same silence as a quiet job market. Noticing in an hour instead of a fortnight is the
- * whole point of putting it here.
+ * the same silence as a quiet job market.
+ *
+ * **Quiet since 2026-10-19, at the owner's request.** Connecting an inbox is optional, and most
+ * people using the site never will, so a red line about it was louder than the feature has
+ * earned. Not connected now shows nothing at all; a lapsed sync is one neutral line, with the
+ * full reason on hover. That still satisfies rule 5 — a stopped sync never reads as a quiet
+ * inbox — without treating an optional feature as an alarm.
  */
 
 const inboxEl = document.getElementById("inbox");
@@ -670,28 +675,26 @@ void (async () => {
     const status = await res.json();
 
     if (!status.account) {
-      // Not connected is a real state, not an error, and saying nothing would leave you
-      // wondering why no email alerts ever arrive.
-      inboxEl.textContent = "Inbox: no account connected.";
-      inboxEl.hidden = false;
+      // Not connected is the normal state for most people, not something to report. This used
+      // to say "Inbox: no account connected." on every open, which reads as a fault.
       return;
     }
 
     const run = status.last_run;
     if (!run) {
-      inboxEl.textContent = `Inbox: ${status.account}, no sync yet.`;
+      inboxEl.textContent = `Email sync: ${status.account}, no sync yet.`;
     } else if (run.superseded_by_reconnect && run.error) {
       // The account was reconnected after this run failed. Showing the old reason would say
       // the token is dead when it has just been replaced.
-      inboxEl.textContent = "Inbox: reconnected — will sync shortly.";
+      inboxEl.textContent = "Email sync: reconnected — will sync shortly.";
     } else if (run.error) {
-      // The failure line. Shown in full rather than summarised — "the stored Gmail token no
-      // longer works, reconnect the account" is actionable, and "sync failed" is not.
-      inboxEl.textContent = `Inbox: ${run.outcome} — ${run.error}`;
-      inboxEl.classList.add("bad");
+      // Neutral, and short. Still actionable — it says where to fix it — with the full reason
+      // one hover away for anyone who wants it.
+      inboxEl.textContent = "Email sync paused — reconnect it on the website.";
+      inboxEl.title = run.error;
     } else {
       inboxEl.textContent =
-        `Inbox: ${run.outcome}, ${run.classified} classified ${relative(run.started_at)}.`;
+        `Email sync: ${run.classified} classified ${relative(run.started_at)}.`;
     }
     inboxEl.hidden = false;
   } catch {

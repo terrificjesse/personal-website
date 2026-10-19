@@ -646,6 +646,27 @@ POST /hunt/proposals/{id}/reject        mark reviewed; undoes an auto-applied ch
 The last two are the whole write-access posture, and the first default is the one Phase 10's
 task 10k asks you to confirm deliberately before the agent runs unattended on a deployed host.
 
+### Email is optional, and presented as optional — decided 2026-10-19
+
+The owner wants the site usable by people other than themselves, and most of them will never
+connect an inbox. So the inbox agent stopped presenting itself as a status to keep healthy and
+became an offer:
+
+- **Not connected:** one muted line on `/internships` — "Optional: connect Gmail to track replies
+  to your applications automatically." No box, no "not connected", and nothing at all in the
+  extension popup, which used to say "Inbox: no account connected." on every open.
+- **Connected but lapsed:** a grey "Email sync is paused. Reconnect" with the reason behind a
+  "Why" disclosure, where there was a red box; and one neutral popup line with the reason on
+  hover, where there was a red one. The header no longer repeats "failed" in red.
+
+**Rule 5 still holds, and that was the constraint on how far this could go.** A stopped sync must
+never read as a quiet inbox, so the paused line is still shown, still names the fix, and still
+carries the full reason. What changed is that a lapse in an optional feature — Google expires the
+token weekly while the OAuth app is in Testing — is treated as a chore rather than an incident.
+
+The review queues are unaffected: status changes and untracked applications are still shown in
+full on the applications page, because a decision waiting for you is not optional in the same way.
+
 ### Phase 9 — the parts that made it usable without an operator
 
 - **The interval worker** (`inbox::sync::spawn`), so a sync is not something you remember to
