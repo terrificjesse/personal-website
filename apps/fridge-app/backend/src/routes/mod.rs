@@ -6,6 +6,7 @@ pub mod hunt;
 pub mod inbox;
 pub mod internships;
 pub mod items;
+pub mod labelling;
 pub mod recipes;
 pub mod reviews;
 pub mod shopping_list;
@@ -217,6 +218,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hunt/inbox/status", get(inbox::status))
         .route("/hunt/inbox/sync", post(inbox::sync_now))
         .route("/hunt/inbox/disconnect", post(inbox::disconnect))
+        .route("/hunt/labelling", get(labelling::progress))
+        .route("/hunt/labelling/next", post(labelling::next))
+        .route(
+            "/hunt/labelling/{message_id}",
+            post(labelling::label).delete(labelling::undo),
+        )
         .route("/hunt/proposals", get(inbox::proposals))
         .route("/hunt/proposals/untracked", get(inbox::untracked_proposals))
         .route(

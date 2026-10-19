@@ -39,6 +39,7 @@ pub mod classify;
 pub mod diagnose;
 pub mod due_dates;
 pub mod gmail;
+pub mod labelling;
 pub mod labels;
 pub mod labelset;
 pub mod oauth;

@@ -232,6 +232,10 @@ labelset — 8b's measurement harness
   labelset export --out <file.csv> [--since <ISO8601>] [--until <ISO8601>] [--force]
       Write every stored message in the window to a CSV with an empty `label` column.
 
+  labelset export-labels --out <file.csv> [--force]
+      Write the labels collected on /internships/labelling to a CSV that `score` reads.
+      Skipped messages are written with a blank label, which `score` excludes.
+
   labelset score --labels <file.csv>
       Re-run the rules over the labelled rows and report how they did.
 
@@ -263,6 +267,11 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
             )
             .await
         }
+        "export-labels" => {
+            let out = flag(args, "--out")
+                .ok_or_else(|| anyhow::anyhow!("export-labels needs --out <file.csv>"))?;
+            export_labels(pool, Path::new(&out), args.iter().any(|a| a == "--force")).await
+        }
         "gate" => gate(args.iter().any(|a| a == "--update")),
         "score" => {
             let labels = flag(args, "--labels")
@@ -279,6 +288,74 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
 fn flag(args: &[String], name: &str) -> Option<String> {
     let position = args.iter().position(|a| a == name)?;
     args.get(position + 1).cloned()
+}
+
+/// Write the labels collected on `/internships/labelling` to a labelling sheet.
+///
+/// The page stores labels in `email_labels`; grading still happens on a CSV, so that `score`,
+/// its ledger and the rules fingerprint work exactly as they did. Same columns as `export`, so
+/// the two kinds of sheet are interchangeable — and, like `export`, **no verdict column**.
+async fn export_labels(pool: &SqlitePool, out: &Path, force: bool) -> Result<()> {
+    if out.exists() && !force {
+        bail!(
+            "{} already exists — and a graded set's ledger sits beside it. Pass --force to \
+             overwrite, or choose a new name.",
+            out.display()
+        );
+    }
+    let users: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT user_id FROM email_labels ORDER BY user_id")
+            .fetch_all(pool)
+            .await?;
+    if users.len() > 1 {
+        bail!("email_labels holds labels from {} users; this tool exports one", users.len());
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct Labelled {
+        gmail_message_id: String,
+        received_at: Option<String>,
+        from_address: Option<String>,
+        subject: Option<String>,
+        snippet: Option<String>,
+        label: Option<String>,
+    }
+    let rows: Vec<Labelled> =
+        sqlx::query_as(
+            "SELECT m.gmail_message_id, m.received_at, m.from_address, m.subject, m.snippet, l.label
+               FROM email_labels l
+               JOIN email_messages m ON m.id = l.message_id
+              ORDER BY m.received_at",
+        )
+        .fetch_all(pool)
+        .await?;
+    if rows.is_empty() {
+        bail!("no labels yet — label some messages on /internships/labelling first");
+    }
+
+    let mut writer = csv::Writer::from_path(out)?;
+    let (mut labelled, mut skipped) = (0usize, 0usize);
+    for row in rows {
+        match &row.label {
+            Some(_) => labelled += 1,
+            None => skipped += 1,
+        }
+        writer.serialize(Row {
+            gmail_message_id: row.gmail_message_id,
+            received_at: row.received_at.unwrap_or_default(),
+            from: row.from_address.unwrap_or_default(),
+            subject: row.subject.unwrap_or_default(),
+            snippet: row.snippet.unwrap_or_default(),
+            label: row.label.unwrap_or_default(),
+        })?;
+    }
+    writer.flush()?;
+    println!("wrote {labelled} labelled and {skipped} skipped message(s) to {}", out.display());
+    println!("grade it with: labelset score --labels {}", out.display());
+    if !out.starts_with("labelsets") {
+        println!("note: labelsets/ is gitignored because these hold real mail; {} is not in it", out.display());
+    }
+    Ok(())
 }
 
 /// Write every stored message in the window to a labelling sheet.

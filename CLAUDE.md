@@ -226,7 +226,7 @@ conflict surfaces at `sqlx migrate run`, not at merge.
 | Block | Reserved for | Status |
 |---|---|---|
 | `0021–0029` | Lane A | **exhausted** — `0029` taken 2026-09-03 |
-| `0030–0059` | **Claude Code** | in use — `0030`, `0031` taken |
+| `0030–0059` | **Claude Code** | in use — `0030`–`0036` taken (`0036` = `email_labels`, 2026-10-19) |
 | `0060–0089` | **Codex** | held open, unused |
 | `0090+` | unreserved | claim a block here before using one |
 

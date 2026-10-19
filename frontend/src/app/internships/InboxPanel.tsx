@@ -19,6 +19,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { useApiError } from "@/lib/useApiError";
 import { StatusProposals } from "./StatusProposals";
 import {
@@ -159,6 +160,13 @@ export function InboxPanel() {
           </details>
         </div>
       )}
+
+      {/* Only here, where an inbox is connected: nobody else has mail to label. */}
+      <p className="mt-1 text-xs text-neutral-500">
+        <Link className="underline" href="/internships/labelling">
+          Help measure how accurately your email is sorted
+        </Link>
+      </p>
 
       {message && <p className="mt-2 text-sm text-neutral-600">{message}</p>}
 

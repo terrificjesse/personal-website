@@ -646,6 +646,36 @@ POST /hunt/proposals/{id}/reject        mark reviewed; undoes an auto-applied ch
 The last two are the whole write-access posture, and the first default is the one Phase 10's
 task 10k asks you to confirm deliberately before the agent runs unattended on a deployed host.
 
+### Labelling held-out mail in the browser — built 2026-10-19
+
+Phase 13's measurement was blocked for a month on one `[you]` task: hand-label a CSV. Two things
+made that harder than it should have been. It meant a spreadsheet, and a CSV row carries only
+Gmail's ~200-character snippet — not enough to label from, since nine Microsoft rejections read
+"Thank you for your application!" and refuse you four hundred characters in. A labeller working
+from snippets would have called them confirmations, and the score would have graded the classifier
+against a mistake.
+
+`/internships/labelling` serves one message at a time **with its body**, and records one click
+(keys 1–7, 0 to skip, U to undo). Labels go to `email_labels` (migration `0036`). Grading is
+unchanged: `labelset export-labels --out labelsets/<name>.csv` writes them to a CSV, and
+`labelset score --labels` grades it with bodies, ledger and fingerprint as before.
+
+Four decisions it encodes:
+
+- **The verdict is never shown.** Not in the response and not in the table — the anchoring
+  argument the CSV was built on. A test serialises the response and asserts it carries no
+  `category`, `verdict`, `confidence` or `evidence`.
+- **Only mail the current rules have never seen.** `HELD_OUT_SINCE` is the day after the rules
+  last changed (2026-09-23), and `HELD_OUT_RULES` is their fingerprint. A test fails when
+  `classify.rs` changes, and `next_candidate` refuses at runtime too, so the window cannot go
+  stale after a revision. Labelling mail outside it is refused with a 404 rather than accepted.
+- **A fixed shuffle, so any prefix is a random sample.** Ordered by SHA-256 of the Gmail id:
+  stopping after ten or after a hundred still leaves an unbiased sample, and the order leaks
+  nothing about the classifier. The target of 40 is a suggestion, not a cap.
+- **The body is fetched on a click, never on a read.** `GET /hunt/labelling` is a database count;
+  the next message comes from `POST /hunt/labelling/next`, keeping the rule that nothing here
+  reads Gmail on a GET. The body is returned and dropped, never stored.
+
 ### Email is optional, and presented as optional — decided 2026-10-19
 
 The owner wants the site usable by people other than themselves, and most of them will never

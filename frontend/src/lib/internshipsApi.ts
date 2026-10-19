@@ -1010,3 +1010,83 @@ export async function getInboxStatus(): Promise<InboxStatus> {
   if (!res.ok) throw new Error(`Could not load inbox status (${res.status})`);
   return res.json();
 }
+
+// ---- Labelling held-out mail (Phase 13b) -------------------------------------------------
+
+/** How far through the held-out mail the labeller is. */
+export type LabellingProgress = {
+  labelled: number;
+  skipped: number;
+  remaining: number;
+  total: number;
+  /** A suggestion, not a cap: the order is shuffled, so stopping anywhere is a random sample. */
+  target: number;
+  /** Mail from this instant on has never been seen by the rules being measured. */
+  since: string;
+};
+
+/**
+ * One message to label. There is deliberately no category here, and the backend has a test that
+ * the response never carries one: a labeller shown the classifier's answer agrees with it.
+ */
+export type LabellingItem = {
+  message_id: string;
+  received_at: string | null;
+  from: string | null;
+  subject: string | null;
+  /** The full text when it could be read; otherwise use `snippet` and say so. */
+  body: string | null;
+  snippet: string | null;
+  gmail_url: string | null;
+};
+
+export const LABEL_CHOICES = [
+  { value: "confirmation", name: "Confirmation", hint: "Your application was received" },
+  { value: "oa", name: "Assessment", hint: "You're given a coding test or online assessment" },
+  { value: "interview", name: "Interview", hint: "An invitation to interview, or scheduling one" },
+  { value: "offer", name: "Offer", hint: "A job offer" },
+  { value: "rejection", name: "Rejection", hint: "They're not moving forward with you" },
+  {
+    value: "outreach",
+    name: "Outreach",
+    hint: "An employer or recruiter writing to you, not about an application you made",
+  },
+  {
+    value: "disregarded",
+    name: "Not job mail",
+    hint: "Job alerts, newsletters, account notices — anything not about you and a job",
+  },
+] as const;
+
+export async function getLabellingProgress(): Promise<LabellingProgress> {
+  const res = await apiFetch("/hunt/labelling");
+  if (!res.ok) throw new Error(`Could not load labelling progress (${res.status})`);
+  return res.json();
+}
+
+/** The next message, with its body. A POST, because the backend reads Gmail to answer it. */
+export async function nextToLabel(): Promise<{
+  item: LabellingItem | null;
+  progress: LabellingProgress;
+}> {
+  const res = await apiFetch("/hunt/labelling/next", { method: "POST" });
+  if (!res.ok) throw new Error(`Could not load the next email (${res.status})`);
+  return res.json();
+}
+
+/** Record a label, or `null` for "could not tell". */
+export async function saveLabel(messageId: string, label: string | null): Promise<void> {
+  const res = await apiFetch(`/hunt/labelling/${encodeURIComponent(messageId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label }),
+  });
+  if (!res.ok) throw new Error(`Could not save that label (${res.status})`);
+}
+
+export async function undoLabel(messageId: string): Promise<void> {
+  const res = await apiFetch(`/hunt/labelling/${encodeURIComponent(messageId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`Could not undo that label (${res.status})`);
+}
