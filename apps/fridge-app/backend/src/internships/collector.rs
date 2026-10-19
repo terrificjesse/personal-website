@@ -485,6 +485,11 @@ struct Upserted {
     created: bool,
 }
 
+/// Sources whose payload carries no company name, so the adapter names the company after the
+/// board slug. See `sources::ashby::parse_job` and `sources::lever`'s module doc, which say so —
+/// if a third source joins them, it belongs here too, or it will overwrite real names again.
+const SLUG_NAMED_SOURCES: &[&str] = &["ashby", "lever"];
+
 /// Insert or merge one posting, and record the sighting.
 ///
 /// # Merging rule: a source that knows something beats a source that does not
@@ -496,6 +501,16 @@ struct Upserted {
 /// accepted knowingly, and the reason it is written here rather than assumed.
 ///
 /// `first_seen_at` is never overwritten: it is our own observation and does not change.
+///
+/// # The company name follows the same rule — since 2026-10-19
+///
+/// It did not. `company_name = excluded.company_name` let whichever source ran last win, and
+/// Ashby and Lever run after Simplify — and carry **no company name at all**, so their adapters
+/// name the company after the board slug. Every collection therefore replaced "Cohere" with
+/// `cohere` and "Heron Power" with `heron-power`: 149 companies on the live listing were shown
+/// under their job-board id, 118 of them on postings Simplify had named correctly the same run.
+/// A source that invents a name from a slug does not know the name, so it no longer overwrites
+/// one; it only fills in where nothing better has been seen.
 async fn upsert_posting(
     pool: &SqlitePool,
     posting: &NormalizedPosting,
@@ -533,7 +548,7 @@ async fn upsert_posting(
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
                    ?22,?23,?24,?25,?25,?25,?25)
          ON CONFLICT (dedup_key) DO UPDATE SET
-             company_name = excluded.company_name,
+             company_name = CASE WHEN ?26 = 1 THEN company_name ELSE excluded.company_name END,
              title = excluded.title,
              canonical_url = excluded.canonical_url,
              term_season = COALESCE(excluded.term_season, term_season),
@@ -597,6 +612,7 @@ async fn upsert_posting(
     .bind(i64::from(estimated))
     .bind(posting.deadline.map(|d| d.to_rfc3339()))
     .bind(now.to_rfc3339())
+    .bind(i64::from(SLUG_NAMED_SOURCES.contains(&posting.source.as_str())))
     .fetch_one(pool)
     .await?;
 
@@ -1336,6 +1352,56 @@ mod integration_tests {
         .fetch_one(pool)
         .await
         .expect("sighting")
+    }
+
+    /// The overwrite that put 149 companies on the listing under their job-board id: Simplify
+    /// names the company, then Ashby — which carries no name and so uses the board slug —
+    /// re-sights the same posting in the same run.
+    #[tokio::test]
+    async fn a_name_invented_from_a_board_slug_never_replaces_a_real_one() {
+        let pool = test_pool().await;
+        let url = "https://jobs.ashbyhq.com/cohere/0b7d5f1e-1111-2222-3333-444455556666";
+        let named = raw("simplify", "s-1", url, "Software Engineer Intern", "Cohere");
+        let slugged = raw("ashby", "a-1", url, "Software Engineer Intern", "cohere");
+        collect_with(
+            &pool,
+            "manual",
+            vec![
+                FakeSource::arc("simplify", SourceFetch::success(vec![named])),
+                FakeSource::arc("ashby", SourceFetch::success(vec![slugged])),
+            ],
+            ctx().await,
+        )
+        .await
+        .expect("collects");
+
+        let names: Vec<String> = sqlx::query_scalar("SELECT company_name FROM internship_postings")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["Cohere".to_string()], "one posting, and the real name kept");
+    }
+
+    /// The other direction still works: a slug fills in until a source that knows the name
+    /// arrives, and then the real name replaces it.
+    #[tokio::test]
+    async fn a_real_name_replaces_a_slug_that_was_there_first() {
+        let pool = test_pool().await;
+        let url = "https://jobs.lever.co/heron-power/0b7d5f1e-1111-2222-3333-444455556666";
+        let slugged = raw("lever", "l-1", url, "Software Engineer Intern", "heron-power");
+        collect_with(&pool, "manual", vec![FakeSource::arc("lever", SourceFetch::success(vec![slugged]))], ctx().await)
+            .await
+            .expect("first run");
+        let named = raw("simplify", "s-1", url, "Software Engineer Intern", "Heron Power");
+        collect_with(&pool, "manual", vec![FakeSource::arc("simplify", SourceFetch::success(vec![named]))], ctx().await)
+            .await
+            .expect("second run");
+
+        let name: String = sqlx::query_scalar("SELECT company_name FROM internship_postings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Heron Power");
     }
 
     #[tokio::test]

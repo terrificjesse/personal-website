@@ -3115,3 +3115,114 @@ mod tests {
         }
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// Presentation: what a reader is shown, as distinct from what is stored
+// ------------------------------------------------------------------------------------------
+
+/// A company name as a reader should see it.
+///
+/// Ashby and Lever carry no company name, so their adapters name the company after the board
+/// slug — `heron-power`, `incident.io`, `leantechniques`. The collector no longer lets that
+/// overwrite a real name (see `collector::SLUG_NAMED_SOURCES`), but a company only ever seen on
+/// one of those boards has nothing better, and on 2026-10-19 that was 135 companies on the live
+/// listing. A name with no capital letter at all is a slug in practice; it is shown with its
+/// separators as spaces and each word capitalised. Anything with a capital is left exactly as
+/// the source wrote it. Display only — the stored name and every key derived from it are
+/// untouched, so dedup and company matching cannot shift.
+pub fn display_company_name(name: &str) -> String {
+    if name.chars().any(char::is_uppercase) || !name.chars().any(char::is_alphabetic) {
+        return name.to_string();
+    }
+    name.split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The first instant after a term is over.
+///
+/// **Winter is read leniently**: "Winter 2026" is used both for January–March 2026 and for the
+/// winter that *starts* in December 2026, so it is only treated as over once the later reading
+/// would be. A contradiction is only worth acting on when it is provable.
+fn term_ends(season: Season, year: i64) -> Option<DateTime<Utc>> {
+    let year = i32::try_from(year).ok()?;
+    let (y, m) = match season {
+        Season::Spring => (year, 6),
+        Season::Summer => (year, 9),
+        Season::Fall => (year + 1, 1),
+        Season::Winter => (year + 1, 4),
+    };
+    NaiveDate::from_ymd_opt(y, m, 1).map(|date| date.and_hms_opt(0, 0, 0).unwrap().and_utc())
+}
+
+/// Whether a stated term had already ended before the posting existed — which no real posting
+/// can do, so the term's year is wrong.
+///
+/// # Why this exists
+///
+/// Simplify's own data carries it. On 2026-10-19 its *Summer 2027* list held 465 live listings
+/// tagged "Summer 2026" and 367 tagged "Fall 2026", many posted in September and October 2026 —
+/// Cboe's "Software Engineer Intern - Web", posted 2026-10-14, among them. A summer that ended
+/// in August cannot be the term of a job posted in October. These are real, open postings with
+/// a wrong year, and showing "Summer 2026" on them misleads every reader who filters by term.
+///
+/// `existed_since` is the earliest date the posting is known to have existed: a stated posted
+/// date when there is one, our first sighting otherwise.
+pub fn term_contradicts_posting(
+    season: Option<Season>,
+    year: Option<i64>,
+    existed_since: DateTime<Utc>,
+) -> bool {
+    match (season, year) {
+        (Some(season), Some(year)) => term_ends(season, year).is_some_and(|end| existed_since >= end),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    fn at(date: &str) -> DateTime<Utc> {
+        NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc()
+    }
+
+    #[test]
+    fn a_slug_is_shown_as_a_name_and_a_real_name_is_left_alone() {
+        assert_eq!(display_company_name("heron-power"), "Heron Power");
+        assert_eq!(display_company_name("allen-control-systems"), "Allen Control Systems");
+        assert_eq!(display_company_name("incident.io"), "Incident.io");
+        assert_eq!(display_company_name("Cohere"), "Cohere");
+        assert_eq!(display_company_name("xAI"), "xAI", "any capital means the source chose it");
+        assert_eq!(display_company_name("3M"), "3M");
+    }
+
+    /// The live case: posted in October, tagged with a summer that ended in August.
+    #[test]
+    fn a_term_that_ended_before_the_posting_existed_is_contradicted() {
+        assert!(term_contradicts_posting(Some(Season::Summer), Some(2026), at("2026-10-14")));
+        assert!(term_contradicts_posting(Some(Season::Spring), Some(2026), at("2026-10-01")));
+    }
+
+    /// Only provable contradictions. A term still running, a future one, an ambiguous winter, or
+    /// a posting from before the term ended are all left as the source stated them.
+    #[test]
+    fn a_term_that_could_still_be_true_is_left_alone() {
+        assert!(!term_contradicts_posting(Some(Season::Summer), Some(2026), at("2026-04-01")),
+            "posted in spring for that summer");
+        assert!(!term_contradicts_posting(Some(Season::Fall), Some(2026), at("2026-10-14")),
+            "fall 2026 is still running in october");
+        assert!(!term_contradicts_posting(Some(Season::Winter), Some(2026), at("2026-10-14")),
+            "winter 2026 may mean the winter starting in december");
+        assert!(!term_contradicts_posting(Some(Season::Summer), Some(2027), at("2026-10-14")));
+        assert!(!term_contradicts_posting(Some(Season::Summer), None, at("2026-10-14")));
+    }
+}

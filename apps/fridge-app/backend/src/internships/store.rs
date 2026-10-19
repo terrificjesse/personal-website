@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use crate::internships::normalize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 
@@ -186,7 +187,28 @@ pub async fn load_live_postings(pool: &SqlitePool, source: Option<&str>) -> Resu
         .await?
         .into_iter()
         .map(PostingRow::into_posting)
+        .map(as_presented)
         .collect())
+}
+
+/// What the listing shows, as distinct from what is stored. Applied on the read path so the
+/// ranking, the filters and the response all see the same thing, and the stored row — and every
+/// key derived from it — is never rewritten by a presentation rule.
+///
+/// - A company known only by a board slug is shown as a name (`heron-power` → "Heron Power").
+/// - A term that ended before the posting existed loses its **year**: Simplify tags hundreds of
+///   October postings "Summer 2026". The season is kept, because the year is the part that is
+///   provably wrong and "Summer" is still what a reader filters by.
+fn as_presented(mut posting: Posting) -> Posting {
+    posting.company_name = normalize::display_company_name(&posting.company_name);
+    let existed_since = match posting.posted_at {
+        Some(posted) if !posting.posted_at_is_estimated => posted.min(posting.first_seen_at),
+        _ => posting.first_seen_at,
+    };
+    if normalize::term_contradicts_posting(posting.term_season, posting.term_year, existed_since) {
+        posting.term_year = None;
+    }
+    posting
 }
 
 /// Every company's derived signals, keyed by `company_key` for `rank_postings`.
@@ -546,6 +568,12 @@ mod rank_probe {
         );
         let top: usize = std::env::var("RANK_PROBE_TOP").ok().and_then(|n| n.parse().ok()).unwrap_or(40);
         println!("live {}  ranked {}", postings.len(), ranked.len());
+        let ended_terms = postings
+            .iter()
+            .filter(|p| p.term_year.is_some_and(|y| y < 2026 || (y == 2026 && matches!(p.term_season, Some(crate::internships::models::Season::Summer | crate::internships::models::Season::Spring)))))
+            .count();
+        let lowercase = postings.iter().filter(|p| !p.company_name.chars().any(char::is_uppercase)).count();
+        println!("as presented: {ended_terms} still show an ended spring/summer-2026 term, {lowercase} show an all-lowercase company name");
         for (i, r) in ranked.iter().take(top).enumerate() {
             let p = &r.posting;
             let term = format!(
