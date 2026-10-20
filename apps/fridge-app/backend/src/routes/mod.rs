@@ -21,6 +21,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use sqlx::SqlitePool;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::GoogleOAuthConfig;
@@ -254,7 +255,13 @@ pub fn build_router(state: AppState) -> Router {
             "/hunt/resume-variants/{id}",
             patch(hunt::edit_variant).delete(hunt::delete_variant),
         )
-        .route("/internships", get(internships::list_postings))
+        // Gzipped, and the only route that is. It is public and was the one large response
+        // (3.5 MB of JSON before paging); compressing secret-bearing per-user responses is a
+        // BREACH-shaped risk for no measured gain. `docs/INTERNSHIPS.md`, "Pages of rows".
+        .route(
+            "/internships",
+            get(internships::list_postings).layer(CompressionLayer::new()),
+        )
         .route("/internships/sources", get(internships::list_sources))
         .route("/internships/collect", post(internships::collect_now))
         .route("/internships/runs", get(internships::run_health))

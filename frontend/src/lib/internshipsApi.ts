@@ -107,7 +107,7 @@ export type RankedInternship = {
   score: number;
   /** Exposed so the UI can explain a ranking rather than asking anyone to trust it. */
   breakdown: InternshipScoreBreakdown;
-  /** Always present, usually empty. `returned` counts these too; `postings.length` counts rows. */
+  /** Always present, usually empty. `returned` counts these too; `total_rows` counts rows. */
   other_openings: InternshipOpening[];
 };
 
@@ -170,8 +170,17 @@ export type ListInternshipsResponse = {
    * indistinguishable — which is exactly the ambiguity this tab exists to remove.
    */
   total_live: number;
+  /** Matching postings before folding, across every page. */
   returned: number;
+  /**
+   * Matching rows after folding, across every page. There is more to fetch while
+   * `offset + postings.length < total_rows`. Contract: `docs/INTERNSHIPS.md`, "Pages of rows".
+   */
+  total_rows: number;
+  offset: number;
+  limit: number;
   sort: InternshipSort;
+  /** This page's rows only. */
   postings: RankedInternship[];
   /** Set while a collection is running, so a thin list can explain itself. */
   collection: RunProgress | null;
@@ -257,10 +266,16 @@ export function internshipFiltersFromSearchParams(
   };
 }
 
+/** A page of rows. Not part of `InternshipFilters`: the URL holds the filters, not the scroll. */
+export type InternshipPage = { offset?: number; limit?: number };
+
 export async function listInternships(
   filters: InternshipFilters = {},
+  page: InternshipPage = {},
 ): Promise<ListInternshipsResponse> {
   const params = internshipFiltersToSearchParams(filters);
+  if (page.offset !== undefined) params.set("offset", String(page.offset));
+  if (page.limit !== undefined) params.set("limit", String(page.limit));
   const query = params.size > 0 ? `?${params.toString()}` : "";
   const res = await apiFetch(`/internships${query}`);
   if (!res.ok) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { PostingCard } from "./PostingCard";
@@ -99,6 +99,14 @@ function InternshipsPageContent() {
   const [trackingId, setTrackingId] = useState<string | null>(null);
   const [trackedIds, setTrackedIds] = useState<Set<string>>(new Set());
   const [refreshVersion, setRefreshVersion] = useState(0);
+  // Rows the server has handed over so far: the next page's offset. Not `data.postings.length`,
+  // which is after de-duplication and would re-request the same page forever if a whole page
+  // turned out to be rows already shown.
+  const [nextOffset, setNextOffset] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Bumped whenever the first page is re-requested. A "Show more" response that comes back
+  // after the filters changed belongs to the old list and must not be appended to the new one.
+  const listGeneration = useRef(0);
   // `undefined` until `/auth/me` answers, then the user or `null`. Three states, not two:
   // while it is unknown, neither the personal panels nor "Sign in to track" are shown.
   const [viewer, setViewer] = useState<AuthenticatedUser | null | undefined>(undefined);
@@ -113,12 +121,14 @@ function InternshipsPageContent() {
   // the list showing results for filters the user has already moved on from.
   useEffect(() => {
     let cancelled = false;
+    listGeneration.current += 1;
 
     (async () => {
       try {
         const result = await listInternships(filters);
         if (cancelled) return;
         setData(result);
+        setNextOffset(result.postings.length);
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -175,6 +185,36 @@ function InternshipsPageContent() {
     );
     const query = next.toString();
     router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  };
+
+  // The listing is paged (50 rows by default; `docs/INTERNSHIPS.md`, "Pages of rows"). Each
+  // page is ranked from scratch, so a collection landing between two requests can move a row
+  // across the boundary. Appended rows are de-duplicated by id; a row skipped that way comes
+  // back on the next filter change.
+  const loadMore = async () => {
+    const generation = listGeneration.current;
+    setLoadingMore(true);
+    try {
+      const page = await listInternships(filters, { offset: nextOffset });
+      if (generation !== listGeneration.current) return;
+      setData((current) => {
+        if (!current) return page;
+        const shown = new Set(current.postings.map((row) => row.posting.id));
+        const fresh = page.postings.filter((row) => !shown.has(row.posting.id));
+        return { ...page, offset: 0, postings: [...current.postings, ...fresh] };
+      });
+      setNextOffset((offset) => offset + page.postings.length);
+    } catch (err) {
+      if (generation !== listGeneration.current) return;
+      setError(
+        handleApiError(
+          err,
+          err instanceof Error ? err.message : "Couldn't load more postings.",
+        ),
+      );
+    } finally {
+      setLoadingMore(false);
+    }
   };
 
   const track = async (postingId: string) => {
@@ -377,8 +417,11 @@ function InternshipsPageContent() {
         ) : data ? (
           <>
             <p className="text-sm text-black/60 dark:text-white/60">
-              Showing {data.returned} of {data.total_live} open posting
-              {data.total_live === 1 ? "" : "s"}
+              {data.returned.toLocaleString()} of {data.total_live.toLocaleString()} open posting
+              {data.total_live === 1 ? "" : "s"} match
+              {/* Said only when it differs, so nobody wonders why the counts below disagree. */}
+              {data.total_rows !== data.returned &&
+                `, grouped into ${data.total_rows.toLocaleString()} rows`}
             </p>
 
             {data.postings.length === 0 ? (
@@ -409,6 +452,25 @@ function InternshipsPageContent() {
                   />
                 ))}
               </ul>
+            )}
+
+            {data.postings.length > 0 && (
+              <div className="mt-4 flex items-center gap-4 text-sm text-black/60 dark:text-white/60">
+                <span>
+                  Showing {data.postings.length.toLocaleString()} of{" "}
+                  {data.total_rows.toLocaleString()}
+                </span>
+                {nextOffset < data.total_rows && (
+                  <button
+                    type="button"
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="rounded border border-black/15 dark:border-white/20 px-3 py-1 text-black dark:text-white disabled:opacity-50"
+                  >
+                    {loadingMore ? "Loading…" : "Show more"}
+                  </button>
+                )}
+              </div>
             )}
           </>
         ) : null}

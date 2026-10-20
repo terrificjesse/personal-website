@@ -997,7 +997,21 @@ pub struct ListPostingsQuery {
     /// Applied in SQL against `posting_sightings`, not in `rank` — a deduped posting can be
     /// carried by several sources, so "which source" is a property of the sighting.
     pub source: Option<String>,
+
+    /// Rows per page, `1..=MAX_PAGE_ROWS`, default `DEFAULT_PAGE_ROWS`. Rows, not postings: a
+    /// page never splits a folded row. Contract: `docs/INTERNSHIPS.md`, "Pages of rows".
+    pub limit: Option<usize>,
+    /// Rows to skip. Past the end is an empty page, not an error.
+    pub offset: Option<usize>,
 }
+
+/// Rows in a page when the request does not say. There is no unpaginated mode: the listing is
+/// public, and the whole corpus was 3.5 MB of JSON when this went in (2026-10-20).
+pub const DEFAULT_PAGE_ROWS: usize = 50;
+
+/// The largest page a request may ask for. Above it is a 400, not a clamp, so a client asking
+/// for more than it gets finds out rather than silently paging wrong.
+pub const MAX_PAGE_ROWS: usize = 200;
 
 /// Parses an `OnUnknown` policy, defaulting to `Keep`.
 ///
@@ -1031,8 +1045,15 @@ pub struct ListPostingsResponse {
     /// UI say "12 of 1,881" rather than leaving an empty list ambiguous between "nothing
     /// matched" and "nothing collected yet".
     pub total_live: usize,
+    /// Matching postings before folding, across every page.
     pub returned: usize,
+    /// Matching rows after folding, across every page. There is more to fetch while
+    /// `offset + postings.len() < total_rows`.
+    pub total_rows: usize,
+    pub offset: usize,
+    pub limit: usize,
     pub sort: String,
+    /// This page's rows only.
     pub postings: Vec<RankedPosting>,
     /// Set while a collection is running, so an empty or partial list can say why.
     pub collection: Option<RunProgress>,
@@ -1055,6 +1076,12 @@ pub async fn list_postings(
         None => SortBy::Composite,
         Some(raw) => SortBy::parse(raw).ok_or(StatusCode::BAD_REQUEST)?,
     };
+
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_ROWS);
+    if !(1..=MAX_PAGE_ROWS).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let offset = params.offset.unwrap_or(0);
 
     let term = match (params.term_season.as_deref(), params.term_year) {
         (None, None) => None,
@@ -1136,12 +1163,19 @@ pub async fn list_postings(
     // like against `total_live`. The row count is `postings.len()`. See `group_openings`.
     let matched = ranked.len();
     let rows = group_openings(ranked);
+    let total_rows = rows.len();
+    // Paged after ranking and folding, never before: the order is a property of the whole
+    // corpus, so ranking one page's worth would rank the wrong postings.
+    let page: Vec<RankedPosting> = rows.into_iter().skip(offset).take(limit).collect();
 
     Ok(Json(ListPostingsResponse {
         total_live,
         returned: matched,
+        total_rows,
+        offset,
+        limit,
         sort: sort.as_str().to_string(),
-        postings: rows,
+        postings: page,
         collection: current_progress(&pool).await?,
     }))
 }
@@ -1508,6 +1542,102 @@ mod handler_tests {
         assert_eq!(body.returned, 0);
         assert_eq!(body.total_live, 1, "the denominator must survive filtering");
         assert_eq!(body.sort, "composite");
+    }
+
+    // --- the ranked list: pages ---
+
+    /// Like `posting`, but in its own city, so `group_openings` keeps every one a separate row.
+    async fn posting_in_own_city(pool: &SqlitePool, id: &str) {
+        posting(pool, id).await;
+        sqlx::query("UPDATE internship_postings SET location_raw = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(format!("City {id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn page(pool: &SqlitePool, offset: Option<usize>, limit: Option<usize>) -> ListPostingsResponse {
+        let query = ListPostingsQuery { offset, limit, ..Default::default() };
+        list_postings(State(pool.clone()), Query(query)).await.unwrap().0
+    }
+
+    fn ids(body: &ListPostingsResponse) -> Vec<String> {
+        body.postings.iter().map(|row| row.posting.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn pages_concatenate_to_the_whole_list_with_no_row_twice() {
+        let pool = pool().await;
+        for n in 0..7 {
+            posting_in_own_city(&pool, &format!("p{n}")).await;
+        }
+        let whole = page(&pool, None, Some(MAX_PAGE_ROWS)).await;
+        assert_eq!(whole.total_rows, 7);
+
+        let mut paged = Vec::new();
+        for offset in [0, 3, 6] {
+            let body = page(&pool, Some(offset), Some(3)).await;
+            assert_eq!((body.offset, body.limit, body.total_rows), (offset, 3, 7));
+            assert_eq!(body.returned, 7, "`returned` counts every page, not this one");
+            paged.extend(ids(&body));
+        }
+        assert_eq!(paged, ids(&whole), "same rows, same order, each exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_page_never_splits_a_folded_row() {
+        // `limit` counts rows. Three requisitions of one job are one row, so a page of one row
+        // carries all three, and the second page starts at the next job.
+        let pool = pool().await;
+        for id in ["same-1", "same-2", "same-3"] {
+            posting(&pool, id).await;
+        }
+        posting_in_own_city(&pool, "other").await;
+
+        let first = page(&pool, Some(0), Some(1)).await;
+        let second = page(&pool, Some(1), Some(1)).await;
+        assert_eq!((first.total_rows, first.returned), (2, 4), "4 postings, 2 rows");
+
+        let rows: Vec<&RankedPosting> = first.postings.iter().chain(&second.postings).collect();
+        assert_eq!(rows.len(), 2, "one row per page");
+        let job = rows
+            .iter()
+            .find(|row| row.posting.id.starts_with("same-"))
+            .expect("the folded job is on one of the two pages");
+        assert_eq!(job.other_openings.len(), 2, "all three requisitions arrive together");
+    }
+
+    #[tokio::test]
+    async fn no_limit_means_one_default_page_not_the_whole_corpus() {
+        let pool = pool().await;
+        for n in 0..(DEFAULT_PAGE_ROWS + 5) {
+            posting_in_own_city(&pool, &format!("p{n}")).await;
+        }
+        let body = page(&pool, None, None).await;
+        assert_eq!(body.postings.len(), DEFAULT_PAGE_ROWS);
+        assert_eq!(body.limit, DEFAULT_PAGE_ROWS);
+        assert_eq!(body.total_rows, DEFAULT_PAGE_ROWS + 5);
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_is_an_empty_page_not_an_error() {
+        // The list can shrink between two page loads when a collection expires postings.
+        let pool = pool().await;
+        posting_in_own_city(&pool, "p1").await;
+        let body = page(&pool, Some(40), Some(10)).await;
+        assert!(body.postings.is_empty());
+        assert_eq!(body.total_rows, 1, "the total still says how much there is");
+    }
+
+    #[tokio::test]
+    async fn a_page_size_out_of_range_is_rejected_rather_than_clamped() {
+        let pool = pool().await;
+        for limit in [0, MAX_PAGE_ROWS + 1] {
+            let query = ListPostingsQuery { limit: Some(limit), ..Default::default() };
+            let result = list_postings(State(pool.clone()), Query(query)).await;
+            assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST), "limit={limit}");
+        }
     }
 
     // --- run health ---

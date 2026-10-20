@@ -345,10 +345,78 @@ before mounting any personal panel. Each of them 401s when signed out, and `useA
 off a public page. A signed-out visitor gets the list, the filters, the apply links and a
 "Sign in to track" link where "I applied" would be.
 
-**Known cost: the response is not paginated or compressed.** At 2,927 live postings, the
-unfiltered default is 3.5 MB of JSON and 2,690-odd rendered cards. `tower-http` here has only
-the `cors` feature, and gzip would bring that to about 445 KB. Fine on localhost, but not for a
-public page on a phone.
+The first public version was not paginated or compressed: at 2,927 live postings the default
+response was 3.5 MB of JSON and 2,690-odd rendered cards. Both were fixed the next day; see
+the next section.
+
+### Pages of rows, gzipped — contract, 2026-10-20
+
+The owner approved both fixes on 2026-10-20: paginate the listing, and add `tower-http`'s
+`compression-gzip` feature. That second one is a dependency change, which is why it needed asking.
+
+**Request.** Two new query parameters on `GET /internships`, both optional:
+
+| Param | Default | Legal | Otherwise |
+|---|---|---|---|
+| `limit` | `50` | `1..=200` | **400** |
+| `offset` | `0` | any `usize` | an offset past the end is a **200** with an empty `postings` |
+
+Both count **rows**, meaning postings after `group_openings` has folded them, so a page boundary
+never splits a folded row. A `limit` outside the range is a 400, not a clamp, for the same reason
+as `pay_unknown=dorp`. An offset past the end is not an error: the list can shrink between two
+page loads when a collection expires postings, and "nothing more" is the true answer then.
+
+**There is no unpaginated mode.** Omitting `limit` gives 50 rows. An endpoint anyone can call
+should not hand out the whole corpus in one request by default.
+
+**Response.** Additive, so nothing existing changes meaning:
+
+```
+total_live   unchanged: live postings before filtering
+returned     unchanged: matching postings, before folding, across ALL pages
+total_rows   NEW: matching rows after folding, across all pages (what "Show more" counts to)
+offset       NEW: the offset applied
+limit        NEW: the limit applied
+postings     now just this page's rows: total_rows[offset .. offset + limit]
+```
+
+There are more rows to fetch while `offset + postings.length < total_rows`.
+
+**Why offset, not a cursor.** Every request ranks the whole live corpus from scratch, which
+takes milliseconds at this size, and the order is deterministic. `rank_postings` breaks ties on
+posting id, and folding keeps first-seen order, so the same corpus at the same moment always
+pages the same way. A cursor would add state for nothing.
+
+What offset paging cannot prevent is the corpus changing between two requests. A collection
+finishing, or the recency score drifting past a tie, can shift a row across a page boundary, so
+it shows up twice or not at all. The client de-duplicates appended rows by posting id. A
+skipped row is the accepted cost; refreshing the filters re-ranks from the top.
+
+**Compression** is on the listing route only (`routes/mod.rs`), not router-wide. That route is
+the one measured as large; everything else here is a few KB. Compressing responses that are
+both per-user and carry secrets (the extension token, the inbox) is a BREACH-shaped risk for no
+measured gain. `tower-http`'s default predicate already skips bodies under 32 bytes, SSE and
+images.
+
+**Measured on 2026-10-20** against 2,936 live postings (2,698 rows):
+
+| | Before | After |
+|---|---|---|
+| Default response, on the wire | 3,548,550 B | 9,165 B (gzip), 65,323 B of JSON |
+| Largest page (`limit=200`), on the wire | n/a | 34,502 B |
+| Cards rendered on first load | ~2,690 | 50 |
+
+Walking every page at `limit=200` returns 2,698 rows, each exactly once, which equals
+`total_rows`. `GET /internships/sources` and every other route answer without
+`Content-Encoding`, and a client that does not offer gzip gets plain JSON.
+
+**A finding this turned up, not yet acted on.** Thirty-four apply URLs are shared by 68 live
+postings. Folding already merges most of those, because they are the same title and city
+differing only in term. Thirteen URLs still end up as two rows each, because the titles or
+locations differ slightly: for example Google's "Forward Deployed Engineer Intern" (NYC;
+Sunnyvale) and "Forward Deployed Engineering Intern" (Sunnyvale), which share one apply link.
+That is 13 extra rows in 2,698, one of them in the top 100. Folding on `canonical_url` as
+well would close it, on the read path, like `group_openings` itself.
 
 ### Openings are folded into one row — contract, 2026-10-19
 
