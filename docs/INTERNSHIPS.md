@@ -326,6 +326,48 @@ policy value is a **400**, not a silent fallback — same reasoning as the blog'
 The response carries `total_live` alongside `returned`, so the UI can say "12 of 1,881" rather
 than leaving an empty list ambiguous between "nothing matched" and "nothing collected yet".
 
+### Openings are folded into one row — contract, 2026-10-19
+
+The live listing showed the same job as several identical rows: Palo Alto Networks had three
+"Software Engineer Intern — California" postings, and Apple's "SoC Machine Learning Software
+Engineer Intern" appeared twice in the default top twelve. They are not dedup failures. Each is a separate requisition
+with its own apply link (`JR-011589`, `JR-011570`, …), and the dedup key — the canonical ATS
+triple, § C of `INTERNSHIP_SCRAPING.md` — is right to keep them apart. They are noise to a
+reader, which is a presentation problem, so it is solved in presentation.
+
+Harvey's "Software Engineering Intern (Summer 2027)" at #4 and #5 looks like the same case in
+a narrow column and is not: one is New York, the other San Francisco. Those stay two rows, by
+the rule below — and that was nearly cited as the motivating example before anyone checked.
+
+**The rule.** Postings with the same `company_key`, the same title once case, punctuation and
+term words (`summer`, `fall`, `winter`, `spring`, any four-digit year) are ignored, and the same
+location once case and punctuation are ignored, are one row. **Different cities stay separate
+rows**, so a location filter keeps meaning what it says. Grouping runs *after* filtering and
+ranking: the row's representative is its highest-ranked member, and the row sits where that
+member ranked.
+
+**The response shape — additive, no field removed or renamed:**
+
+```ts
+type RankedInternship = {
+  posting: InternshipPosting;      // the representative
+  score: number;
+  breakdown: InternshipScoreBreakdown;
+  other_openings: InternshipOpening[];   // NEW. Always present; [] for most rows.
+};
+type InternshipOpening = {
+  id: string;
+  title: string;
+  canonical_url: string;
+  location_raw: string | null;
+};
+```
+
+`returned` **still counts matching postings**, not rows — `returned = Σ (1 + other_openings.length)`
+over `postings` — so "12 of 1,881" keeps comparing like with like against `total_live`.
+`postings.length` is the row count. A tracked application may point at any member of a row, so
+the client checks the representative *and* every `other_openings[].id` before saying "tracked".
+
 `source` is applied **in SQL against `posting_sightings`**, not in `rank`: a deduped posting can
 be carried by several sources, so "which source" is a property of the sighting.
 

@@ -352,7 +352,11 @@ function InternshipsPageContent() {
                     ranked={ranked}
                     onTrack={track}
                     tracking={trackingId === ranked.posting.id}
-                    tracked={trackedIds.has(ranked.posting.id)}
+                    tracked={
+                      // A tracked application may point at any opening in a folded row.
+                      trackedIds.has(ranked.posting.id) ||
+                      ranked.other_openings.some((opening) => trackedIds.has(opening.id))
+                    }
                   />
                 ))}
               </ul>

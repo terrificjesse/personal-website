@@ -107,7 +107,7 @@ export function PostingCard({
         </p>
       )}
 
-      <div className="mt-3 flex items-center gap-3">
+      <div className="mt-3 flex flex-wrap items-center gap-3">
         <a
           href={posting.canonical_url}
           target="_blank"
@@ -116,6 +116,33 @@ export function PostingCard({
         >
           View posting
         </a>
+        {/* The same role in the same place, posted as separate requisitions. Every link is kept:
+            they are distinct postings, folded into one row only because a reader could not
+            tell them apart. */}
+        {ranked.other_openings.length > 0 && (
+          <details className="text-sm">
+            <summary className="cursor-pointer text-black/70 dark:text-white/70">
+              +{ranked.other_openings.length} more{" "}
+              {ranked.other_openings.length === 1 ? "opening" : "openings"}
+            </summary>
+            <ul className="mt-1 space-y-0.5 pl-4">
+              {ranked.other_openings.map((opening, index) => (
+                <li key={opening.id}>
+                  <a
+                    href={opening.canonical_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline underline-offset-4"
+                  >
+                    {/* Folded openings usually share the title exactly, so a list of identical
+                        titles would tell the reader nothing. Number those instead. */}
+                    {opening.title === posting.title ? `Opening ${index + 2}` : opening.title}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         <button
           type="button"
           onClick={() => onTrack(posting.id)}

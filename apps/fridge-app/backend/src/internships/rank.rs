@@ -627,6 +627,19 @@ pub struct RankedPosting {
     /// On `SCORE_MIN..=SCORE_MAX`, because the weights sum to 1.0.
     pub score: f64,
     pub breakdown: ScoreBreakdown,
+    /// Other requisitions folded into this row by [`group_openings`]. Always serialised — the
+    /// client is told "always present, usually empty" rather than having to guess.
+    pub other_openings: Vec<Opening>,
+}
+
+/// Another opening shown in a row rather than as a row: same company, same role, same place,
+/// separate requisition with its own apply link.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Opening {
+    pub id: String,
+    pub title: String,
+    pub canonical_url: String,
+    pub location_raw: Option<String>,
 }
 
 // ------------------------------------------------------------------------------------------
@@ -852,7 +865,84 @@ pub fn score_posting(
         posting: posting.clone(),
         score: breakdown.total(),
         breakdown,
+        other_openings: Vec::new(),
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// Folding openings into rows
+// ------------------------------------------------------------------------------------------
+
+/// Fold postings that a reader cannot tell apart into one row.
+///
+/// # Why
+///
+/// The live listing showed the same job as several identical rows: three Palo Alto Networks
+/// "Software Engineer Intern — California" postings, and Apple's "SoC Machine Learning Software
+/// Engineer Intern" twice in the top twelve on 2026-10-19. They are not dedup failures — each is its own requisition with its own apply link,
+/// and the dedup key is right to keep them apart (§ C of `INTERNSHIP_SCRAPING.md`). They are noise
+/// to a reader, so this is presentation, and it runs after ranking rather than inside it.
+///
+/// # The rule, and what it deliberately does not merge
+///
+/// Same `company_key`, same title once case, punctuation and term words are ignored, and same
+/// location once case and punctuation are ignored. **Different cities stay separate rows**, so a
+/// location filter keeps meaning what it says, and "Software Engineer" and "Software
+/// Engineering" stay apart — a merge that is wrong hides a job, which costs more than a row that
+/// could have been merged.
+///
+/// Input order is preserved: the first member of a group is its representative, which, given
+/// [`rank_postings`]'s output, is its highest-ranked member, and the row sits where it ranked.
+/// Contract: `docs/INTERNSHIPS.md`, "Openings are folded into one row".
+pub fn group_openings(ranked: Vec<RankedPosting>) -> Vec<RankedPosting> {
+    let mut row_of: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut rows: Vec<RankedPosting> = Vec::new();
+    for ranked in ranked {
+        let key = opening_key(&ranked.posting);
+        match row_of.get(&key) {
+            Some(&row) => rows[row].other_openings.push(Opening {
+                id: ranked.posting.id.clone(),
+                title: ranked.posting.title.clone(),
+                canonical_url: ranked.posting.canonical_url.clone(),
+                location_raw: ranked.posting.location.raw.clone(),
+            }),
+            None => {
+                row_of.insert(key, rows.len());
+                rows.push(ranked);
+            }
+        }
+    }
+    rows
+}
+
+fn opening_key(posting: &Posting) -> (String, String, String) {
+    (posting.company_key.clone(), title_key(&posting.title), plain_words(posting.location.raw.as_deref().unwrap_or("")))
+}
+
+/// Lowercase alphanumeric words, single-spaced.
+fn plain_words(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A season, or a four-digit year: a word that says when, not what.
+fn is_term_word(word: &str) -> bool {
+    let season = matches!(word, "summer" | "fall" | "autumn" | "winter" | "spring");
+    let year = word.len() == 4 && word.chars().all(|c| c.is_ascii_digit());
+    season || year
+}
+
+/// A title with the words that name *when* rather than *what* removed: "Software Engineering
+/// Intern (Summer 2027)" and "Software Engineering Intern" are one role.
+fn title_key(title: &str) -> String {
+    plain_words(title)
+        .split(' ')
+        .filter(|word| !is_term_word(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1153,6 +1243,72 @@ mod tests {
 
     fn filters_admit(posting: &Posting, grad_year: i64, on_unknown: OnUnknown) -> bool {
         class_year_filter(grad_year, on_unknown).admits(posting)
+    }
+
+    fn opening(id: &str, title: &str, city: &str) -> Posting {
+        let mut posting = blank(id);
+        posting.title = title.to_string();
+        posting.location.raw = Some(city.to_string());
+        posting
+    }
+
+    /// The live case: Palo Alto Networks' three requisitions for one role in one place, and
+    /// Apple's duplicate in the default top twelve.
+    #[test]
+    fn identical_openings_fold_into_one_row_led_by_the_highest_ranked() {
+        let ranked = rank(&[
+            opening("a", "Software Engineering Intern (Summer 2027)", "San Francisco, CA"),
+            opening("b", "Software Engineering Intern (Summer 2027)", "San Francisco, CA"),
+            opening("c", "Software Engineering Intern (Summer 2027)", "San Francisco, CA"),
+        ]);
+        let lead = ranked[0].posting.id.clone();
+        let rows = group_openings(ranked);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].posting.id, lead, "the representative is the first-ranked member");
+        assert_eq!(rows[0].other_openings.len(), 2);
+    }
+
+    /// Words naming *when* do not make a different role.
+    #[test]
+    fn a_title_that_differs_only_by_term_is_the_same_role() {
+        let rows = group_openings(rank(&[
+            opening("a", "Software Engineer Intern - Summer 2027", "NYC"),
+            opening("b", "Software Engineer Intern", "NYC"),
+        ]));
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// What must NOT fold. A wrong merge hides a job; a missed one only costs a row.
+    ///
+    /// Harvey's "Software Engineering Intern (Summer 2027)" sits at #4 and #5 of the live listing
+    /// and looks like a duplicate in a narrow column. It is New York and San Francisco. Two rows
+    /// is the rule working, which is the reason this test exists.
+    #[test]
+    fn different_cities_and_different_roles_stay_separate_rows() {
+        let rows = group_openings(rank(&[
+            opening("a", "Software Engineer Intern", "Seattle, WA"),
+            opening("b", "Software Engineer Intern", "New York, NY"),
+            opening("c", "Software Engineering Intern", "Seattle, WA"),
+            opening("d", "Data Engineer Intern", "Seattle, WA"),
+        ]));
+        assert_eq!(rows.len(), 4, "another city, or another word in the role, is another row");
+        assert!(rows.iter().all(|row| row.other_openings.is_empty()));
+    }
+
+    /// Folding never loses a posting: every one is either a row or listed inside one. This is
+    /// what lets `returned` keep counting postings while `postings` holds rows.
+    #[test]
+    fn folding_accounts_for_every_posting() {
+        let postings = vec![
+            opening("a", "SWE Intern", "Austin, TX"),
+            opening("b", "SWE Intern", "Austin, TX"),
+            opening("c", "SWE Intern", "Boston, MA"),
+            opening("d", "PM Intern", "Austin, TX"),
+        ];
+        let rows = group_openings(rank(&postings));
+        let accounted: usize = rows.iter().map(|row| 1 + row.other_openings.len()).sum();
+        assert_eq!(accounted, postings.len());
+        assert_eq!(rows.len(), 3);
     }
 
     fn rank(postings: &[Posting]) -> Vec<RankedPosting> {

@@ -91,11 +91,24 @@ export type InternshipScoreBreakdown = {
   prestige: InternshipInputScore;
 };
 
+/**
+ * Another requisition folded into a row: same company, same role, same place, its own apply
+ * link. Contract: `docs/INTERNSHIPS.md`, "Openings are folded into one row".
+ */
+export type InternshipOpening = {
+  id: string;
+  title: string;
+  canonical_url: string;
+  location_raw: string | null;
+};
+
 export type RankedInternship = {
   posting: InternshipPosting;
   score: number;
   /** Exposed so the UI can explain a ranking rather than asking anyone to trust it. */
   breakdown: InternshipScoreBreakdown;
+  /** Always present, usually empty. `returned` counts these too; `postings.length` counts rows. */
+  other_openings: InternshipOpening[];
 };
 
 export type InternshipSort =

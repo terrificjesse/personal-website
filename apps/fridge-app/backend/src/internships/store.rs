@@ -547,7 +547,7 @@ mod tests {
 #[cfg(test)]
 mod rank_probe {
     use super::*;
-    use crate::internships::rank::{InternshipFilters, SortBy, rank_postings};
+    use crate::internships::rank::{InternshipFilters, SortBy, group_openings, rank_postings};
 
     #[tokio::test]
     #[ignore = "reads a copy of the live database named by RANK_PROBE_DB"]
@@ -574,6 +574,10 @@ mod rank_probe {
             .count();
         let lowercase = postings.iter().filter(|p| !p.company_name.chars().any(char::is_uppercase)).count();
         println!("as presented: {ended_terms} still show an ended spring/summer-2026 term, {lowercase} show an all-lowercase company name");
+        let matched = ranked.len();
+        let ranked = group_openings(ranked);
+        let folded: usize = ranked.iter().map(|r| r.other_openings.len()).sum();
+        println!("rows {} for {matched} postings ({folded} folded into another row)", ranked.len());
         for (i, r) in ranked.iter().take(top).enumerate() {
             let p = &r.posting;
             let term = format!(
@@ -582,12 +586,13 @@ mod rank_probe {
                 p.term_year.map(|y| y.to_string()).unwrap_or_else(|| "?".into())
             );
             println!(
-                "{:>3} {:.3} {:<26} {:<48} {:<12} posted {} | prest {:.2} rec {:.2} pay {:.2} dl {:.2} loc {:.2}",
+                "{:>3} {:.3} {:<26} {:<48} {:<12} +{} posted {} | prest {:.2} rec {:.2} pay {:.2} dl {:.2} loc {:.2}",
                 i + 1,
                 r.score,
                 p.company_name.chars().take(26).collect::<String>(),
                 p.title.chars().take(48).collect::<String>(),
                 term,
+                r.other_openings.len(),
                 p.posted_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "-".into()),
                 r.breakdown.prestige.value,
                 r.breakdown.recency.value,

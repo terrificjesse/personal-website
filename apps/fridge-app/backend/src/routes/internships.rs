@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::internships::rank::{
     ClassYearFilter, InternshipFilters, LocationFilter, OnUnknown, PayRangeFilter, RankedPosting,
-    SortBy, TermFilter, rank_postings,
+    SortBy, TermFilter, group_openings, rank_postings,
 };
 use crate::internships::store;
 
@@ -1127,12 +1127,16 @@ pub async fn list_postings(
     })?;
 
     let ranked = rank_postings(&postings, &signals, &filters, sort, now);
+    // Counted before folding: `returned` is matching *postings*, so it still compares like with
+    // like against `total_live`. The row count is `postings.len()`. See `group_openings`.
+    let matched = ranked.len();
+    let rows = group_openings(ranked);
 
     Ok(Json(ListPostingsResponse {
         total_live,
-        returned: ranked.len(),
+        returned: matched,
         sort: sort.as_str().to_string(),
-        postings: ranked,
+        postings: rows,
         collection: current_progress(&pool).await?,
     }))
 }
