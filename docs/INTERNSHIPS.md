@@ -418,6 +418,15 @@ Sunnyvale) and "Forward Deployed Engineering Intern" (Sunnyvale), which share on
 That is 13 extra rows in 2,698, one of them in the top 100. Folding on `canonical_url` as
 well would close it, on the read path, like `group_openings` itself.
 
+### "Closing soonest" is hidden — 2026-10-20
+
+The owner's call. **0 of 2,931 live postings state a deadline** (17 rows ever have, all
+expired), so `sort=deadline` tied every posting and fell through to the id tie-break. A sort
+that visibly does nothing reads as a bug to a public visitor. The frontend no longer offers it,
+except while it is the selected sort, so an old `?sort=deadline` link still says what it is.
+The backend still accepts it: unhiding it is one line in `page.tsx`'s `SORTS`, and is the
+thing to do once a source starts supplying deadlines.
+
 ### Openings are folded into one row — contract, 2026-10-19
 
 The live listing showed the same job as several identical rows: Palo Alto Networks had three

@@ -24,11 +24,17 @@ import {
   type ListInternshipsResponse,
 } from "@/lib/internshipsApi";
 
-const SORTS: { value: InternshipSort; label: string }[] = [
+/**
+ * A `hidden` sort is still valid in a URL (the backend accepts it), but it is offered only while
+ * it is the selected one, so an old link still says what it is sorted by.
+ */
+const SORTS: { value: InternshipSort; label: string; hidden?: boolean }[] = [
   { value: "composite", label: "Best match" },
   { value: "pay", label: "Highest pay" },
   { value: "posted", label: "Most recent" },
-  { value: "deadline", label: "Closing soonest" },
+  // Hidden 2026-10-20: 0 of 2,931 live postings state a deadline, so every posting tied and
+  // this sort had nothing to sort by. Unhide it when a source starts supplying deadlines.
+  { value: "deadline", label: "Closing soonest", hidden: true },
   { value: "prestige", label: "Top companies" },
 ];
 
@@ -268,7 +274,9 @@ function InternshipsPageContent() {
               }
               className="w-full rounded border border-black/15 dark:border-white/20 bg-transparent px-2 py-1"
             >
-              {SORTS.map((sort) => (
+              {SORTS.filter(
+                (sort) => !sort.hidden || sort.value === (filters.sort ?? "composite"),
+              ).map((sort) => (
                 <option key={sort.value} value={sort.value}>
                   {sort.label}
                 </option>
