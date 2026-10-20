@@ -76,8 +76,15 @@ export const config = {
   // `/login` and `/register` are deliberately **not** matched. They must always render, or a
   // stale cookie locks the user out of the only page that could fix it.
   //
-  // The internship tab is entirely per-user — the ranked list, the applied tracker and the
-  // run-health panel all require a session on the backend — so the whole subtree is matched
-  // rather than just a sub-path, unlike the blog where only the editor is gated.
-  matcher: ["/fridge/:path*", "/blog/admin/:path*", "/internships/:path*"],
+  // **The internship listing is public since 2026-10-19; everything under it is not.** The
+  // ranked list and its source dropdown are open on the backend, so `/internships` itself
+  // renders for anyone and hides its personal panels when `/auth/me` says nobody is signed in.
+  // The applied tracker, run health and labelling pages all 401 without a session, so they
+  // stay gated here.
+  //
+  // `:path+` is what makes that split, and the one-character difference matters: `:path*`
+  // matches zero or more segments, so it gated `/internships` itself; `:path+` needs at least
+  // one, so it gates only the sub-pages (path-to-regexp syntax; see the matcher section of
+  // this convention's doc, linked at the top of this file).
+  matcher: ["/fridge/:path*", "/blog/admin/:path*", "/internships/:path+"],
 };

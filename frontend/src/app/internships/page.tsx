@@ -12,6 +12,7 @@ import { ExtensionAccess } from "./ExtensionAccess";
 import { AnalyticsPanel } from "./AnalyticsPanel";
 import { ResumeVariantsPanel } from "./ResumeVariantsPanel";
 import { useApiError } from "@/lib/useApiError";
+import { fetchMe, type AuthenticatedUser } from "@/lib/authApi";
 import {
   createApplication,
   internshipFiltersFromSearchParams,
@@ -33,6 +34,9 @@ const SORTS: { value: InternshipSort; label: string }[] = [
 
 const STUDY_YEARS = ["freshman", "sophomore", "junior", "senior"];
 
+/** Back to this page after signing in. The login page accepts only same-site paths in `next`. */
+const SIGN_IN_HREF = "/login?next=/internships";
+
 /**
  * The internship tab.
  *
@@ -50,6 +54,15 @@ const STUDY_YEARS = ["freshman", "sophomore", "junior", "senior"];
  *    page has no control for it yet, so a shared link reproduces the exact request. Controls
  *    replace only known filter keys and preserve unrelated query parameters; back/forward
  *    navigation therefore restores the view without a second state copy drifting from it.
+ *
+ * # Public listing, personal everything-else (since 2026-10-19)
+ *
+ * The ranked list is open to anyone; the backend serves `GET /internships` and
+ * `GET /internships/sources` without a session. Everything else on this page belongs to an
+ * account (tracking, collection status, the inbox, the CV, the answer library), and each of
+ * those 401s for a signed-out visitor, which `useApiError` turns into a redirect to `/login`.
+ * So none of them may even *mount* until `/auth/me` has said someone is signed in. Rendering
+ * them optimistically and letting them fail would bounce every visitor off a public page.
  */
 export default function InternshipsPage() {
   return (
@@ -86,6 +99,10 @@ function InternshipsPageContent() {
   const [trackingId, setTrackingId] = useState<string | null>(null);
   const [trackedIds, setTrackedIds] = useState<Set<string>>(new Set());
   const [refreshVersion, setRefreshVersion] = useState(0);
+  // `undefined` until `/auth/me` answers, then the user or `null`. Three states, not two:
+  // while it is unknown, neither the personal panels nor "Sign in to track" are shown.
+  const [viewer, setViewer] = useState<AuthenticatedUser | null | undefined>(undefined);
+  const signedIn = viewer != null;
 
   // The fetch lives inside the effect rather than in a `useCallback` the effect calls, so no
   // state is set synchronously when the effect runs.
@@ -122,6 +139,22 @@ function InternshipsPageContent() {
       cancelled = true;
     };
   }, [filters, handleApiError, refreshVersion]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMe()
+      .then((user) => {
+        if (!cancelled) setViewer(user);
+      })
+      // Unreachable `/auth/me` is treated as signed out: the public list still works, and
+      // guessing "signed in" would mount panels that redirect to the login page.
+      .catch(() => {
+        if (!cancelled) setViewer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     listInternshipSources()
@@ -166,14 +199,23 @@ function InternshipsPageContent() {
     <main className="mx-auto max-w-4xl px-4 py-8">
       <div className="flex items-baseline justify-between gap-4">
         <h1 className="text-2xl font-semibold">Internships</h1>
-        <nav className="flex gap-4 text-sm">
-          <Link href="/internships/applications" className="underline underline-offset-4">
-            Applications
+        {signedIn ? (
+          <nav className="flex gap-4 text-sm">
+            <Link href="/internships/applications" className="underline underline-offset-4">
+              Applications
+            </Link>
+            <Link href="/internships/runs" className="underline underline-offset-4">
+              Run health
+            </Link>
+          </nav>
+        ) : viewer === null ? (
+          <Link
+            href={SIGN_IN_HREF}
+            className="text-sm text-black/60 dark:text-white/60 underline underline-offset-4"
+          >
+            Sign in to track applications
           </Link>
-          <Link href="/internships/runs" className="underline underline-offset-4">
-            Run health
-          </Link>
-        </nav>
+        ) : null}
       </div>
 
       <section className="mt-6 rounded-lg border border-black/10 dark:border-white/15 p-4">
@@ -308,16 +350,20 @@ function InternshipsPageContent() {
         </div>
       </section>
 
-      <CollectionStatus onUpdate={refresh} />
+      {signedIn && (
+        <>
+          <CollectionStatus onUpdate={refresh} />
 
-      <div className="mt-4 space-y-3">
-        <AnalyticsPanel />
-        <InboxPanel />
-        <ExtensionAccess />
-        <CvProfileEditor />
-        <ResumeVariantsPanel />
-        <AnswerLibrary />
-      </div>
+          <div className="mt-4 space-y-3">
+            <AnalyticsPanel />
+            <InboxPanel />
+            <ExtensionAccess />
+            <CvProfileEditor />
+            <ResumeVariantsPanel />
+            <AnswerLibrary />
+          </div>
+        </>
+      )}
 
       {error && (
         <p className="mt-4 rounded border border-red-500/40 bg-red-500/5 px-3 py-2 text-sm text-red-700 dark:text-red-400">
@@ -342,7 +388,9 @@ function InternshipsPageContent() {
                   ? "No postings match these filters. Try widening the pay range, or turning off the “only postings that state…” switches."
                   : data.collection
                     ? "A collection is running now — postings will appear here as each source finishes."
-                    : "No postings have been collected yet. Use “Collect now” above to fetch them, or check Run health to see whether the sources are working."}
+                    : signedIn
+                      ? "No postings have been collected yet. Use “Collect now” above to fetch them, or check Run health to see whether the sources are working."
+                      : "No postings have been collected yet."}
               </p>
             ) : (
               <ul className="mt-4 space-y-3">
@@ -350,7 +398,8 @@ function InternshipsPageContent() {
                   <PostingCard
                     key={ranked.posting.id}
                     ranked={ranked}
-                    onTrack={track}
+                    onTrack={signedIn ? track : undefined}
+                    signInHref={viewer === null ? SIGN_IN_HREF : undefined}
                     tracking={trackingId === ranked.posting.id}
                     tracked={
                       // A tracked application may point at any opening in a folded row.

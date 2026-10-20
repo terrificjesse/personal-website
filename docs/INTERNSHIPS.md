@@ -309,8 +309,8 @@ rather than trusting them.
 ### `src/routes/internships.rs`
 
 ```
-GET    /internships                        ranked + filtered list        CurrentUser
-GET    /internships/sources                source names for the filter   CurrentUser
+GET    /internships                        ranked + filtered list        public (2026-10-19)
+GET    /internships/sources                source names for the filter   public (2026-10-19)
 GET    /internships/runs                   run-health panel              CurrentUser
 GET    /internships/runs/{id}/rejects      what a run threw away         CurrentUser
 POST   /internships/collect                trigger a run                 RequireAdmin
@@ -325,6 +325,30 @@ DELETE /internships/applications/{id}
 policy value is a **400**, not a silent fallback — same reasoning as the blog's `?sort=oldset`.
 The response carries `total_live` alongside `returned`, so the UI can say "12 of 1,881" rather
 than leaving an empty list ambiguous between "nothing matched" and "nothing collected yet".
+
+### The listing is public — decided 2026-10-19
+
+The owner's call, for opening the tab to general use: **listings are public, tracking needs an
+account.** The two read endpoints above dropped their `CurrentUser` extractor; nothing else in
+the table changed, and the runs, applications, collect and hunt routes still 401 without a
+session (checked route by route when this went in).
+
+Safe because neither response contains anything per-user. `rank_postings` takes no user input
+beyond the query string, and the posting rows are the same scraped public postings for everyone.
+If ranking ever becomes personal (a CV-weighted score, say), that variant needs a session and a
+separate route. Don't put it behind this one.
+
+The frontend half: `proxy.ts` matches `/internships/:path+` rather than `:path*`, so the
+listing itself renders for anyone while every sub-page stays gated. `page.tsx` asks `/auth/me`
+before mounting any personal panel. Each of them 401s when signed out, and `useApiError` turns a
+401 into a redirect to `/login`, so mounting them optimistically would bounce every visitor
+off a public page. A signed-out visitor gets the list, the filters, the apply links and a
+"Sign in to track" link where "I applied" would be.
+
+**Known cost: the response is not paginated or compressed.** At 2,927 live postings, the
+unfiltered default is 3.5 MB of JSON and 2,690-odd rendered cards. `tower-http` here has only
+the `cors` feature, and gzip would bring that to about 445 KB. Fine on localhost, but not for a
+public page on a phone.
 
 ### Openings are folded into one row — contract, 2026-10-19
 

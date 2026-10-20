@@ -1038,10 +1038,15 @@ pub struct ListPostingsResponse {
     pub collection: Option<RunProgress>,
 }
 
-/// The ranked, filtered list of open postings.
+/// The ranked, filtered list of open postings. **Public since 2026-10-19** — no session required.
+///
+/// It took `CurrentUser` and never used it: postings are not anybody's data, the same list is
+/// served to every account, and a site meant for general use should not make a visitor sign up
+/// before seeing a single job. Everything personal stays behind a session — the applied tracker,
+/// the inbox, run health — and so does `collect_now`, which is admin-only because it makes
+/// outbound requests to third-party sources.
 pub async fn list_postings(
     State(pool): State<SqlitePool>,
-    CurrentUser(_user): CurrentUser,
     Query(params): Query<ListPostingsQuery>,
 ) -> Result<Json<ListPostingsResponse>, StatusCode> {
     let now = Utc::now();
@@ -1145,9 +1150,10 @@ pub async fn list_postings(
 ///
 /// Derived from real data rather than a hardcoded list, following `recipes/page.tsx` — a
 /// hardcoded list silently rots as sources are added or retired.
+///
+/// Public, like the listing it filters.
 pub async fn list_sources(
     State(pool): State<SqlitePool>,
-    CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     store::live_source_names(&pool).await.map(Json).map_err(|err| {
         eprintln!("internships: listing sources failed: {err:?}");
@@ -1464,7 +1470,6 @@ mod handler_tests {
     #[tokio::test]
     async fn malformed_filters_are_rejected_rather_than_silently_ignored() {
         let pool = pool().await;
-        let me = user(&pool, "a@test.local").await;
 
         let cases: Vec<(&str, ListPostingsQuery)> = vec![
             ("unknown sort", ListPostingsQuery { sort: Some("bogus".into()), ..Default::default() }),
@@ -1476,7 +1481,7 @@ mod handler_tests {
         ];
 
         for (label, query) in cases {
-            let result = list_postings(State(pool.clone()), me.clone(), Query(query)).await;
+            let result = list_postings(State(pool.clone()), Query(query)).await;
             assert_eq!(
                 result.err(),
                 Some(StatusCode::BAD_REQUEST),
@@ -1490,10 +1495,9 @@ mod handler_tests {
         // What stops "nothing matched" and "nothing collected yet" looking identical.
         let pool = pool().await;
         posting(&pool, "p1").await;
-        let me = user(&pool, "a@test.local").await;
+        // No user exists in this database at all: the listing is public (2026-10-19).
         let Json(body) = list_postings(
             State(pool.clone()),
-            me,
             Query(ListPostingsQuery {
                 company: Some("nobody-by-this-name".into()),
                 ..Default::default()

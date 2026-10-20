@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   NOT_STATED,
   daysUntil,
@@ -28,11 +29,16 @@ const DEADLINE_SOON_DAYS = 14;
 export function PostingCard({
   ranked,
   onTrack,
+  signInHref,
   tracking,
   tracked,
 }: {
   ranked: RankedInternship;
-  onTrack: (postingId: string) => void;
+  /** Absent for a signed-out visitor: tracking an application needs an account. */
+  onTrack?: (postingId: string) => void;
+  /** Shown in place of the track button when `onTrack` is absent. Neither, while the page is
+   *  still finding out who is viewing — a signed-in user should not see "Sign in" flash past. */
+  signInHref?: string;
   tracking: boolean;
   tracked: boolean;
 }) {
@@ -143,14 +149,23 @@ export function PostingCard({
             </ul>
           </details>
         )}
-        <button
-          type="button"
-          onClick={() => onTrack(posting.id)}
-          disabled={tracking || tracked}
-          className="text-sm rounded border border-black/15 dark:border-white/20 px-2 py-1 disabled:opacity-50"
-        >
-          {tracked ? "Tracked" : tracking ? "Saving…" : "I applied"}
-        </button>
+        {onTrack ? (
+          <button
+            type="button"
+            onClick={() => onTrack(posting.id)}
+            disabled={tracking || tracked}
+            className="text-sm rounded border border-black/15 dark:border-white/20 px-2 py-1 disabled:opacity-50"
+          >
+            {tracked ? "Tracked" : tracking ? "Saving…" : "I applied"}
+          </button>
+        ) : signInHref ? (
+          <Link
+            href={signInHref}
+            className="text-sm text-black/60 dark:text-white/60 underline underline-offset-4"
+          >
+            Sign in to track
+          </Link>
+        ) : null}
       </div>
     </li>
   );
