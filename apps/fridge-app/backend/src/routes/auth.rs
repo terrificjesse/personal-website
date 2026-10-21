@@ -354,12 +354,33 @@ fn validate_email(email: &str) -> Result<(), AuthError> {
 /// This is the sign in function. Given a register request, the email and password
 /// are verified to be valid and normalized. Then the password is hashed and the
 /// pair is assigne to a database entry with a unique id.
+///
+/// Throttled like login, and for the same reason with higher stakes: every attempt is a 19 MiB
+/// Argon2 hash and, if it succeeds, a new account. The check runs before validation and before
+/// hashing, so a refused request costs nothing. `docs/PUBLIC_API_STRESS_TEST.md`, S2.
 pub async fn register(
     State(pool): State<SqlitePool>,
+    State(rate_limits): State<RateLimits>,
+    ClientIp(ip): ClientIp,
     jar: CookieJar,
     Json(req): Json<RegisterRequest>,
-) -> Result<(CookieJar, (StatusCode, Json<AuthenticatedUser>)), AuthError> {
+) -> Response {
     let email = normalize_email(&req.email);
+    if let Err(retry) = rate_limits.check_register(ip, &email) {
+        return retry.response("POST /auth/register", ip, &email);
+    }
+
+    register_after_rate_limit(&pool, jar, req, email)
+        .await
+        .into_response()
+}
+
+async fn register_after_rate_limit(
+    pool: &SqlitePool,
+    jar: CookieJar,
+    req: RegisterRequest,
+    email: String,
+) -> Result<(CookieJar, (StatusCode, Json<AuthenticatedUser>)), AuthError> {
     validate_email(&email)?;
     validate_password(&req.password)?;
 
@@ -370,7 +391,7 @@ pub async fn register(
 
     // Write transaction — see `db::begin_write` for why a deferred BEGIN is the wrong default
     // for one, even when the first statement happens to be a write today.
-    let mut tx = crate::db::begin_write(&pool).await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     let insert =
         sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
@@ -394,7 +415,7 @@ pub async fn register(
 
     tx.commit().await?;
 
-    let session = auth::issue_session(&pool, &id).await?;
+    let session = auth::issue_session(pool, &id).await?;
 
     let user = User {
         id,
@@ -851,7 +872,8 @@ mod tests {
 
         let client = reqwest::Client::new();
         let mut statuses = Vec::new();
-        for n in 0..6 {
+        let budget = crate::rate_limit::REGISTER_MAX_ATTEMPTS;
+        for n in 0..=budget {
             let response = client
                 .post(format!("http://{address}/auth/register"))
                 .json(&serde_json::json!({
@@ -865,10 +887,10 @@ mod tests {
         }
 
         assert!(
-            statuses[..5].iter().all(|status| *status == 201),
-            "the first five registrations should succeed: {statuses:?}"
+            statuses[..budget].iter().all(|status| *status == 201),
+            "registrations within the budget should succeed: {statuses:?}"
         );
-        assert_eq!(statuses[5], 429, "the sixth from one client must be refused: {statuses:?}");
+        assert_eq!(statuses[budget], 429, "one past the budget must be refused: {statuses:?}");
     }
 }
 

@@ -1,4 +1,5 @@
-//! In-process write throttles for the two cheap denial-of-service paths (Phase 10j).
+//! In-process write throttles for the cheap denial-of-service paths (Phase 10j, and
+//! `POST /auth/register` since the 2026-10-21 stress test).
 //!
 //! # Contract
 //!
@@ -10,6 +11,14 @@
 //!
 //! `POST /reviews` permits thirty submissions per hour under the same two-bucket rule, using
 //! the authenticated user id as the account key. Login and review buckets are independent.
+//!
+//! `POST /auth/register` permits five attempts per hour under the same rule, keyed by IP and by
+//! the normalized email being registered. Like login, every attempt counts and the check runs
+//! before validation and before Argon2, so a refused request costs nothing. Without it one
+//! anonymous client created 1,840 accounts in 16 seconds, each a 19 MiB hash -
+//! `docs/PUBLIC_API_STRESS_TEST.md`, S2. **Do not answer that by moving the hash to
+//! `spawn_blocking`:** running on the worker threads is what caps concurrent hashes at the core
+//! count, and the blocking pool would let 512 run at once (~9.7 GiB).
 //!
 //! The state is intentionally in memory: this deployment is one process, a restart may forgive
 //! old attempts, and the user explicitly accepted an in-memory limiter for this hardening pass.
@@ -45,6 +54,10 @@ const LOGIN_MAX_ATTEMPTS: usize = 10;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const REVIEW_MAX_SUBMISSIONS: usize = 30;
 const REVIEW_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// Enough for several people behind one NAT, nothing like a script. A policy number: change it
+/// here if it is wrong, and the route test follows it.
+pub(crate) const REGISTER_MAX_ATTEMPTS: usize = 5;
+const REGISTER_WINDOW: Duration = Duration::from_secs(60 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Address used as the per-IP bucket key. Missing connection metadata collapses into one
@@ -128,6 +141,10 @@ impl RateLimits {
         self.check(Endpoint::Review, ip, account, Instant::now())
     }
 
+    pub fn check_register(&self, ip: IpAddr, account: &str) -> Result<(), RetryAfter> {
+        self.check(Endpoint::Register, ip, account, Instant::now())
+    }
+
     fn check(
         &self,
         endpoint: Endpoint,
@@ -151,6 +168,11 @@ impl RateLimits {
                     .reviews
                     .check(ip, account, now, REVIEW_MAX_SUBMISSIONS, REVIEW_WINDOW)
             }
+            Endpoint::Register => {
+                limits
+                    .register
+                    .check(ip, account, now, REGISTER_MAX_ATTEMPTS, REGISTER_WINDOW)
+            }
         }
     }
 }
@@ -159,12 +181,14 @@ impl RateLimits {
 enum Endpoint {
     Login,
     Review,
+    Register,
 }
 
 #[derive(Debug, Default)]
 struct AllLimits {
     login: EndpointLimit,
     reviews: EndpointLimit,
+    register: EndpointLimit,
 }
 
 #[derive(Debug, Default)]
@@ -419,6 +443,44 @@ mod tests {
         assert!(
             limits
                 .check(Endpoint::Review, ip(1), "account-1", now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn register_refuses_the_sixth_attempt_from_one_client() {
+        let limits = RateLimits::default();
+        let now = Instant::now();
+
+        for n in 0..REGISTER_MAX_ATTEMPTS {
+            assert!(
+                limits
+                    .check(Endpoint::Register, ip(1), &format!("person{n}@example.com"), now)
+                    .is_ok()
+            );
+        }
+
+        let retry = limits
+            .check(Endpoint::Register, ip(1), "one-more@example.com", now)
+            .expect_err("a sixth fresh address from the same client must be refused");
+        assert_eq!(retry.seconds(), REGISTER_WINDOW.as_secs());
+    }
+
+    #[test]
+    fn register_and_login_budgets_are_independent() {
+        let limits = RateLimits::default();
+        let now = Instant::now();
+
+        for n in 0..REGISTER_MAX_ATTEMPTS {
+            limits
+                .check(Endpoint::Register, ip(1), &format!("person{n}@example.com"), now)
+                .unwrap();
+        }
+
+        // Exhausting sign-ups must not lock the same address out of signing in.
+        assert!(
+            limits
+                .check(Endpoint::Login, ip(1), "person0@example.com", now)
                 .is_ok()
         );
     }

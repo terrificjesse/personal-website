@@ -153,6 +153,12 @@ Ordered. The two gates are marked and are not optional.
    ```bash
    cargo build --release --manifest-path apps/fridge-app/backend/Cargo.toml
    ```
+   **Run that from the repo root, as written.** `.cargo/config.toml` at the root builds SQLite
+   without its process-wide memory-statistics lock, and Cargo only finds config by walking up
+   from the working directory. Built from anywhere that does not see it, the binary works but
+   the public listing serves about a thirteenth of the traffic
+   (`docs/PUBLIC_API_STRESS_TEST.md`, S1). The backend prints a `WARNING` at startup when that
+   has happened — check `journalctl -u personal-website-backend` after the first start.
    ```bash
    cd frontend && NEXT_PUBLIC_FRIDGE_API_URL=https://hunt.example.com/api npm ci && npm run build
    ```

@@ -4,14 +4,15 @@
 >
 > | | |
 > |---|---|
-> | **Confirmed** | S1 SQLite allocator lock collapses throughput, S2 registration is unthrottled, S4 a NaN pay bound is accepted |
+> | **Confirmed & fixed** | S1 SQLite allocator lock collapses throughput (`65c393e`), S2 registration is unthrottled ("Rate-limit registration, before validation and before Argon2"), S4 a NaN pay bound is accepted (`c8aa917`) |
 > | **Measured, by design** | S3 a listing request costs the same whatever it returns |
 > | **Refuted** | S1 *as predicted* (no `/health` stall), S5 pool exhaustion, S6 oversized free text, S7 numeric extremes |
 > | **Held** | S8 login limiter under a concurrent burst |
 >
 > Each confirmed finding has a test that failed against the code as it stood, committed in its
-> own commit **before** the commit that fixes it — so the bug is proven, not asserted. Self-review
-> only: no independent reviewer saw this pass.
+> own commit (`6263695`) **before** the commit that fixes it — so the bug is proven, not asserted.
+> Every fix was then re-measured against the binary the deploy would build. Full suite after all
+> three: 1,038 passed. Self-review only: no independent reviewer saw this pass.
 
 **Scope: what an anonymous caller on the internet can reach.** `GET /internships` went public on
 2026-10-19 (`9b2d5d8`), registration is open, and `deploy/Caddyfile` does no rate limiting — so
@@ -130,11 +131,24 @@ a session row. `/health` degraded ~100× but did not stall, so the predicted sta
 hashes at 14 (14 × 19 MiB ≈ 266 MiB). The blocking pool allows 512 threads: **512 × 19 MiB ≈ 9.7
 GiB.** Moving the hash would turn slow into out-of-memory. The fix is the limit.
 
-**Fix:** `POST /auth/register` gets the same two-bucket limiter as login — `REGISTER_MAX = 5` per
-`REGISTER_WINDOW = 1 h`, by client IP and by normalized email — and the check runs **before**
+**Fix:** `POST /auth/register` gets the same two-bucket limiter as login — `REGISTER_MAX_ATTEMPTS
+= 5` per `REGISTER_WINDOW` of one hour (`src/rate_limit.rs`), by client IP and by normalized
+email — and the check runs **before**
 validation and hashing, so a refused request costs nothing. Five an hour is a policy number,
 picked to admit several people behind one NAT and nothing like a script; change the constant if
 it is wrong.
+
+The same burst against the fix, release build through the deploy's build path:
+
+| 56 clients × 8 s | Before | After |
+|---|---:|---:|
+| Accounts created | 788 | **5** |
+| Responses | 788 × 201 | 5 × 201, **3,156 × 429** |
+| `/health` p99 | 163.3 ms | **1.8 ms** |
+| Server memory growth | +267 MiB | +80 MiB |
+
+The memory *baselines* differ — a warmed process before, a fresh one after — so only the growth
+compares.
 
 *Noted, not fixed:* registering an address that already exists answers differently from a fresh
 one, so registration reveals whether an email has an account. Common, and out of scope here.
