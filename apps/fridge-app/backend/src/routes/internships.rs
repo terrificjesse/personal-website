@@ -1511,6 +1511,14 @@ mod handler_tests {
             ("misspelled on_unknown", ListPostingsQuery { pay_min: Some(10.0), pay_unknown: Some("dorp".into()), ..Default::default() }),
             ("inverted pay window", ListPostingsQuery { pay_min: Some(80.0), pay_max: Some(20.0), ..Default::default() }),
             ("negative pay floor", ListPostingsQuery { pay_min: Some(-5.0), ..Default::default() }),
+            // Every comparison against NaN is false, so NaN slipped past both checks above and
+            // answered 200 with an empty list - the exact "nothing pays that" this 400 exists to
+            // prevent. Infinity is the same failure: no finite pay is >= it. Stress test,
+            // 2026-10-21, `pay_min=NaN&pay_unknown=drop` -> 200, 0 of 2997.
+            ("NaN pay floor", ListPostingsQuery { pay_min: Some(f64::NAN), ..Default::default() }),
+            ("NaN pay ceiling", ListPostingsQuery { pay_max: Some(f64::NAN), ..Default::default() }),
+            ("infinite pay floor", ListPostingsQuery { pay_min: Some(f64::INFINITY), ..Default::default() }),
+            ("infinite pay ceiling", ListPostingsQuery { pay_max: Some(f64::INFINITY), ..Default::default() }),
             ("misspelled study year", ListPostingsQuery { class_year: Some("sophmore".into()), ..Default::default() }),
         ];
 

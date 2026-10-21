@@ -66,3 +66,46 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
 pub async fn begin_write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
     pool.begin_with("BEGIN IMMEDIATE").await
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// SQLite keeps memory-usage statistics under **one process-wide mutex**, taken on every
+    /// `sqlite3_malloc` and `sqlite3_free`, and shared by every connection in the pool.
+    ///
+    /// Stress-tested 2026-10-21: sqlx copies every column of every row out with
+    /// `sqlite3_value_dup`, so one public listing request is ~90,000 allocations and as many
+    /// frees, all through that lock. Under concurrency the listing *lost* throughput — 38
+    /// requests a second for one client, ~21 for any number above four — while burning eight
+    /// cores, and 99% of the lock waits in a profile were inside SQLite's allocator.
+    /// `-DSQLITE_DEFAULT_MEMSTATUS=0` removes the lock; measured, it took the listing from
+    /// ~21 to ~290 requests a second. SQLite's own "Recommended Compile-time Options" lists it
+    /// for exactly this reason.
+    ///
+    /// The flag is a build setting (`.cargo/config.toml` at the repo root), so nothing in the
+    /// code would notice it going missing — a build run from a directory that does not see
+    /// that file would compile, pass every other test, and ship the collapse. This is the
+    /// check that notices. `compile_options` is a property of the linked library, not of any
+    /// one database, so an in-memory connection is enough.
+    #[tokio::test]
+    async fn sqlite_is_built_without_its_global_memory_statistics_lock() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+
+        let options: Vec<String> = sqlx::query_scalar("PRAGMA compile_options")
+            .fetch_all(&pool)
+            .await
+            .expect("compile_options");
+
+        assert!(
+            options.iter().any(|option| option == "DEFAULT_MEMSTATUS=0"),
+            "SQLite was built with memory statistics on, which serializes every allocation \
+             across the whole process. Is LIBSQLITE3_FLAGS reaching libsqlite3-sys? \
+             compile_options: {options:?}"
+        );
+    }
+}

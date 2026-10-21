@@ -816,6 +816,60 @@ mod tests {
             assert_eq!(response.status(), expected, "attempt {}", attempt + 1);
         }
     }
+
+    /// An anonymous client must not be able to mint accounts without limit.
+    ///
+    /// Stress-tested 2026-10-21: one client created **1,840 accounts in 16 seconds** with no
+    /// 429 - about 470,000 an hour - each one a 19 MiB Argon2 hash. Driven through the real
+    /// router and a real socket rather than by calling the handler, so it cannot pass against
+    /// a limiter the route does not actually use, and so the peer address is the genuine one.
+    #[tokio::test]
+    async fn the_register_route_refuses_a_client_minting_accounts_without_limit() {
+        let path = std::env::temp_dir().join(format!("register-limit-{}.db", Uuid::new_v4()));
+        let pool = crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("pool");
+        let app = crate::routes::build_router(crate::routes::AppState {
+            pool,
+            catalog: std::sync::Arc::new(crate::foodkeeper::Catalog::load().expect("catalog")),
+            recipe_catalog: std::sync::Arc::new(
+                crate::themealdb::Catalog::load().expect("recipe catalog"),
+            ),
+            google_oauth: None,
+            rate_limits: RateLimits::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("serve");
+        });
+
+        let client = reqwest::Client::new();
+        let mut statuses = Vec::new();
+        for n in 0..6 {
+            let response = client
+                .post(format!("http://{address}/auth/register"))
+                .json(&serde_json::json!({
+                    "email": format!("person{n}@example.com"),
+                    "password": "a-long-enough-password",
+                }))
+                .send()
+                .await
+                .expect("request");
+            statuses.push(response.status().as_u16());
+        }
+
+        assert!(
+            statuses[..5].iter().all(|status| *status == 201),
+            "the first five registrations should succeed: {statuses:?}"
+        );
+        assert_eq!(statuses[5], 429, "the sixth from one client must be refused: {statuses:?}");
+    }
 }
 
 #[cfg(test)]
