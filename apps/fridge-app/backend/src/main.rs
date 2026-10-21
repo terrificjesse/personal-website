@@ -53,6 +53,20 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
+    // A build that lost `.cargo/config.toml`'s SQLite flag compiles, passes every test but one,
+    // and serves the public listing at a thirteenth of its throughput. The deploy runs no tests,
+    // so say it here, where `journalctl` will show it. Silent when correct.
+    match db::sqlite_memstatus_disabled(&pool).await {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "WARNING: SQLite was built with memory statistics on. Every allocation then takes \
+             one process-wide lock, and the public listing collapses under concurrent load. \
+             Rebuild from the repo root so .cargo/config.toml applies. \
+             docs/PUBLIC_API_STRESS_TEST.md, S1."
+        ),
+        Err(err) => eprintln!("could not read SQLite compile options: {err:?}"),
+    }
+
     // Checks for expired sessions in the session table and purges them
     match auth::purge_expired_sessions(&pool).await {
         Ok(0) => {}

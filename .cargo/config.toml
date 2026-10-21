@@ -1,0 +1,18 @@
+# Build settings for the backend. THIS FILE MUST STAY AT THE REPO ROOT.
+#
+# Cargo finds config by walking up from the *working directory*, not from the manifest. The
+# deploy builds from the root (`cargo build --manifest-path apps/fridge-app/backend/Cargo.toml`,
+# docs/DEPLOY.md); CI builds inside the backend directory. Only the root is on both paths. Move
+# this file beside Cargo.toml and CI stays green while production silently ships without it.
+#
+# Guards, because nothing else would notice it going missing:
+#   - db::tests::sqlite_is_built_without_its_global_memory_statistics_lock fails the build;
+#   - the backend prints a WARNING at startup, for the deploy, which does not run tests.
+
+[env]
+# SQLite's memory statistics are updated under one process-wide mutex on every allocation, and
+# sqlx copies every column of every row out, so a public listing request was ~90,000 trips
+# through that one lock. Throughput fell from 38 to ~21 requests/s as clients were added; with
+# this flag it reaches ~290. Nothing in this app reads the statistics it switches off.
+# docs/PUBLIC_API_STRESS_TEST.md, S1.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

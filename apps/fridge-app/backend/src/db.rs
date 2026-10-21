@@ -67,6 +67,21 @@ pub async fn begin_write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlit
     pool.begin_with("BEGIN IMMEDIATE").await
 }
 
+/// The compile option `.cargo/config.toml` sets. See `docs/PUBLIC_API_STRESS_TEST.md`, S1.
+pub const MEMSTATUS_OFF: &str = "DEFAULT_MEMSTATUS=0";
+
+/// Whether the linked SQLite was built without its process-wide memory-statistics lock.
+///
+/// A property of the library rather than of any database, so any connection answers it.
+/// `main` checks it at startup because a build that lost the flag compiles cleanly, and the
+/// deploy does not run the test that would catch it.
+pub async fn sqlite_memstatus_disabled(pool: &SqlitePool) -> sqlx::Result<bool> {
+    let options: Vec<String> = sqlx::query_scalar("PRAGMA compile_options")
+        .fetch_all(pool)
+        .await?;
+    Ok(options.iter().any(|option| option == MEMSTATUS_OFF))
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
@@ -102,7 +117,7 @@ mod tests {
             .expect("compile_options");
 
         assert!(
-            options.iter().any(|option| option == "DEFAULT_MEMSTATUS=0"),
+            options.iter().any(|option| option == super::MEMSTATUS_OFF),
             "SQLite was built with memory statistics on, which serializes every allocation \
              across the whole process. Is LIBSQLITE3_FLAGS reaching libsqlite3-sys? \
              compile_options: {options:?}"
