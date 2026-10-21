@@ -1126,7 +1126,14 @@ pub async fn list_postings(
             {
                 return Err(StatusCode::BAD_REQUEST);
             }
-            if min.is_some_and(|value| value < 0.0) || max.is_some_and(|value| value < 0.0) {
+            // A bound is an amount of money, so it must be a finite, non-negative number. NaN is
+            // the case the two checks above cannot see: every comparison against it is false, so
+            // `pay_min=NaN` sailed past both and answered 200 with an empty list. Infinity fails
+            // the same way - no pay is >= it. An absent bound already means "no ceiling", so an
+            // infinite one is rejected too rather than read as one.
+            // docs/PUBLIC_API_STRESS_TEST.md, S4.
+            let not_an_amount = |value: f64| !value.is_finite() || value < 0.0;
+            if min.is_some_and(not_an_amount) || max.is_some_and(not_an_amount) {
                 return Err(StatusCode::BAD_REQUEST);
             }
             Some(PayRangeFilter {
