@@ -432,8 +432,8 @@ The whole predicate: **curated tier 1 or 2, and nothing else.**
 ### `src/routes/hunt.rs` *(new — `[gen]`)*
 
 ```
-GET  /hunt/events?since=&include_acked=&limit=    CurrentUser
-     -> { "events": [ … ], "unacked_total": n }
+GET  /hunt/events?since=&include_acked=&limit=&cursor=    CurrentUser
+     -> { "events": [ … ], "unacked_total": n, "next_cursor": "…" | null }
 POST /hunt/events/{id}/ack                        CurrentUser -> 204
 ```
 
@@ -446,6 +446,39 @@ POST /hunt/events/{id}/ack                        CurrentUser -> 204
 state an MV3 background page loses, and an event that arrived while Firefox was closed would
 sit behind a watermark that had already moved past it. `acked_at` is the record; `since` exists
 for the popup.
+
+#### Scrolling back through older alerts — contract, 2026-10-30
+
+The popup asked for the newest 25 and could show nothing older. After two weeks away, the
+alerts you missed were in the table and unreachable from the extension. So `GET /hunt/events`
+pages backwards with a keyset cursor:
+
+| Param / field | Meaning |
+|---|---|
+| `cursor` (query, optional) | Opaque. Returns only events strictly *older* than the position it names, in the same newest-first order. A cursor that does not decode is a **400** |
+| `next_cursor` (response) | The position of the last event on this page when more exist after it, else `null`. Hand it back as `cursor` for the next page |
+
+The cursor is `models::encode_cursor(created_at, id)`, the same encoding as the blog's
+pages. It is opaque, so clients hand it back rather than build one. `limit` keeps its existing
+meaning and its clamp at 200, and `since` and `include_acked` combine with `cursor` as AND.
+The change is additive: the background poller sends no cursor and ignores `next_cursor`.
+
+**Why a keyset, not an offset.** Alerts arrive at the head of a newest-first list, so an
+offset shifts under a reader. A collection that lands while you scroll would push every row
+down and the next page would repeat the ones you just saw. That is the bug `docs/BLOG.md`
+records for the blog's first pagination. A keyset names a position that new arrivals cannot
+move.
+
+**Why the `id` is in it.** One collection run stamps all of its alerts with the same
+`created_at`: 460 events had only 133 distinct timestamps on 2026-10-30. On `created_at`
+alone, a page boundary falling inside such a batch has no single "next row", and the rest of
+the batch is skipped or repeated. The `ORDER BY` is `created_at DESC, id DESC`, so the
+condition is `created_at < ? OR (created_at = ? AND id < ?)`, which mirrors it exactly.
+
+`created_at` is compared as text. That is sound only because every stored value has one
+format, which was checked on 2026-10-30 (0 of 460 rows deviate): `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`.
+Comparing text in that fixed format orders the same as comparing the instants. `since` has
+always relied on the same property.
 
 ### `src/internships/collector.rs` *(changed)*
 

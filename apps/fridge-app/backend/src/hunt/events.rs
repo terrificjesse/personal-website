@@ -173,6 +173,11 @@ pub struct EventQuery<'a> {
     /// The popup passes `true` for a recent-alerts list. The poller leaves it `false` and so
     /// sees only what has not been delivered.
     pub include_acked: bool,
+    /// Only events strictly *older* than this `(created_at, id)` position: the popup paging
+    /// back through what you missed. A position, not an offset, because alerts arrive at the
+    /// head of a newest-first list and an offset shifts under a reader. `docs/HUNT.md`,
+    /// "Scrolling back through older alerts".
+    pub older_than: Option<(DateTime<Utc>, String)>,
     pub limit: i64,
 }
 
@@ -185,11 +190,22 @@ pub async fn list(pool: &SqlitePool, query: &EventQuery<'_>) -> Result<Vec<HuntE
     if query.since.is_some() {
         sql.push_str(" AND created_at > ?");
     }
+    // Mirrors the ORDER BY below exactly. One collection run stamps every alert it raises with
+    // the same `created_at`, so on the timestamp alone a page boundary inside that batch has no
+    // single next row, and the rest of the batch is skipped or repeated. `id` makes it total.
+    if query.older_than.is_some() {
+        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+    }
     sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
 
+    // Bound in the order the conditions were pushed: sqlx binds positionally.
     let mut statement = sqlx::query_as::<_, HuntEventRow>(&sql).bind(query.viewer);
     if let Some(since) = query.since {
         statement = statement.bind(since.to_rfc3339());
+    }
+    if let Some((created_at, id)) = &query.older_than {
+        let created_at = created_at.to_rfc3339();
+        statement = statement.bind(created_at.clone()).bind(created_at).bind(id);
     }
 
     let rows = statement.bind(query.limit).fetch_all(pool).await?;
@@ -301,8 +317,80 @@ mod tests {
             viewer,
             since: None,
             include_acked: false,
+            older_than: None,
             limit: 50,
         }
+    }
+
+    fn position(event: &HuntEvent) -> Option<(DateTime<Utc>, String)> {
+        Some((event.created_at, event.id.clone()))
+    }
+
+    /// Every event, walked `page_size` at a time the way the popup scrolls.
+    ///
+    /// Capped, because the bug this exists to catch is a cursor that does not move — and
+    /// uncapped, that bug is a test that hangs rather than one that fails.
+    async fn walk(pool: &SqlitePool, page_size: i64) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut older_than = None;
+        for _ in 0..100 {
+            let query = EventQuery { include_acked: true, older_than, limit: page_size, ..poll("u1") };
+            let page = list(pool, &query).await.expect("page");
+            let Some(last) = page.last() else { return seen };
+            older_than = position(last);
+            seen.extend(page.iter().map(|event| event.id.clone()));
+        }
+        panic!("paging never reached the end; the cursor is not moving");
+    }
+
+    #[tokio::test]
+    async fn paging_back_visits_every_event_once_even_inside_a_batch_with_one_timestamp() {
+        // One collection run stamps all of its alerts with the same `created_at`. On the
+        // timestamp alone, a page boundary inside that batch would lose or repeat its rest.
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let batch = Utc::now();
+        for n in 0..7 {
+            emit(&pool, &event(EventKind::Posting, &format!("batch-{n}"), None), batch).await.expect("batch");
+        }
+        for n in 0..3 {
+            let earlier = batch - chrono::Duration::days(n + 1);
+            emit(&pool, &event(EventKind::Posting, &format!("old-{n}"), None), earlier).await.expect("old");
+        }
+
+        let everything: Vec<String> = list(&pool, &EventQuery { include_acked: true, ..poll("u1") })
+            .await
+            .expect("all")
+            .into_iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(everything.len(), 10);
+
+        // 3 does not divide 7, so pages break inside the tied batch.
+        assert_eq!(walk(&pool, 3).await, everything, "same events, same order, each once");
+    }
+
+    #[tokio::test]
+    async fn an_alert_arriving_mid_scroll_does_not_shift_the_older_pages() {
+        // The reason this is a position and not an offset: new alerts land at the head of the
+        // list, and an offset would hand the reader the rows they just read a second time.
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let start = Utc::now() - chrono::Duration::days(10);
+        for n in 0..4 {
+            let at = start + chrono::Duration::hours(n);
+            emit(&pool, &event(EventKind::Posting, &format!("p{n}"), None), at).await.expect("emit");
+        }
+        let query = EventQuery { include_acked: true, limit: 2, ..poll("u1") };
+        let first = list(&pool, &query).await.expect("first page");
+
+        emit(&pool, &event(EventKind::Posting, "arrived-late", None), Utc::now()).await.expect("late");
+
+        let second = list(&pool, &EventQuery { older_than: position(first.last().unwrap()), ..query })
+            .await
+            .expect("second page");
+        let subjects: Vec<&str> = second.iter().map(|event| event.subject_id.as_str()).collect();
+        assert_eq!(subjects, ["p1", "p0"], "exactly the two older events, nothing repeated");
     }
 
     #[tokio::test]

@@ -5,6 +5,12 @@
  * background page has acked everything it notified you about — "ack" here means the client
  * took delivery, not that you read it — so a list of only unacked events would be empty on
  * every normal open.
+ *
+ * Scrolling to the bottom of the list fetches the page before it (2026-10-30). It used to stop
+ * at the newest LIST_LIMIT, so two weeks away meant the alerts you missed were unreachable from
+ * here. Pages are fetched with the backend's cursor, not an offset: alerts arrive at the top
+ * while you scroll, and an offset would hand back rows you had just read. Contract:
+ * `docs/HUNT.md`, "Scrolling back through older alerts".
  */
 
 const SETTINGS_KEY = "settings";
@@ -17,6 +23,9 @@ const DEFAULTS = { backendUrl: "http://localhost:8080", siteUrl: "http://localho
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("events");
 const emptyEl = document.getElementById("empty");
+
+/** Older than this, an alert also shows its date: "16d ago" alone is hard to place. */
+const SHOW_DATE_AFTER_DAYS = 6;
 
 async function settings() {
   const stored = await browser.storage.local.get(SETTINGS_KEY);
@@ -32,34 +41,144 @@ function relative(iso) {
 }
 
 /** Built with the DOM API rather than innerHTML: every string here came off the network. */
+function eventItem(event) {
+  const item = document.createElement("li");
+  item.dataset.id = event.id;
+  const link = document.createElement("a");
+  link.href = event.url || "#";
+  link.target = "_blank";
+  link.rel = "noreferrer";
+
+  const title = document.createElement("div");
+  title.className = "title";
+  title.textContent = event.title;
+
+  const body = document.createElement("div");
+  body.className = "body";
+  body.textContent = event.body;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const created = new Date(event.created_at);
+  const days = (Date.now() - created.getTime()) / 86_400_000;
+  meta.textContent =
+    days > SHOW_DATE_AFTER_DAYS
+      ? `${relative(event.created_at)} · ${created.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
+      : relative(event.created_at);
+  meta.title = created.toLocaleString();
+
+  link.append(title, body, meta);
+  item.append(link);
+  return item;
+}
+
 function render(events) {
-  listEl.replaceChildren();
+  listEl.replaceChildren(...events.map(eventItem));
   emptyEl.hidden = events.length > 0;
+  // A fresh list starts at the top. Left where it was, a list redrawn by "Check now" while
+  // scrolled to the bottom would have the scroll-back control already in view, and fetch the
+  // next page before you had read the first.
+  listEl.scrollTop = 0;
+}
 
-  for (const event of events) {
-    const item = document.createElement("li");
-    const link = document.createElement("a");
-    link.href = event.url || "#";
-    link.target = "_blank";
-    link.rel = "noreferrer";
+// ---- Scrolling back -------------------------------------------------------------------------
 
-    const title = document.createElement("div");
-    title.className = "title";
-    title.textContent = event.title;
+/** Where the next older page starts, from the last response. `null` means there is none. */
+let nextCursor = null;
+let loadingOlder = false;
+/** Whether any older page has been loaded, so the end of the list can say it is the end. */
+let pagedBack = false;
+/** Bumped by every fresh load. An older page that lands after "Check now" redrew the list
+ *  belongs to the previous list, and is dropped rather than appended to this one. */
+let listGeneration = 0;
 
-    const body = document.createElement("div");
-    body.className = "body";
-    body.textContent = event.body;
+// Lives inside the scrolling list, as its last row, so it comes into view exactly when you
+// reach the bottom. That is what triggers the next page; the button is there for when the
+// list is too short to scroll, and so the state is visible.
+const olderRow = document.createElement("li");
+olderRow.className = "older";
+const olderButton = document.createElement("button");
+olderButton.type = "button";
+const olderNote = document.createElement("span");
+olderNote.className = "meta";
+olderRow.append(olderButton, olderNote);
 
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = relative(event.created_at);
-
-    link.append(title, body, meta);
-    item.append(link);
-    listEl.append(item);
+function showOlderControl(note = "") {
+  olderNote.textContent = note;
+  if (nextCursor) {
+    olderButton.hidden = false;
+    olderButton.disabled = loadingOlder;
+    olderButton.textContent = loadingOlder ? "Loading older alerts…" : "Show older alerts";
+  } else {
+    olderButton.hidden = true;
+    if (!note && pagedBack) olderNote.textContent = "No older alerts.";
+  }
+  if (nextCursor || olderNote.textContent) {
+    listEl.append(olderRow);
+  } else {
+    olderRow.remove();
   }
 }
+
+const bottomWatcher = new IntersectionObserver(
+  (entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) void loadOlder();
+  },
+  { root: listEl },
+);
+
+/** Re-arm after the list changes: an observer reports crossings, not states, so a control that
+ *  is still in view after a short page would otherwise never fire again. */
+function watchBottom() {
+  bottomWatcher.unobserve(olderButton);
+  if (nextCursor) bottomWatcher.observe(olderButton);
+}
+
+async function loadOlder() {
+  if (!nextCursor || loadingOlder) return;
+  const generation = listGeneration;
+  loadingOlder = true;
+  showOlderControl();
+
+  let note = "";
+  try {
+    const config = await settings();
+    const base = config.backendUrl.replace(/\/+$/, "");
+    const url =
+      `${base}/hunt/events?include_acked=true&limit=${LIST_LIMIT}` +
+      `&cursor=${encodeURIComponent(nextCursor)}`;
+    const response = await fetch(url, {
+      credentials: "include",
+      headers: config.token ? { Authorization: `Bearer ${config.token}` } : {},
+    });
+    if (generation !== listGeneration) return;
+    if (!response.ok) {
+      note = `Couldn't load older alerts (HTTP ${response.status}).`;
+      return;
+    }
+    const payload = await response.json();
+    if (generation !== listGeneration) return;
+
+    // De-duplicated by id. A cursor cannot repeat a row, but the cache drawn first can hold
+    // ones a live page also returns, and a list showing one alert twice reads as two alerts.
+    const shown = new Set([...listEl.querySelectorAll("li[data-id]")].map((li) => li.dataset.id));
+    for (const event of payload.events || []) {
+      if (!shown.has(event.id)) listEl.insertBefore(eventItem(event), olderRow);
+    }
+    nextCursor = payload.next_cursor || null;
+    pagedBack = true;
+  } catch {
+    if (generation === listGeneration) note = "Couldn't reach the backend for older alerts.";
+  } finally {
+    loadingOlder = false;
+    if (generation === listGeneration) {
+      showOlderControl(note);
+      watchBottom();
+    }
+  }
+}
+
+olderButton.addEventListener("click", () => void loadOlder());
 
 function say(text, bad = false) {
   statusEl.textContent = text;
@@ -72,6 +191,11 @@ function say(text, bad = false) {
  * The cache is only ever a head start. If the fetch below disagrees with it, the fetch wins.
  */
 async function load() {
+  listGeneration += 1;
+  nextCursor = null;
+  pagedBack = false;
+  watchBottom();
+
   const cached = await browser.storage.local.get([CACHE_KEY, STATUS_KEY]);
   render(cached[CACHE_KEY] || []);
 
@@ -123,6 +247,11 @@ async function load() {
 
   const payload = await response.json();
   render(payload.events || []);
+  // Only a live page can start the scroll back: the cache has no cursor, and a position
+  // guessed from it would describe a list the backend never sent.
+  nextCursor = payload.next_cursor || null;
+  showOlderControl();
+  watchBottom();
 
   const last = cached[STATUS_KEY];
   const when = last && last.at ? ` · last checked ${relative(last.at)}` : "";

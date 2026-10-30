@@ -3,7 +3,7 @@
 //! Two endpoints, consumed by the Firefox extension's background poll:
 //!
 //! ```text
-//! GET  /hunt/events?since=&include_acked=&limit=   undelivered events, newest first
+//! GET  /hunt/events?since=&include_acked=&limit=&cursor=   events, newest first
 //! POST /hunt/events/{id}/ack                       the extension took delivery
 //! ```
 //!
@@ -37,6 +37,7 @@ use crate::hunt::events::{self, AckOutcome, EventQuery, HuntEvent};
 use crate::hunt::answers::{self, Answer, NewAnswer, Suggestion};
 use crate::hunt::profile::{self, CvProfile};
 use crate::hunt::tokens::{self, HuntToken, MAX_LABEL_LENGTH, MintedToken};
+use crate::models::{decode_cursor, encode_cursor};
 use crate::routes::auth::CurrentUser;
 
 /// How many events one poll returns when the caller doesn't say.
@@ -53,6 +54,9 @@ pub struct EventsQuery {
     /// passes `true`; the background poll leaves it off.
     pub include_acked: Option<bool>,
     pub limit: Option<u32>,
+    /// A previous page's `next_cursor`: only events older than the last one it returned. The
+    /// popup scrolls back with it; the background poll never sends one.
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +66,8 @@ pub struct EventsResponse {
     /// truncated page is indistinguishable from a complete one — the same reasoning as
     /// keeping `filtered` and `rejected` separate on `source_runs`.
     pub unacked_total: i64,
+    /// Set when there are older events than this page holds. Pass it back as `cursor`.
+    pub next_cursor: Option<String>,
 }
 
 /// Events visible to this user, newest first.
@@ -81,21 +87,36 @@ pub async fn list_events(
         ),
     };
 
+    // A cursor that does not decode is a caller error, not a first page: answering it with the
+    // newest events would send a scrolling popup back to the top and repeat everything.
+    let older_than = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(decode_cursor(raw).ok_or(StatusCode::BAD_REQUEST)?),
+    };
+
     let limit = params
         .limit
         .unwrap_or(DEFAULT_EVENT_LIMIT)
         .min(MAX_EVENT_LIMIT);
 
+    // One more than asked for: a full page cannot say on its own whether anything is older.
     let query = EventQuery {
         viewer: &user.id,
         since,
         include_acked: params.include_acked.unwrap_or(false),
-        limit: i64::from(limit),
+        older_than,
+        limit: i64::from(limit) + 1,
     };
 
-    let events = events::list(&pool, &query)
+    let mut events = events::list(&pool, &query)
         .await
         .map_err(internal("listing hunt events"))?;
+    let has_more = events.len() > limit as usize;
+    events.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| events.last())
+        .flatten()
+        .map(|event| encode_cursor(event.created_at, &event.id));
     let unacked_total = events::unacked_total(&pool, &user.id)
         .await
         .map_err(internal("counting unacked hunt events"))?;
@@ -103,6 +124,7 @@ pub async fn list_events(
     Ok(Json(EventsResponse {
         events,
         unacked_total,
+        next_cursor,
     }))
 }
 
@@ -786,5 +808,115 @@ mod answer_loop_tests {
         let json = serde_json::to_value(&all.0).unwrap();
         assert!(json.get("answers").is_some(), "no q -> the whole library, under `answers`");
         assert!(json.get("suggestions").is_none());
+    }
+}
+
+#[cfg(test)]
+mod event_paging_tests {
+    use super::*;
+    use crate::hunt::events::{EventKind, NewHuntEvent, emit};
+    use crate::models::User;
+    use axum::http::Uri;
+    use uuid::Uuid;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("hunt-paging-{}.db", Uuid::new_v4()));
+        crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("migrations")
+    }
+
+    fn viewer() -> CurrentUser {
+        // Posting alerts are visible to every user, so the viewer needs no row of its own.
+        CurrentUser(User {
+            id: Uuid::new_v4().to_string(),
+            email: "who@example.com".into(),
+            password_hash: None,
+            created_at: Utc::now(),
+            is_admin: false,
+        })
+    }
+
+    async fn posting_alert(pool: &SqlitePool, subject: &str, at: DateTime<Utc>) {
+        let event = NewHuntEvent {
+            kind: EventKind::Posting,
+            user_id: None,
+            subject_id: subject.to_string(),
+            title: subject.to_string(),
+            body: "body".to_string(),
+            url: None,
+            payload: serde_json::json!({}),
+        };
+        emit(pool, &event, at).await.expect("emit");
+    }
+
+    /// Exactly the URL `popup.js` builds: `include_acked`, its page size, and the cursor it was
+    /// handed, if any.
+    async fn popup_page(pool: &SqlitePool, who: &CurrentUser, cursor: Option<&str>) -> Result<EventsResponse, StatusCode> {
+        let mut url = "/hunt/events?include_acked=true&limit=3".to_string();
+        if let Some(cursor) = cursor {
+            url.push_str(&format!("&cursor={cursor}"));
+        }
+        let query = Query::try_from_uri(&url.parse::<Uri>().unwrap()).expect("the popup's URL must parse");
+        list_events(State(pool.clone()), CurrentUser(who.0.clone()), query).await.map(|json| json.0)
+    }
+
+    #[tokio::test]
+    async fn following_next_cursor_reaches_every_alert_once_and_then_stops() {
+        let pool = pool().await;
+        let who = viewer();
+        let batch = Utc::now() - chrono::Duration::days(3);
+        for n in 0..5 {
+            posting_alert(&pool, &format!("batch-{n}"), batch).await;
+        }
+        for n in 0..3 {
+            posting_alert(&pool, &format!("older-{n}"), batch - chrono::Duration::days(n + 1)).await;
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = popup_page(&pool, &who, cursor.as_deref()).await.expect("page");
+            pages += 1;
+            assert!(page.events.len() <= 3);
+            seen.extend(page.events.iter().map(|event| event.subject_id.clone()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+            assert!(pages < 10, "next_cursor never ran out");
+        }
+
+        assert_eq!(pages, 3, "8 alerts at 3 a page is 3 pages, and the last says so");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!((seen.len(), unique.len()), (8, 8), "every alert once: {seen:?}");
+        assert_eq!(&seen[5..], ["older-0", "older-1", "older-2"], "oldest last");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_holds_the_last_alert_offers_no_cursor() {
+        // Exactly a page's worth: the extra row fetched to look ahead finds nothing.
+        let pool = pool().await;
+        let who = viewer();
+        for n in 0..3 {
+            posting_alert(&pool, &format!("p{n}"), Utc::now() - chrono::Duration::hours(n)).await;
+        }
+        let page = popup_page(&pool, &who, None).await.expect("page");
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_that_does_not_decode_is_a_400_not_the_first_page() {
+        let pool = pool().await;
+        let who = viewer();
+        posting_alert(&pool, "p0", Utc::now()).await;
+        for bad in ["zz", "6e6f2d706970652d686572", ""] {
+            let result = popup_page(&pool, &who, Some(bad)).await;
+            assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST), "cursor={bad:?}");
+        }
     }
 }

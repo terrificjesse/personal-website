@@ -100,6 +100,13 @@ button {
   color: var(--muted);
 }
 
+/* The scroll-back control: the last row of the list, so reaching the bottom reveals it. */
+.events li.older {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
 footer {
   display: flex;
   gap: 0.75rem;
