@@ -47,12 +47,17 @@ use super::classify::Category;
 
 /// Mail received at or after this instant has never been seen by the rules being measured.
 ///
-/// The rules last changed on 2026-09-22 (`f454449`). **Move this whenever `classify.rs` changes**,
-/// to the day of the change — [`HELD_OUT_RULES`] and its test make that impossible to forget.
-pub const HELD_OUT_SINCE: &str = "2026-09-23T00:00:00+00:00";
+/// The rules last changed on 2026-11-02, revised against the owner's first 90 labels, all of
+/// which are therefore in-sample (`labelsets/fresh-2026-10.csv`, ledger beside it). Set to the
+/// minute of that change rather than the next midnight: every message received before it had
+/// been read while tuning. Before that, 2026-09-22 (`f454449`).
+///
+/// **Move this whenever `classify.rs` changes**, to the moment of the change. [`HELD_OUT_RULES`]
+/// and its test make that impossible to forget.
+pub const HELD_OUT_SINCE: &str = "2026-11-02T20:46:00+00:00";
 
 /// The rules fingerprint ([`super::labelset::rules_fingerprint`]) [`HELD_OUT_SINCE`] belongs to.
-pub const HELD_OUT_RULES: &str = "ec898b2723de";
+pub const HELD_OUT_RULES: &str = "1959b41978bc";
 
 /// How many labels make a first honest measurement. A suggestion shown to the labeller, not a
 /// cap: the shuffle means stopping anywhere is still a random sample.
@@ -287,14 +292,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        for (id, received) in [("old", "2026-09-10T00:00:00+00:00"), ("a", "2026-10-01T00:00:00+00:00"),
-                               ("b", "2026-10-02T00:00:00+00:00")] {
+        // Relative to the window, not fixed dates. These were "2026-09-10" and "2026-10-01/02",
+        // which silently became pre-window the first time the window moved (2026-11-02).
+        let since = chrono::DateTime::parse_from_rfc3339(HELD_OUT_SINCE).expect("since").with_timezone(&Utc);
+        for (id, offset_days) in [("old", -1), ("a", 1), ("b", 2)] {
+            let received = (since + chrono::Duration::days(offset_days)).to_rfc3339();
             sqlx::query(
                 "INSERT INTO email_messages (id, user_id, gmail_message_id, received_at, created_at)
                  VALUES (?1, 'u1', ?1, ?2, ?2)",
             )
             .bind(id)
-            .bind(received)
+            .bind(&received)
             .execute(&pool)
             .await
             .unwrap();
@@ -307,7 +315,7 @@ mod tests {
     async fn only_held_out_mail_is_offered_or_accepted() {
         let pool = pool().await;
         let progress = progress(&pool, "u1").await.unwrap();
-        assert_eq!(progress.total, 2, "the 2026-09-10 message predates the rules");
+        assert_eq!(progress.total, 2, "the message from before the window predates the rules");
 
         assert!(!record(&pool, "u1", "old", Some(Category::Rejection)).await.unwrap());
         assert!(!record(&pool, "someone-else", "a", Some(Category::Rejection)).await.unwrap());

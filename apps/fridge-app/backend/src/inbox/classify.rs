@@ -154,6 +154,10 @@ const REJECTION: &[&str] = &[
     "were not selected",
     "not selected for",
     "pursue other candidates",
+    // Workiva, 2026-11-02, classified `outreach`: "our team has chosen to proceed with other
+    // candidates whose qualifications align more closely". No other marker covered it.
+    "proceed with other candidates",
+    "proceed with other applicants",
     // Fit-based refusals, which name no decision verb at all. Every one is negated on purpose:
     // a bare "ideal fit" would read an enthusiastic offer as a rejection, and REJECTION is
     // checked first so it would win.
@@ -166,6 +170,133 @@ const REJECTION: &[&str] = &[
     "not a fit at this time",
     "position has been filled",
     "role has been filled",
+];
+
+/// Phrases that turn a sentence into a description of what MIGHT happen to you.
+///
+/// # A confirmation describes the process; it is not the process
+///
+/// The owner's first labelled measurement (2026-11-02, 90 messages) found the same mistake behind
+/// seven false pressing verdicts. Each was a confirmation explaining what would come next, and
+/// the classifier read the explanation as the event, paraphrased:
+///
+/// - LinkedIn: "if your skills are a strong match, a member of our team will reach out to
+///   schedule some time": an interview, falsely.
+/// - C3 AI: "the first step for candidates who move forward is a HackerRank assessment": an OA.
+/// - GM ×2: "you may receive an invitation to take a coding assessment": an OA.
+/// - Nutanix ×3: "for candidates selected to move forward… we're planning to send assessment
+///   invitations… if you're invited to complete the assessment": an OA.
+///
+/// So a marker counts only where it is **stated**: an occurrence in a sentence carrying one of
+/// these phrases does not count, and the next occurrence is tried. **This cannot drop a real
+/// invitation that says so plainly**, because an invitation has at least one sentence that
+/// simply asks ("please complete the assessment by Friday"), and that sentence still counts.
+///
+/// Each entry is a conditional about *selection* or a statement about the *future*, and narrow
+/// on purpose. A bare "if" or "may" is not here: "if you are interested, please complete the
+/// challenge by Friday" is a real invitation, and "you may now begin" is one too.
+const PROSPECTIVE: &[&str] = &[
+    "if your skills",
+    "if your application is selected",
+    "if your application moves forward",
+    "if you are selected",
+    "if you're selected",
+    "if selected",
+    "candidates who move forward",
+    "candidates who are selected",
+    "candidates selected to move forward",
+    "for candidates selected",
+    "may receive an invitation",
+    "may be invited",
+    "if you're invited",
+    "if you are invited",
+    "planning to send",
+    "upon completion",
+    "if applicable",
+];
+
+/// The same idea for a rejection marker: a status explained as one possibility among several.
+///
+/// Microsoft's confirmation, labelled a confirmation by the owner and classified `rejection`:
+/// "if you see the job moved to an inactive state, the position is either no longer open, you
+/// withdrew from consideration, or you were not selected for the role". A false rejection is
+/// the worst false positive here: it ends the story, and it is never auto-applied for exactly
+/// that reason.
+const REJECTION_HYPOTHETICAL: &[&str] = &[
+    "or you were not",
+    "if you were not",
+    "if you are not",
+    "if you're not",
+];
+
+/// The sentence holding byte `at`: from just after the previous `.`, `!` or `?` to the next.
+///
+/// Crude, and enough. A hedge has to sit in the same sentence as the marker it hedges; an
+/// abbreviation splitting a sentence early can only make a hedge miss, which leaves the marker
+/// counting, the direction this classifier already errs in.
+fn sentence_around(text: &str, at: usize) -> &str {
+    let start = text[..at].rfind(['.', '!', '?']).map_or(0, |i| i + 1);
+    let end = text[at..].find(['.', '!', '?']).map_or(text.len(), |i| at + i);
+    &text[start..end]
+}
+
+/// Whether the occurrence at `at` is stated, rather than described as a possibility.
+fn stated(text: &str, at: usize, hedges: &[&str]) -> bool {
+    let sentence = sentence_around(text, at);
+    !hedges.iter().any(|hedge| sentence.contains(hedge))
+}
+
+/// The first marker with at least one stated occurrence, and where that occurrence is.
+fn hit_stated<'a>(text: &str, markers: &[&'a str], hedges: &[&str]) -> Option<(&'a str, usize)> {
+    markers.iter().copied().find_map(|marker| {
+        text.match_indices(marker)
+            .map(|(at, _)| at)
+            .find(|&at| stated(text, at, hedges))
+            .map(|at| (marker, at))
+    })
+}
+
+/// [`hit_pair_near`], counting only pairs whose halves are both stated. Returns where `a` was.
+fn hit_pair_near_stated<'a>(
+    text: &str,
+    pairs: &[(&'a str, &'a str)],
+    hedges: &[&str],
+) -> Option<(&'a str, &'a str, usize)> {
+    pairs.iter().copied().find_map(|(a, b)| {
+        text.match_indices(a).map(|(ai, _)| ai).filter(|&ai| stated(text, ai, hedges)).find_map(|ai| {
+            text.match_indices(b).map(|(bi, _)| bi).find(|&bi| {
+                let (lo, hi) = if ai < bi { (ai + a.len(), bi) } else { (bi + b.len(), ai) };
+                hi.saturating_sub(lo) <= PAIR_WINDOW && stated(text, bi, hedges)
+            })
+            .map(|_| (a, b, ai))
+        })
+    })
+}
+
+/// Account mail an application sets off, matched against the SUBJECT: one-time codes, login
+/// and sign-in links, identity checks, registration links.
+///
+/// The owner labelled every one of these `disregarded` (2026-11-02: Optiver login codes ×2,
+/// identity checks from Honeywell, Uber and BNY, a Jobvite registration link, Amazon
+/// verification codes). They were leaking into Outreach as "a machine at a known employer
+/// writing about employment", which they literally are. But you asked for the code a minute
+/// ago; it tells you nothing about any application.
+///
+/// **Not when the subject names an internship.** Uber's "Confirm your identity for 303922 -
+/// 2027 Software Engineering Intern" was labelled `outreach`: it is about a specific
+/// application. See its use in `classify_with_body`.
+///
+/// Checked after every pressing branch, like the other relevance gates, so an assessment that
+/// arrives with a login code is still an assessment, and before the confirmation markers.
+const ACCOUNT_MAIL: &[&str] = &[
+    "login code",
+    "log-in code",
+    "verification code",
+    "security code",
+    "one-time password",
+    "confirm your identity",
+    "sign-in link",
+    "registration",
 ];
 
 /// Phrases that mean an assessment is being *described*, not assigned to you.
@@ -354,6 +485,13 @@ const ASSESSMENT_PAIRS: &[(&str, &str)] = &[
     ("invite you", "assessment"),
     ("invitation", "assessment"),
     ("next step", "assessment"),
+    // Epic's assessment is a ~20-minute quiz it calls the Rembrandt Profile, and its mail never
+    // uses the word "assessment". The owner labelled the reminder an OA, 2026-11-02; it had been
+    // read as a confirmation. A pair rather than a bare name, because the request links the
+    // name ("please complete the [1] Rembrandt Profile") and so splits any single marker, and
+    // because the platform also sends a completion receipt that asks nothing.
+    ("please complete", "rembrandt"),
+    ("complete your", "rembrandt"),
 ];
 
 const CONFIRMATION: &[&str] = &[
@@ -390,6 +528,17 @@ const CONFIRMATION: &[&str] = &[
     "application sent to",
     "submitted your application",
     "for submitting your",
+    // From the owner's labels, 2026-11-02. Each was read as outreach:
+    //   Amazon: "Thank you for completing your Amazon Assessment… a confirmation that your
+    //            assessment was successfully submitted". Checked after the OA branches, so an
+    //            invitation that also thanks you for an earlier step is still an invitation.
+    "thank you for completing",
+    //   NASCO (iCIMS): "Thank you for starting your submission for job: …"
+    "starting your submission",
+    //   NASCO (iCIMS): "…You have completed this step. Your resume will be reviewed…"
+    "your resume will be reviewed",
+    //   Meta: "Thank you for creating your Career Profile with Meta"
+    "creating your career profile",
 ];
 
 /// Bulk mail that is *literally* job-related and still junk.
@@ -646,26 +795,29 @@ pub fn classify_with_body(
     // can match four thousand characters in rather than inside a 200-character snippet, where
     // a human could see the whole haystack anyway. The evidence column exists to make a verdict
     // checkable; a bare marker had stopped doing that.
+    // Quoted where it matched. A marker can now be skipped where a sentence hedges it, so the
+    // first occurrence is not necessarily the one that decided anything.
+    let quote_at = |marker: &str, at: usize| -> String {
+        let start = text[..at].char_indices().rev().nth(45).map_or(0, |(i, _)| i);
+        let end = text[at..]
+            .char_indices()
+            .nth(marker.chars().count() + 55)
+            .map_or(text.len(), |(i, _)| at + i);
+        format!("…{}…", text[start..end].trim())
+    };
     let quote = |marker: &str| -> String {
         match text.find(marker) {
-            Some(at) => {
-                let start = text[..at].char_indices().rev().nth(45).map_or(0, |(i, _)| i);
-                let end = text[at..]
-                    .char_indices()
-                    .nth(marker.chars().count() + 55)
-                    .map_or(text.len(), |(i, _)| at + i);
-                format!("…{}…", text[start..end].trim())
-            }
+            Some(at) => quote_at(marker, at),
             None => String::new(),
         }
     };
 
     // Terminal outcomes first. See REJECTION's note on why it leads.
-    if let Some(marker) = hit(&text, REJECTION) {
+    if let Some((marker, at)) = hit_stated(&text, REJECTION, REJECTION_HYPOTHETICAL) {
         return verdict(
             Category::Rejection,
             0.9,
-            format!("rejection marker: {marker:?} — {}", quote(marker)),
+            format!("rejection marker: {marker:?} — {}", quote_at(marker, at)),
         );
     }
     if let Some((a, b)) = hit_pair_near(&text, REJECTION_PAIRS) {
@@ -685,11 +837,11 @@ pub fn classify_with_body(
 
     // Then the two that need a response from you. Interview before assessment: "interview" is
     // the more specific claim, and an email that mentions both is usually inviting you to one.
-    if let Some(marker) = hit(&text, INTERVIEW) {
+    if let Some((marker, at)) = hit_stated(&text, INTERVIEW, PROSPECTIVE) {
         return verdict(
             Category::Interview,
             0.8,
-            format!("interview marker: {marker:?} — {}", quote(marker)),
+            format!("interview marker: {marker:?} — {}", quote_at(marker, at)),
         );
     }
     // An assessment somebody is telling you about is not one you have been given — unless the
@@ -698,34 +850,63 @@ pub fn classify_with_body(
     let assessment_is_yours = hit(&text, ASSESSMENT_IS_DESCRIBED).is_none()
         || hit(&text, ASSESSMENT_IS_ASSIGNED).is_some();
     if assessment_is_yours
-        && let Some(marker) = hit(&text, ASSESSMENT)
+        && let Some((marker, at)) = hit_stated(&text, ASSESSMENT, PROSPECTIVE)
     {
         return verdict(
             Category::Oa,
             0.8,
-            format!("assessment marker: {marker:?} — {}", quote(marker)),
+            format!("assessment marker: {marker:?} — {}", quote_at(marker, at)),
         );
     }
     // A platform's own mail, corroborated. Neither half is a verdict alone: the platform name
     // by itself made an account-verification mail pressing, and the topic word by itself is in
     // half the recruiting mail ever written.
+    //
+    // **A platform named in the text has to be in the topic's own sentence**, since 2026-11-02.
+    // Anywhere-in-the-mail made Nutanix's process description an OA: HackerRank in one hedged
+    // sentence, "the assessment may take up to two hours" in another. Mail FROM a platform
+    // still needs only a stated topic word somewhere in it.
+    let platform_in_sender = hit(&sender, ASSESSMENT_PLATFORMS);
+    let platform_with_topic = ASSESSMENT_TOPIC.iter().copied().find_map(|topic| {
+        text.match_indices(topic)
+            .map(|(at, _)| at)
+            .filter(|&at| stated(&text, at, PROSPECTIVE))
+            .find_map(|at| {
+                let platform = platform_in_sender
+                    .or_else(|| hit(sentence_around(&text, at), ASSESSMENT_PLATFORMS))?;
+                Some((platform, topic, at))
+            })
+    });
     if assessment_is_yours
-        && let Some(platform) = hit(&sender, ASSESSMENT_PLATFORMS).or_else(|| hit(&text, ASSESSMENT_PLATFORMS))
-        && let Some(topic) = hit(&text, ASSESSMENT_TOPIC)
+        && let Some((platform, topic, at)) = platform_with_topic
     {
         return verdict(
             Category::Oa,
             0.75,
-            format!("assessment platform: {platform:?} + {topic:?} — {}", quote(topic)),
+            format!("assessment platform: {platform:?} + {topic:?} — {}", quote_at(topic, at)),
         );
     }
     if assessment_is_yours
-        && let Some((a, b)) = hit_pair_near(&text, ASSESSMENT_PAIRS)
+        && let Some((a, b, at)) = hit_pair_near_stated(&text, ASSESSMENT_PAIRS, PROSPECTIVE)
     {
         return verdict(
             Category::Oa,
             0.7,
-            format!("assessment pair: {a:?} + {b:?} — {} / {}", quote(a), quote(b)),
+            format!("assessment pair: {a:?} + {b:?} — {} / {}", quote_at(a, at), quote(b)),
+        );
+    }
+
+    // Account mail an application sets off. See `ACCOUNT_MAIL`, including why a subject that
+    // names an internship is exempt. **Before the confirmation markers**: Greenhouse's
+    // "Security code for your application to Stripe" contains "your application to", and a
+    // code you asked for while still filling in the form confirms nothing.
+    if let Some(marker) = hit(&headline, ACCOUNT_MAIL)
+        && !headline.contains("intern")
+    {
+        return verdict(
+            Category::Disregarded,
+            0.7,
+            format!("account mail in the subject: {marker:?} — {}", quote(marker)),
         );
     }
 
@@ -743,6 +924,17 @@ pub fn classify_with_body(
             format!("confirmation pair: {a:?} + {b:?} — {} / {}", quote(a), quote(b)),
         );
     }
+    // A careers-site account, opened as part of applying: "Welcome to Qualcomm Careers",
+    // labelled a confirmation by the owner. Subject only, and both words, so a "welcome to"
+    // newsletter or a product sign-up is not one.
+    if headline.contains("welcome to") && headline.contains("careers") {
+        return verdict(
+            Category::Confirmation,
+            0.6,
+            "a careers-site welcome in the subject — an account opened to apply".to_string(),
+        );
+    }
+
 
     // The relevance gate. Checked AFTER the pressing categories, never before: a digest
     // subject line must not be able to swallow a real interview invite that happens to
@@ -1964,6 +2156,147 @@ mod tests {
         classify_with_body(Some(from), Some(subject), None, Some(body), &context)
     }
 
+    // --- The owner's first labelled measurement, 2026-11-02. Paraphrased, like everything in
+    // this block. Each case reproduced the mislabel before its rule landed. ---------------------
+
+    #[test]
+    fn a_confirmation_describing_what_might_come_next_is_a_confirmation() {
+        for (subject, body) in [
+            // LinkedIn: read as an interview.
+            ("Your Application for Software Engineer Intern",
+             "Thank you for your interest in Example Corp. We have received your application. What \
+              happens next? If your skills and experience are a strong match, a member of our team \
+              will reach out to you to schedule some time for a conversation."),
+            // C3 AI: read as an OA.
+            ("Thank you for applying to the Internship Program",
+             "We've received your application. The first step for candidates who move forward is \
+              a HackerRank assessment. You will receive an email from HackerRank if your \
+              application is selected. Upon completion of the assessment, we will be in touch \
+              about next steps."),
+            // GM: read as an OA.
+            ("Your application to Software Intern is in!",
+             "Thanks for applying. If you are applying to a role that requires coding skills, you \
+              may receive an invitation to take a coding assessment. Once your results (if \
+              applicable) have been reviewed, we will contact you about next steps."),
+            // Nutanix: read as an OA.
+            ("Update on Your Internship Application",
+             "Thank you for applying to our internship program! For candidates selected to move \
+              forward, the next step will be an online technical assessment through HackerRank. \
+              Here's what to expect: we're planning to send assessment invitations on Friday. The \
+              assessment may take up to two hours. If you're invited to complete the assessment \
+              and have difficulties, let us know."),
+            // Microsoft: read as a rejection.
+            ("Thank you for your application!",
+             "Thank you for taking the time to submit your application for Software Engineer \
+              Intern. If you see the job moved to an inactive state, the position is either no \
+              longer open, you withdrew from consideration, or you were not selected for the \
+              role."),
+        ] {
+            let verdict = classify_body("Example Corp <no-reply@examplecorp.com>", subject, body);
+            assert_eq!(verdict.category, Category::Confirmation, "{subject} -> {verdict:?}");
+        }
+    }
+
+    /// The other side of `PROSPECTIVE`: a hedge in one sentence must not cancel a plain ask in
+    /// another, and the hedges are narrow enough that an ordinary "if" or "may" is not one.
+    #[test]
+    fn a_real_invitation_survives_a_hedged_sentence_beside_it() {
+        for (subject, body, expected) in [
+            ("Next steps: online assessment",
+             "Candidates who move forward complete an assessment. You have moved forward: please \
+              complete the assessment by Friday.",
+             Category::Oa),
+            ("Coding challenge",
+             "If you are interested in continuing, please complete the coding challenge by Friday.",
+             Category::Oa),
+            ("Your assessment is ready",
+             "You may now begin. Your HackerRank assessment is open for seven days.",
+             Category::Oa),
+            ("Interview invitation",
+             "If selected for the final round you will hear from us. For now, we would like to \
+              interview you: please pick a time below.",
+             Category::Interview),
+        ] {
+            let verdict = classify_body("Recruiting <recruiting@examplecorp.com>", subject, body);
+            assert_eq!(verdict.category, expected, "{subject} -> {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_rejection_is_still_a_rejection() {
+        for body in [
+            // Workiva's wording, which no marker covered. Read as outreach.
+            "Thank you for applying. After careful consideration, our team has chosen to proceed \
+             with other candidates whose qualifications align more closely with the role.",
+            // The hypothetical rule must not reach a direct statement, including one with no
+            // "unfortunately" in it to fall back on.
+            "Unfortunately, you were not selected for the role.",
+            "We have reviewed your application and you were not selected for the role.",
+            "After careful consideration, we've decided not to move forward with your candidacy.",
+        ] {
+            let verdict = classify_body("Example Corp <no-reply@examplecorp.com>", "Your Application", body);
+            assert_eq!(verdict.category, Category::Rejection, "{body} -> {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn account_mail_an_application_sets_off_is_disregarded_unless_it_names_the_role() {
+        for (from, subject) in [
+            ("Example Assessments <no-reply@roblox.com>", "Your login code to the Roblox assessment portal"),
+            ("Human Resources <noreply@tesla.com>", "Confirm your identity"),
+            ("Jobvite System <notification@jobvite.stripe.com>", "Jobvite Registration"),
+            ("Greenhouse <no-reply@us.greenhouse-mail.io>", "Security code for your application to Stripe"),
+        ] {
+            let verdict = classify_body(from, subject, "Use this code to continue. It expires in 10 minutes. Recruiting team.");
+            assert_eq!(verdict.category, Category::Disregarded, "{subject} -> {verdict:?}");
+        }
+        // Labelled outreach by the owner: it is about one specific application.
+        let verdict = classify_body(
+            "Talent <no-reply@stripe.com>",
+            "Confirm your identity for 303922 - Software Engineering Intern",
+            "We need you to confirm your identity so that your job application is considered.",
+        );
+        assert_ne!(verdict.category, Category::Disregarded, "{verdict:?}");
+    }
+
+    #[test]
+    fn epics_rembrandt_quiz_is_an_assessment_and_its_receipt_is_not() {
+        for body in [
+            "Your application is being reviewed. First, please complete the [1] Rembrandt Profile. \
+             It should only take about 20 minutes.",
+            "As we review your application, please remember to [1] complete your Rembrandt Profile. \
+             This quick quiz takes about 20 minutes.",
+        ] {
+            let verdict = classify_body("Epic Human Resources <careers@epic.com>", "Rembrandt", body);
+            assert_eq!(verdict.category, Category::Oa, "{body} -> {verdict:?}");
+        }
+        let receipt = classify_body(
+            "Rembrandt <no-reply@rembrandtadvantage.com>",
+            "Assessment Completed - Confirmation Code Enclosed",
+            "Thank you for completing the Rembrandt Profile. Your confirmation code is 1234.",
+        );
+        assert_ne!(receipt.category, Category::Oa, "{receipt:?}");
+    }
+
+    #[test]
+    fn the_confirmation_wordings_the_owner_labelled() {
+        for (from, subject, body) in [
+            ("noreply@mail.amazon.jobs", "Thank you for completing your Assessment",
+             "Thank you for completing our assessment. This confirms it was submitted."),
+            ("Example Corp <example+autoreply@talent.icims.com>", "You've started your candidate submission!",
+             "Thank you for starting your submission for job: Software Engineering Intern."),
+            ("Example Corp <example+autoreply@talent.icims.com>", "Thank you for your interest",
+             "Thank you for your recent interest. You have completed this step. Your resume will be reviewed."),
+            ("The Recruiting team at Example <security@examplemail.com>", "Confirm your Career Profile email address",
+             "Thank you for creating your Career Profile with Example. Please confirm your email."),
+            ("Example Careers <careers@examplecorp.com>", "Welcome to Example Careers",
+             "Build a rich profile and track your applications."),
+        ] {
+            let verdict = classify_body(from, subject, body);
+            assert_eq!(verdict.category, Category::Confirmation, "{subject} -> {verdict:?}");
+        }
+    }
+
     /// Integrity boilerplate at the foot of a genuine invitation used to switch the whole
     /// assessment branch off, because `ASSESSMENT_IS_DESCRIBED` vetoed the entire haystack.
     ///
@@ -2019,9 +2352,12 @@ mod tests {
     /// at all. Three live messages fell straight through to disregarded this way.
     #[test]
     fn a_machine_at_a_known_employer_writing_about_hiring_is_outreach() {
+        // This subject was "Welcome to Roblox Careers" until 2026-11-02, when the owner labelled
+        // a real careers-site welcome a confirmation; that case is pinned below. What this test
+        // guards is the path, so it keeps a machine-sent hiring mail that is not a welcome.
         let verdict = classify_body(
             "Roblox Careers <donotreply@careers.roblox.com>",
-            "Welcome to Roblox Careers",
+            "Your Roblox candidate profile",
             "Your profile is set up. You can now apply for openings and follow the recruiting \
              process from your action center.",
         );

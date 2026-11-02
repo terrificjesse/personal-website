@@ -1369,6 +1369,61 @@ is therefore in-sample by construction. This was a **self-review**: one agent wr
 checked it, against artifacts rather than against its own reasoning — each of the fifteen new
 tests was verified to fail without its fix before being kept.
 
+### The revision of 2026-11-02, against the owner's first 90 labels
+
+The first owner-labelled measurement (`docs/PLAN.md` 13c) agreed with 69 of 90. Here are the
+21 disagreements, read with their bodies, grouped by cause:
+
+| Cause | Messages | Rule |
+|---|---|---|
+| A confirmation **describing** a later step ("if your skills are a match… we will reach out to schedule", "candidates who move forward take a HackerRank assessment", "you may receive an invitation", "we're planning to send assessment invitations") read as that step | LinkedIn, C3 AI, GM ×2, Nutanix ×3 | `PROSPECTIVE`: a marker in a sentence carrying one of these selection conditionals or future phrasings does not count. `stated` / `hit_stated` / `hit_pair_near_stated` |
+| A status **listed as a possibility** ("…or you were not selected for the role") read as a rejection | Microsoft ×11 stored, 2 labelled | `REJECTION_HYPOTHETICAL` |
+| A rejection worded "chosen to proceed with other candidates" | Workiva | Two `REJECTION` markers |
+| Login codes, identity checks, security codes and registration links leaking into Outreach | Optiver ×2, Honeywell, Uber, Jobvite (BNY and Amazon codes too) | `ACCOUNT_MAIL`, subject only, **exempt when the subject names an internship**. The owner labelled Uber's role-naming identity check `outreach` |
+| Epic's assessment, which it calls the Rembrandt Profile and never "assessment" | Epic ×2 | Two `ASSESSMENT_PAIRS` |
+| Confirmation wordings: "thank you for completing", "starting your submission", "your resume will be reviewed", "creating your career profile", and "Welcome to … Careers" in a subject | Amazon, NASCO ×2, Meta, Qualcomm | `CONFIRMATION` and one subject check |
+
+**Why the hedge cannot drop a real invitation.** The rule skips an *occurrence*, not a
+message. A genuine invitation has at least one sentence that simply asks ("please complete the
+assessment by Friday"), and that sentence still counts. The hedges are narrow on purpose. A bare
+"if" or "may" is not one, because "if you are interested, please complete the challenge" is a
+real invitation. `a_real_invitation_survives_a_hedged_sentence_beside_it` pins this, and it
+fails when a bare "if " is added to the list.
+
+A text-named platform now needs the topic word **in its own sentence**. Mail from a platform
+still needs only a stated topic word somewhere in it.
+
+**Two labels were not fitted**, so 88 of 90 now agree, not 90:
+
+- GM's "We'd like to know more about you" was labelled `oa`. It is a talent-community form
+  asking for preferred career areas, with no assessment in it, so it reads as a slip.
+- Epic's first Rembrandt email was labelled `confirmation` while its reminder was labelled
+  `oa`. Both ask for the same 20-minute quiz, so both are `oa` now, in the direction the owner
+  chose when asked whether to favour catching pressing mail.
+
+**A fixture was relabelled, in the open.** `data/inbox/stress-set.csv` row `str-005` ("Welcome to
+Example Corp Careers") was `outreach`, a label written by an agent before the owner labelled the
+real equivalent a confirmation. It still guards D5 (it must not be disregarded), and the outreach
+path it was written for is pinned by a unit test that no longer uses a welcome.
+
+**In-sample, not a measurement:** 88 of 90 agree, junk leaked to Outreach falls 5 to 0 of 16,
+real mail disregarded stays 0 of 74, and pressing mail missed falls 2 to 1 of 9 (the GM slip).
+Every labelled message is now spent. `HELD_OUT_SINCE` moved to 2026-11-02T20:46Z, the minute of
+the change, and the next honest number needs mail from after it.
+
+**Blast radius across all stored mail** (`inbox diagnose --moved`): 44 verdicts change.
+
+- No pressing message becomes disregarded.
+- Every pressing → non-pressing move was read by hand: three identical LinkedIn templates, two
+  GM, one C3 and three Nutanix. Each is a confirmation template.
+
+**Damage the old rule had already done.** Seven of the eleven false Microsoft rejections had
+been proposed as `applied → rejected` and accepted. A genuine Microsoft rejection exists for six
+of those roles, matched by job number, so their status is right and only their evidence is wrong.
+**Firmware Engineering INTERN (200051878) has no genuine rejection.** It is `rejected` only
+because of a confirmation, and it is left for the owner to set back with `application-events
+repair`. A tracker row is not something a classifier revision changes on its own.
+
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
 The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first
