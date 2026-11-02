@@ -489,6 +489,37 @@ async fn fetch_proposals(pool: &SqlitePool, user_id: &str) -> Result<Vec<Proposa
     .await
 }
 
+/// `inbox accept-status <proposal-id>`: the Accept button, from the command line.
+///
+/// Calls the same [`decide`] the button does, so the status, the event citing the email and the
+/// reviewed mark land in one transaction exactly as they would from the UI — including its
+/// refusal (409) when the application has already moved past the proposal. Written 2026-11-02 to
+/// accept the OKC Thunder rejection after `application-events merge` moved it off a duplicate
+/// row; a hand-written UPDATE is the copy of `decide` this exists to avoid.
+pub async fn accept_from_cli(pool: &SqlitePool, args: &[String]) -> anyhow::Result<()> {
+    let [_, proposal_id] = args else {
+        anyhow::bail!("usage: inbox accept-status <proposal-id>");
+    };
+    let user_id: Option<String> = sqlx::query_scalar(
+        "SELECT a.user_id FROM status_proposals p
+           JOIN internship_applications a ON a.id = p.application_id
+          WHERE p.id = ? AND p.reviewed_at IS NULL",
+    )
+    .bind(proposal_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(user_id) = user_id else {
+        anyhow::bail!("no pending status proposal {proposal_id}");
+    };
+    match decide(pool, &user_id, proposal_id, true).await {
+        Ok(status) => {
+            println!("accepted {proposal_id} ({status})");
+            Ok(())
+        }
+        Err(status) => anyhow::bail!("accepting {proposal_id} was refused: {status}"),
+    }
+}
+
 /// Accept a proposal: apply the status change and mark it reviewed.
 pub async fn accept_proposal(
     State(pool): State<SqlitePool>,

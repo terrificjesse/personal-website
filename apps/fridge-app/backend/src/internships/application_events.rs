@@ -210,11 +210,16 @@ application-events — rebuild the append-only application status history
       Assert that every non-empty event history folds to its application's cached status.
       Fails when applications exist but none has an event history to check.
 
-  application-events repair --application <id> --to <status> [--apply]
+  application-events repair --application <id> --to <status> [--note <text>] [--apply]
       Correct one application's status and record the correction as an event, in one
       transaction. Dry by default. For undoing a status change that should never have been
       applied — the event row is the part a hand-written UPDATE forgets, and forgetting it
-      breaks the invariant `verify` checks.
+      breaks the invariant `verify` checks. --note says why, on the event.
+
+  application-events merge --keep <id> --remove <id> [--apply]
+      Fold a duplicate tracker row into the one it duplicates: everything pointing at the
+      duplicate is pointed at the kept row, and the duplicate and its own history are deleted.
+      Dry by default. Refuses when the duplicate is further along than the kept row.
 ";
 
 /// The value after a named flag. Same positional scan the other dev-tooling verbs use.
@@ -242,6 +247,7 @@ async fn repair(
     pool: &SqlitePool,
     application_id: &str,
     target: ApplicationStatus,
+    note: Option<&str>,
     apply: bool,
 ) -> Result<String> {
     let current: Option<(String, String)> = sqlx::query_as(
@@ -297,12 +303,110 @@ async fn repair(
             actor: Actor::Manual,
             cause: None,
             at: now,
-            note: Some("manual repair: a stale proposal had moved this backwards"),
+            // The reason this command was first written for, when no other is given.
+            note: Some(note.unwrap_or("manual repair: a stale proposal had moved this backwards")),
         },
     )
     .await?;
     tx.commit().await?;
     Ok(format!("repaired {summary}"))
+}
+
+/// Fold a duplicate tracker row into the row it duplicates.
+///
+/// For one application tracked twice. The case that forced it, 2026-11-02: "Data Solutions —
+/// Unknown role", created from an OKC Thunder email whose sender name was the team's department,
+/// beside the real "Oklahoma City Thunder" row. Every later email about that application had two
+/// rows to match, and the rejection matched the duplicate, so accepting it would have left the
+/// real row at `applied`.
+///
+/// One transaction:
+///
+/// - **Everything pointing at `remove` is pointed at `keep`**: status proposals, matched
+///   verdicts, deadlines. They were about the same application all along. These four columns are
+///   every foreign key to `internship_applications` (migrations `0019`, `0021`, `0023`).
+///   The database enforces them, so a reference this misses fails the delete rather than
+///   orphaning a row.
+/// - **`remove`'s own events are deleted with it.** They are the history of a row that should
+///   not have existed. Moved beside `keep`'s, they would fold into a second creation.
+/// - `remove` is deleted.
+///
+/// **Refuses when `remove` is further along than `keep`.** That row knows something the kept one
+/// does not, and a merge would lose it: move `keep` forward first. Also refuses across users and
+/// a row merged into itself. The dry run is the same transaction rolled back.
+async fn merge(pool: &SqlitePool, keep: &str, remove: &str, apply: bool) -> Result<String> {
+    if keep == remove {
+        bail!("cannot merge {keep} into itself");
+    }
+    let mut tx = crate::db::begin_write(pool).await?;
+    let row = |id: &str| {
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT user_id, company_name, title, status FROM internship_applications WHERE id = ?",
+        )
+        .bind(id.to_string())
+    };
+    let Some((keep_user, keep_company, keep_title, keep_status)) = row(keep).fetch_optional(&mut *tx).await? else {
+        bail!("no application {keep}")
+    };
+    let Some((remove_user, remove_company, remove_title, remove_status)) = row(remove).fetch_optional(&mut *tx).await?
+    else {
+        bail!("no application {remove}")
+    };
+    if keep_user != remove_user {
+        bail!("{keep} and {remove} belong to different users");
+    }
+    let (Some(kept), Some(removed)) =
+        (ApplicationStatus::parse(&keep_status), ApplicationStatus::parse(&remove_status))
+    else {
+        bail!("an application holds an unparseable status ({keep_status:?}, {remove_status:?})")
+    };
+    if crate::inbox::advance::may_advance(kept, removed) {
+        bail!(
+            "{remove} ({remove_company}) is at {remove_status}, further along than {keep} at \
+             {keep_status}; move {keep} forward first, or this merge loses that"
+        );
+    }
+
+    let mut moved = Vec::new();
+    for (table, column) in [
+        ("status_proposals", "application_id"),
+        ("email_verdicts", "matched_application_id"),
+        ("application_deadlines", "application_id"),
+    ] {
+        let n = sqlx::query(&format!("UPDATE {table} SET {column} = ?1 WHERE {column} = ?2"))
+            .bind(keep)
+            .bind(remove)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        moved.push(format!("{n} {table}"));
+    }
+    let events = sqlx::query("DELETE FROM application_events WHERE application_id = ?")
+        .bind(remove)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let deleted = sqlx::query("DELETE FROM internship_applications WHERE id = ?")
+        .bind(remove)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if deleted != 1 {
+        bail!("deleting {remove} matched {deleted} rows, expected 1");
+    }
+
+    let summary = format!(
+        "{remove_company} \"{remove_title}\" ({remove_status}) into {keep_company} \"{keep_title}\" \
+         ({keep_status}): moved {}; deleted {events} event(s) and the duplicate",
+        moved.join(", ")
+    );
+    if apply {
+        tx.commit().await?;
+        Ok(format!("merged {summary}"))
+    } else {
+        tx.rollback().await?;
+        Ok(format!("would merge {summary}"))
+    }
 }
 
 /// Dispatch for the `application-events` server-binary subcommand.
@@ -368,8 +472,19 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
             let apply = args.iter().any(|a| a == "--apply");
             let target = ApplicationStatus::parse(&to)
                 .with_context(|| format!("{to:?} is not an application status"))?;
-            let report = repair(pool, &application, target, apply).await?;
+            let note = flag(args, "--note");
+            let report = repair(pool, &application, target, note.as_deref(), apply).await?;
             println!("{report}");
+            if !apply {
+                println!("\n  re-run with --apply to write it.");
+            }
+            Ok(())
+        }
+        "merge" => {
+            let keep = flag(args, "--keep").context("merge needs --keep <id>")?;
+            let remove = flag(args, "--remove").context("merge needs --remove <id>")?;
+            let apply = args.iter().any(|a| a == "--apply");
+            println!("{}", merge(pool, &keep, &remove, apply).await?);
             if !apply {
                 println!("\n  re-run with --apply to write it.");
             }
@@ -728,6 +843,105 @@ mod tests {
         .execute(pool)
         .await
         .expect("proposal");
+    }
+
+
+    async fn proposal_application(pool: &SqlitePool, proposal: &str) -> String {
+        sqlx::query_scalar("SELECT application_id FROM status_proposals WHERE id = ?")
+            .bind(proposal)
+            .fetch_one(pool)
+            .await
+            .expect("proposal")
+    }
+
+    async fn application_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM internship_applications")
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    /// The OKC Thunder case: a duplicate row held the pending rejection.
+    async fn duplicate_holding_a_proposal(pool: &SqlitePool) {
+        insert_user(pool).await;
+        insert_application(pool, "real", ApplicationStatus::Applied, "2026-01-02T00:00:00Z").await;
+        insert_application(pool, "duplicate", ApplicationStatus::Applied, "2026-01-03T00:00:00Z").await;
+        let at = DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z").expect("at").with_timezone(&Utc);
+        let mut tx = pool.begin().await.expect("tx");
+        for id in ["real", "duplicate"] {
+            record(
+                &mut tx,
+                NewApplicationEvent {
+                    application_id: id,
+                    from_status: None,
+                    to_status: ApplicationStatus::Applied,
+                    actor: Actor::Email,
+                    cause: None,
+                    at,
+                    note: None,
+                },
+            )
+            .await
+            .expect("creation event");
+        }
+        tx.commit().await.expect("commit");
+        insert_proposal(
+            pool,
+            ProposalFixture {
+                id: "rejection",
+                application_id: "duplicate",
+                from: ApplicationStatus::Applied,
+                to: ApplicationStatus::Rejected,
+                auto: false,
+                accepted: None,
+                created_at: "2026-01-04T00:00:00Z",
+                reviewed_at: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn merging_a_duplicate_moves_what_pointed_at_it_and_deletes_it() {
+        let pool = pool().await;
+        duplicate_holding_a_proposal(&pool).await;
+
+        merge(&pool, "real", "duplicate", true).await.expect("merge");
+
+        assert_eq!(proposal_application(&pool, "rejection").await, "real", "the pending rejection follows");
+        let verdict_target: Option<String> =
+            sqlx::query_scalar("SELECT matched_application_id FROM email_verdicts WHERE id = 'verdict-rejection'")
+                .fetch_one(&pool)
+                .await
+                .expect("verdict");
+        assert_eq!(verdict_target.as_deref(), Some("real"));
+        assert_eq!(application_count(&pool).await, 1);
+        let report = verify_invariant(&pool).await.expect("verify");
+        assert!(report.mismatches.is_empty(), "the kept row still folds to its status: {:?}", report.mismatches.len());
+    }
+
+    #[tokio::test]
+    async fn merging_is_a_dry_run_unless_applied() {
+        let pool = pool().await;
+        duplicate_holding_a_proposal(&pool).await;
+
+        let summary = merge(&pool, "real", "duplicate", false).await.expect("dry run");
+        assert!(summary.starts_with("would merge"), "{summary}");
+        assert_eq!(application_count(&pool).await, 2);
+        assert_eq!(proposal_application(&pool, "rejection").await, "duplicate");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_further_along_than_the_kept_row_is_not_merged() {
+        // It knows something the kept row does not; merging would lose it.
+        let pool = pool().await;
+        insert_user(&pool).await;
+        insert_application(&pool, "real", ApplicationStatus::Applied, "2026-01-02T00:00:00Z").await;
+        insert_application(&pool, "duplicate", ApplicationStatus::Oa, "2026-01-03T00:00:00Z").await;
+
+        let refused = merge(&pool, "real", "duplicate", true).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(application_count(&pool).await, 2);
     }
 
     #[tokio::test]

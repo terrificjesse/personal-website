@@ -975,6 +975,33 @@ different application, breaking the one invariant this module is for, silently. 
 both in one transaction with `Actor::Manual` and no cause, since no email caused it. Tracker after:
 36 applied, 12 rejected, 5 OA, and `verify` still 53/53.
 
+#### `application-events merge`, `repair --note`, and `inbox accept-status` (2026-11-02)
+
+Two tracker rows were wrong because of the old classifier and company guesser, and the owner
+asked for both to be fixed:
+
+- **Microsoft Firmware Engineering INTERN (200051878)** was `rejected` only because a
+  confirmation's "…or you were not selected" boilerplate was read as a rejection and accepted.
+  No genuine rejection exists for that job number. It went back to `applied` with `repair`, which
+  now takes `--note` so the event says *why*. The old fixed note ("a stale proposal had moved
+  this backwards") is still the default, and it was not true here.
+- **"Data Solutions — Unknown role"** was a duplicate of the Oklahoma City Thunder application.
+  It was created from an OKC email whose sender name was the team's department, and OKC's later
+  rejection matched the duplicate. `merge --keep <real> --remove <duplicate>` folds one row into
+  another in one transaction: it re-points every foreign key to `internship_applications`
+  (status proposals, matched verdicts, deadlines), then deletes the duplicate and its own events.
+  It refuses when the duplicate is further along than the kept row, and is a dry run unless
+  `--apply`. The re-pointed rejection was then accepted with `inbox accept-status <id>`, which
+  calls `routes::inbox::decide`, the same function as the Accept button. So the event cites the
+  proposal, exactly as a click would.
+
+Run after a `.backup` (`fridge.db.pre-row-fixes-2026-11-02`), with each dry run read first. After:
+54 tracked rows, `verify` 54/54 with 0 mismatches, OKC `rejected` through its own proposal,
+Firmware `applied`.
+
+**The cause is still live.** The company guesser can take a sender's display name, a department
+or a person ("Data Solutions", "Aaron Simonds"), over the email's domain. That is its own fix.
+
 #### What this did not change
 
 `INBOX_AUTO_APPLY_CONFIDENCE` is still unset and `may_auto_apply` still refuses every terminal
@@ -1420,9 +1447,10 @@ the change, and the next honest number needs mail from after it.
 **Damage the old rule had already done.** Seven of the eleven false Microsoft rejections had
 been proposed as `applied → rejected` and accepted. A genuine Microsoft rejection exists for six
 of those roles, matched by job number, so their status is right and only their evidence is wrong.
-**Firmware Engineering INTERN (200051878) has no genuine rejection.** It is `rejected` only
-because of a confirmation, and it is left for the owner to set back with `application-events
-repair`. A tracker row is not something a classifier revision changes on its own.
+**Firmware Engineering INTERN (200051878) has no genuine rejection.** It was `rejected` only
+because of a confirmation. A classifier revision does not move a tracker row on its own, so it
+was left for the owner, who asked for it to be set back. That is done; see "`application-events
+merge`, `repair --note`, and `inbox accept-status`".
 
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
