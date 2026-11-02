@@ -642,6 +642,46 @@ numbers survive the run; a log line only names which row to go and look at.
 | `advance` | Matching, and what an email may do to a status. Rules 2 and 3, pure, no database |
 | `labelset` | 8b's measurement harness. Tooling, not pipeline — documented above |
 
+#### Correcting titles after the parser learns: `inbox retitle` (2026-11-02)
+
+The 2026-11-02 sync left 44 pending proposals, and seven of them read like "…Compiler Software
+Engineering Intern - Summer 2027 **role has been received**". `title_from_subject` was keeping
+the rest of the sentence. Five shapes were found, and all are now cut, case-insensitively
+(`SENTENCE_CONTINUATIONS`):
+
+- "… role has been received"
+- "… has been Received"
+- "… and it is being reviewed …"
+- "… position with the Oklahoma City Thunder"
+- "TetraMem Inc and the …" after "interest in"
+
+The leading "position of" and "position 130043 -" are now dropped as well.
+
+**A bad title costs more than looks.** Its `role_key` is what the next email has to equal. The
+Thunder application had been tracked since September and was still proposed as untracked,
+because the title ran on into the employer's name. Three tracked titles carried the same
+garbling, two at Workiva and one at Qualcomm. Under them, a later rejection naming the clean
+role would have matched nothing.
+
+Fixing the parser fixes the next email, not the rows already written. That is what
+`inbox retitle [--apply]` is for:
+
+- It re-derives each **pending** proposal's title with `role_from`, exactly as the live sync
+  does. A corrected role you already track removes the proposal, but only when the tracker is
+  at or past the proposal's status. A proposal that is further along is left for you.
+- A correction that duplicates another proposal for the same company removes this one. The
+  kept one takes the further `implied_status` and the evidence that implied it: IBM's OA
+  survived as OA, not as the confirmation's `applied`.
+- Reviewed proposals are never touched. A tracked title is re-read only when it carries one of
+  the garblings itself, never when it came from a posting.
+- A dry run unless `--apply`. The dry run is the same transaction rolled back.
+
+Run on 2026-11-02 after a `.backup` (`fridge.db.pre-retitle-2026-11-02`) and two rehearsals on
+copies. The result: 12 retitled, 5 removed as already tracked (each an exact title match,
+checked by hand), 2 removed as duplicates (IBM's kept at `oa`), and 3 tracked titles
+corrected. That took the queue from 44 to 37, with zero garbled titles left in either table. A
+second run changes nothing, which the IBM test pins.
+
 ### Tables (migration `0019`, plus `0020`)
 
 `gmail_accounts`, `inbox_runs`, `email_messages`, `email_verdicts`, `status_proposals`; `0020`

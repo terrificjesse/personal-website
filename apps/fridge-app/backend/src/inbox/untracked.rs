@@ -294,6 +294,40 @@ fn has_requisition_id(text: &str) -> bool {
     false
 }
 
+/// Where a sentence stops naming the job and starts telling you about it. Lowercase, and matched
+/// case-insensitively by [`cut_before_any`]: Workiva capitalises its "has been Received".
+const SENTENCE_CONTINUATIONS: &[&str] = &[
+    " and are ",
+    " and we ",
+    " and you ",
+    " what happens",
+    // Added 2026-11-02. Each is a title that reached the tracker or the review queue with the
+    // rest of its sentence still attached, paraphrased:
+    //   NVIDIA, Databricks: "…Compiler Software Engineering Intern - Summer 2027 role has been received"
+    //   Workiva:            "…Intern - Software Engineering has been Received"
+    //   Allegion:           "…Software Engineering and it is being reviewed by our recruiting team"
+    //   OKC Thunder:        "…Basketball Operations position with the Oklahoma City Thunder"
+    // The Thunder one cost more than a long title: the tail kept its key from equalling the
+    // tracked title's, so an application already in the tracker was proposed as untracked.
+    // `" and it is "`, not `" and it "`, so an "Information Systems and IT Intern" keeps its IT.
+    " has been ",
+    " and it is ",
+    " is being ",
+    " position with ",
+    " role with ",
+];
+
+/// `text` up to the first of `markers`, compared ASCII-case-insensitively.
+///
+/// `to_ascii_lowercase` rather than `to_lowercase` because it keeps every byte where it was, so
+/// an index found in the lowered copy is a valid cut in the original. Full Unicode lowercasing
+/// can change a string's length and would cut in the wrong place.
+fn cut_before_any<'a>(text: &'a str, markers: &[&str]) -> &'a str {
+    let lower = text.to_ascii_lowercase();
+    let end = markers.iter().filter_map(|marker| lower.find(marker)).min().unwrap_or(text.len());
+    &text[..end]
+}
+
 pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
     // Real mail is HTML-escaped, so a role reaches this as "Summer &#39;27" and would be stored
     // with the entity in it, in the column the tracker renders.
@@ -347,6 +381,20 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
                 }
                 _ => tail,
             };
+            // "…your interest in TetraMem Inc and the US 2026 Software - Machine Learning Intern":
+            // the employer, then the role. Only after an "interest in" marker, where an employer
+            // is what usually comes next, and only for a short head that does not itself name an
+            // internship, so a role with "and the" inside it keeps it.
+            let tail = match tail.to_ascii_lowercase().find(" and the ") {
+                Some(at)
+                    if marker.contains("interest in")
+                        && tail[..at].split_whitespace().count() <= 4
+                        && !tail[..at].to_ascii_lowercase().contains("intern") =>
+                {
+                    tail[at + " and the ".len()..].trim_start()
+                }
+                _ => tail,
+            };
             // Leading noise the surrounding sentence leaves behind: an article, a possessive,
             // or a requisition number the ATS prefixes to the title. All real —
             // "our [Summer 2027] Software Engineer Intern", "R171519 2027 Intern - …".
@@ -358,6 +406,10 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
                     // "…your application for the following position: Software Engineer…"
                     "following position: ", "Following position: ",
                     "following role: ", "position: ", "Position: ", "role of ",
+                    // "…your application for the position of ML Systems … Intern" and
+                    // "…for position 130043 - QA/Test Engineer Intern" (the id goes below).
+                    // "position of " is listed first so it is never left as a stray "of ".
+                    "position of ", "Position of ", "position ", "Position ",
                 ] {
                     tail = tail.strip_prefix(prefix).unwrap_or(tail);
                 }
@@ -389,9 +441,7 @@ pub fn title_from_subject(subject: Option<&str>) -> Option<String> {
             // heuristic, and an admitted one: extracting a noun phrase from prose with
             // substrings has a floor, and the honest failure is a title that is too long rather
             // than one that is wrong. The role is still identifiable, and editable once tracked.
-            let tail = [" and are ", " and we ", " and you ", " What happens", " what happens"]
-                .iter()
-                .fold(tail, |acc, cut| acc.split(cut).next().unwrap_or(acc));
+            let tail = cut_before_any(tail, SENTENCE_CONTINUATIONS);
             // A requisition id in a trailing parenthetical is not part of the role's name, and
             // carrying it costs more than the twenty characters it occupies.
             //
@@ -767,9 +817,206 @@ pub async fn backfill(pool: &SqlitePool, now: DateTime<Utc>) -> Result<BackfillR
     Ok(report)
 }
 
+/// What `inbox retitle` changed, or would change.
+#[derive(Debug, Default)]
+pub struct RetitleReport {
+    /// Pending proposals given a corrected title: company, old title, new title.
+    pub retitled: Vec<(String, Option<String>, String)>,
+    /// Pending proposals whose corrected role is already in the tracker: company, role. They
+    /// were never untracked, and the garbled title is what stopped them matching. Removed.
+    pub already_tracked: Vec<(String, String)>,
+    /// Pending proposals that, corrected, ask the same question as another proposal for that
+    /// company and role: company, role, and the status the kept one was raised to when this one
+    /// was further along. Removed; the other one stays.
+    pub duplicates: Vec<(String, String, Option<String>)>,
+    /// Pending proposals whose corrected role is tracked, but which say more than the tracker
+    /// does: company, role, tracked status, implied status. Left for you, not removed.
+    pub ahead_of_tracker: Vec<(String, String, String, String)>,
+    /// Tracked applications whose title carried the same garbling: company, old, new.
+    pub applications: Vec<(String, String, String)>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingTitle {
+    id: String,
+    user_id: String,
+    company_key: String,
+    company_name: String,
+    title: Option<String>,
+    implied_status: String,
+    verdict_id: String,
+    subject: Option<String>,
+    snippet: Option<String>,
+}
+
+/// Whether a stored title carries one of the garblings [`title_from_subject`] used to leave:
+/// the rest of its sentence, or the word "position" in front.
+fn carries_sentence_residue(title: &str) -> bool {
+    cut_before_any(title, SENTENCE_CONTINUATIONS).len() < title.len()
+        || title.to_ascii_lowercase().starts_with("position ")
+}
+
+/// Re-read titles with the current parser, after it learns a phrasing it used to garble.
+///
+/// Fixing [`title_from_subject`] fixes the next email, not the rows already written, and the
+/// rows matter twice over: a title is what the tracker shows, and its [`role_key`] is what the
+/// next email about that application has to equal. Added 2026-11-02, when 44 pending proposals
+/// included seven titles ending "…role has been received" and one tracked application was
+/// being re-proposed because its title ran on into the employer's name.
+///
+/// **A dry run unless `apply`.** The dry run is the same transaction, rolled back, so what it
+/// prints is what the real run does, unique constraints included.
+///
+/// - **Pending proposals** are re-derived exactly as the live sync derives them, by
+///   [`role_from`] on the verdict's message. A corrected role that a tracked application
+///   already has removes the proposal: it was never untracked. One that now equals another
+///   proposal for the same company removes this one and keeps the other. Anything else is
+///   retitled. **Reviewed proposals are never touched**: each is an answer you gave.
+/// - **Tracked applications** are touched only where the stored title itself carries the
+///   garbling ([`carries_sentence_residue`]). A title copied from a posting is never re-parsed,
+///   because the parser's other rules (splitting on " at ", dropping a leading possessive) are
+///   written for email sentences and would damage it. The snapshot is left as it was taken.
+pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Result<RetitleReport> {
+    let mut tx = pool.begin().await?;
+    let mut report = RetitleReport::default();
+
+    let pending: Vec<PendingTitle> = sqlx::query_as(
+        "SELECT p.id, p.user_id, p.company_key, p.company_name, p.title, p.implied_status,
+                p.verdict_id, m.subject, m.snippet
+           FROM application_proposals p
+           JOIN email_verdicts v ON v.id = p.verdict_id
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE p.reviewed_at IS NULL
+          ORDER BY p.created_at, p.id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for row in pending {
+        // Exactly what `sync::propose_status` derives for this message today.
+        let Some(title) = role_from(row.subject.as_deref(), row.snippet.as_deref()) else {
+            continue;
+        };
+        if row.title.as_deref() == Some(title.as_str()) {
+            continue;
+        }
+
+        let applications: Vec<super::advance::TrackedApplication> = sqlx::query_as(
+            "SELECT id, company_name AS company, title FROM internship_applications WHERE user_id = ?",
+        )
+        .bind(&row.user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let implied = ApplicationStatus::parse(&row.implied_status);
+        if let Some(tracked_id) = super::advance::match_application(Some(&row.company_name), Some(&title), &applications) {
+            // Removed only when the tracker already knows as much as this proposal does. An OA
+            // proposal for an application tracked at `applied` is news, not a duplicate, and
+            // deleting it would lose the one record that the assessment arrived.
+            let tracked: String = sqlx::query_scalar("SELECT status FROM internship_applications WHERE id = ?")
+                .bind(tracked_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let ahead = match (ApplicationStatus::parse(&tracked), implied) {
+                (Some(current), Some(implied)) => super::advance::may_advance(current, implied),
+                _ => true,
+            };
+            if ahead {
+                report.ahead_of_tracker.push((row.company_name, title, tracked, row.implied_status));
+                continue;
+            }
+            sqlx::query("DELETE FROM application_proposals WHERE id = ?")
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+            report.already_tracked.push((row.company_name, title));
+            continue;
+        }
+
+        let key = role_key(Some(&title));
+        let taken: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, implied_status FROM application_proposals
+              WHERE user_id = ? AND company_key = ? AND role_key = ? AND id <> ?",
+        )
+        .bind(&row.user_id)
+        .bind(&row.company_key)
+        .bind(&key)
+        .bind(&row.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((kept_id, kept_status)) = taken {
+            // The removed one must not take the further status with it. IBM's assessment
+            // reminder and its confirmation were one role; deleting the OA proposal and keeping
+            // the `applied` one would create the application a step behind the mail.
+            let raised = match (ApplicationStatus::parse(&kept_status), implied) {
+                (Some(kept), Some(implied)) if super::advance::may_advance(kept, implied) => {
+                    // The title moves with the evidence. A title read from one email beside a
+                    // verdict citing another is a row the next run would "correct" again.
+                    sqlx::query(
+                        "UPDATE application_proposals SET implied_status = ?, verdict_id = ?, title = ? WHERE id = ?",
+                    )
+                        .bind(&row.implied_status)
+                        .bind(&row.verdict_id)
+                        .bind(&title)
+                        .bind(&kept_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    Some(row.implied_status.clone())
+                }
+                _ => None,
+            };
+            sqlx::query("DELETE FROM application_proposals WHERE id = ?")
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+            report.duplicates.push((row.company_name, title, raised));
+            continue;
+        }
+
+        sqlx::query("UPDATE application_proposals SET title = ?, role_key = ? WHERE id = ?")
+            .bind(&title)
+            .bind(&key)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await?;
+        report.retitled.push((row.company_name, row.title, title));
+    }
+
+    let tracked: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, company_name, title FROM internship_applications ORDER BY company_name")
+            .fetch_all(&mut *tx)
+            .await?;
+    for (id, company, title) in tracked {
+        if !carries_sentence_residue(&title) {
+            continue;
+        }
+        let Some(fixed) = title_from_subject(Some(&format!("application for {title}"))) else {
+            continue;
+        };
+        if fixed == title {
+            continue;
+        }
+        sqlx::query("UPDATE internship_applications SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(&fixed)
+            .bind(now.to_rfc3339())
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        report.applications.push((company, title, fixed));
+    }
+
+    if apply {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(report)
+}
+
 const USAGE: &str = "\
 usage:
   inbox backfill-untracked        re-read stored mail and propose what it implies
+  inbox retitle [--apply]         re-read pending proposals' and tracked titles with the current
+                                  parser (a dry run without --apply)
   inbox untracked                 list proposals awaiting your review
   inbox untracked accept <company>   track it  (use `all` for every pending one)
   inbox untracked reject <company>   record that you did not apply there
@@ -808,6 +1055,17 @@ async fn pending(pool: &SqlitePool, user_id: &str) -> Result<Vec<(String, String
 pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("backfill-untracked") if args.len() == 1 => {}
+        Some("retitle") => {
+            let apply = match &args[1..] {
+                [] => false,
+                [flag] if flag == "--apply" => true,
+                _ => {
+                    print!("{USAGE}");
+                    return Ok(());
+                }
+            };
+            return retitle_cli(pool, apply).await;
+        }
         Some("untracked") => return untracked_cli(pool, &args[1..]).await,
         _ => {
             print!("{USAGE}");
@@ -837,6 +1095,36 @@ pub async fn main(pool: &SqlitePool, args: &[String]) -> Result<()> {
         for subject in &report.unusable_subjects {
             println!("  {subject}");
         }
+    }
+    Ok(())
+}
+
+async fn retitle_cli(pool: &SqlitePool, apply: bool) -> Result<()> {
+    let report = retitle(pool, Utc::now(), apply).await?;
+    let mode = if apply { "applied" } else { "DRY RUN, nothing written; --apply to write" };
+    println!("inbox retitle ({mode}):");
+    println!("\n  {} pending proposal(s) retitled", report.retitled.len());
+    for (company, old, new) in &report.retitled {
+        println!("    {company}: {:?}\n      -> {new:?}", old.as_deref().unwrap_or("(no role)"));
+    }
+    println!("\n  {} pending proposal(s) removed: already in your tracker", report.already_tracked.len());
+    for (company, role) in &report.already_tracked {
+        println!("    {company}: {role:?}");
+    }
+    println!("\n  {} pending proposal(s) removed: duplicate of another proposal", report.duplicates.len());
+    for (company, role, raised) in &report.duplicates {
+        match raised {
+            Some(status) => println!("    {company}: {role:?}  (the one kept now implies {status})"),
+            None => println!("    {company}: {role:?}"),
+        }
+    }
+    println!("\n  {} pending proposal(s) left for you: tracked, but this one is further along", report.ahead_of_tracker.len());
+    for (company, role, tracked, implied) in &report.ahead_of_tracker {
+        println!("    {company}: {role:?}  tracked at {tracked}, the email implies {implied}");
+    }
+    println!("\n  {} tracked application title(s) corrected", report.applications.len());
+    for (company, old, new) in &report.applications {
+        println!("    {company}: {old:?}\n      -> {new:?}");
     }
     Ok(())
 }
@@ -936,6 +1224,66 @@ mod tests {
                 "{snippet}"
             );
         }
+    }
+
+    /// Titles that reached the tracker or the review queue on 2026-11-02 with the rest of their
+    /// sentence attached, or with the word that introduced them still in front. Paraphrased
+    /// shapes, not the mail itself. Each returned the garbled title before this fix.
+    #[test]
+    fn a_role_ends_where_its_sentence_moves_on() {
+        let cases = [
+            (
+                "Thanks for your interest! Your application for the Compiler Engineering Intern - \
+                 Summer 2027 role has been received and our team will review it",
+                "Compiler Engineering Intern - Summer 2027",
+            ),
+            (
+                "Your application for Summer 2027 Intern - Software Engineering has been Received",
+                "Summer 2027 Intern - Software Engineering",
+            ),
+            (
+                "Thank you for your application for Summer Intern - Software Engineering and it is \
+                 being reviewed by our recruiting team",
+                "Summer Intern - Software Engineering",
+            ),
+            (
+                "Thanks for your application for the Software Engineer Intern / Basketball \
+                 Operations position with the Oklahoma City Thunder. We will",
+                "Software Engineer Intern / Basketball Operations",
+            ),
+            (
+                "Thank you for your interest in TetraMem Inc and the US 2026 Software - Machine \
+                 Learning Intern position",
+                "US 2026 Software - Machine Learning Intern",
+            ),
+            (
+                "Your application for the position of Systems Software Development Engineer \
+                 Intern, Annapurna Labs - 2027. Please finish it",
+                "Systems Software Development Engineer Intern, Annapurna Labs - 2027",
+            ),
+            (
+                "Please complete the assessment for your application for position 130043 - \
+                 QA/Test Engineer Intern-Poughkeepsie, NY",
+                "QA/Test Engineer Intern-Poughkeepsie, NY",
+            ),
+        ];
+        for (snippet, expected) in cases {
+            assert_eq!(role_from(Some("Thank you"), Some(snippet)).as_deref(), Some(expected), "{snippet}");
+        }
+    }
+
+    /// The new cuts must not eat a role that merely contains their words.
+    #[test]
+    fn a_role_containing_and_or_it_keeps_them() {
+        assert_eq!(
+            role_from(None, Some("Your application for Information Systems and IT Intern - Summer 2027.")).as_deref(),
+            Some("Information Systems and IT Intern - Summer 2027")
+        );
+        // "and the" after a marker that is not about interest is part of the role.
+        assert_eq!(
+            role_from(None, Some("Your application for Research and the Arts Intern.")).as_deref(),
+            Some("Research and the Arts Intern")
+        );
     }
 
     /// The broad new markers are safe only because of the "intern" gate. These must stay `None`:
@@ -1158,6 +1506,200 @@ mod tests {
         .await
         .expect("verdict");
         id.to_string()
+    }
+
+    /// A stored message and its verdict, with the text the title is read from.
+    async fn seed_mail(pool: &SqlitePool, id: &str, snippet: &str) -> String {
+        seed_verdict(pool, id).await;
+        sqlx::query("UPDATE email_messages SET subject = 'Thank you', snippet = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(snippet)
+            .execute(pool)
+            .await
+            .expect("snippet");
+        id.to_string()
+    }
+
+    /// A pending proposal as the old parser wrote it: the stored title and its key.
+    async fn seed_stored_proposal(pool: &SqlitePool, id: &str, verdict: &str, company: &str, title: &str) {
+        sqlx::query(
+            "INSERT INTO application_proposals
+                 (id, user_id, verdict_id, company_key, company_name, title, role_key,
+                  implied_status, created_at)
+             VALUES (?1, 'u1', ?2, ?3, ?4, ?5, ?6, 'applied', '2026-11-02T00:00:00+00:00')",
+        )
+        .bind(id)
+        .bind(verdict)
+        .bind(company_key(company))
+        .bind(company)
+        .bind(title)
+        .bind(role_key(Some(title)))
+        .execute(pool)
+        .await
+        .expect("proposal");
+    }
+
+    async fn seed_application(pool: &SqlitePool, id: &str, company: &str, title: &str) {
+        sqlx::query(
+            "INSERT INTO internship_applications
+                 (id, user_id, company_name, title, url, snapshot_json, snapshot_at, status,
+                  applied_at, status_changed_at, created_at, updated_at)
+             VALUES (?1, 'u1', ?2, ?3, 'https://example.com', '{}', '2026-10-01', 'applied',
+                     '2026-10-01', '2026-10-01', '2026-10-01', '2026-10-01')",
+        )
+        .bind(id)
+        .bind(company)
+        .bind(title)
+        .execute(pool)
+        .await
+        .expect("application");
+    }
+
+    async fn proposal_titles(pool: &SqlitePool) -> Vec<(String, Option<String>, String)> {
+        sqlx::query_as("SELECT id, title, role_key FROM application_proposals ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("titles")
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_corrects_a_pending_title_and_the_key_it_is_matched_on(pool: SqlitePool) {
+        seed_user(&pool).await;
+        let verdict = seed_mail(&pool, "m1", "Your application for the Compiler Engineering Intern - Summer 2027 role has been received.").await;
+        seed_stored_proposal(&pool, "p1", &verdict, "NVIDIA", "Compiler Engineering Intern - Summer 2027 role has been received").await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        assert_eq!(report.retitled.len(), 1);
+        let rows = proposal_titles(&pool).await;
+        assert_eq!(rows[0].1.as_deref(), Some("Compiler Engineering Intern - Summer 2027"));
+        assert_eq!(rows[0].2, role_key(Some("Compiler Engineering Intern - Summer 2027")), "the key moves with the title");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_removes_a_proposal_its_corrected_role_shows_was_already_tracked(pool: SqlitePool) {
+        // The Thunder case: tracked all along, proposed only because the title ran on.
+        seed_user(&pool).await;
+        seed_application(&pool, "a1", "Oklahoma City Thunder", "Software Engineer Intern / Basketball Operations").await;
+        let verdict = seed_mail(&pool, "m1", "Thanks for your application for the Software Engineer Intern / Basketball Operations position with the Oklahoma City Thunder.").await;
+        seed_stored_proposal(&pool, "p1", &verdict, "Oklahoma City Thunder", "Software Engineer Intern / Basketball Operations position with the Oklahoma City Thunder").await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        assert_eq!(report.already_tracked.len(), 1);
+        assert!(proposal_titles(&pool).await.is_empty(), "no question left about an application you track");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_removes_a_proposal_that_becomes_a_duplicate_and_keeps_the_other(pool: SqlitePool) {
+        // TetraMem: one email read the role cleanly, another with the employer in front.
+        seed_user(&pool).await;
+        let clean = seed_mail(&pool, "m1", "Your application for US 2026 Software - Machine Learning Intern.").await;
+        seed_stored_proposal(&pool, "p1", &clean, "TetraMem", "US 2026 Software - Machine Learning Intern").await;
+        let garbled = seed_mail(&pool, "m2", "Thank you for your interest in TetraMem Inc and the US 2026 Software - Machine Learning Intern position.").await;
+        seed_stored_proposal(&pool, "p2", &garbled, "TetraMem", "TetraMem Inc and the US 2026 Software - Machine Learning Intern").await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        assert_eq!(report.duplicates.len(), 1);
+        let rows = proposal_titles(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "p1", "the one that was already right stays");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_removed_duplicate_never_takes_the_further_status_with_it(pool: SqlitePool) {
+        // IBM: the confirmation proposed `applied`, the assessment reminder `oa`, one role.
+        seed_user(&pool).await;
+        let confirmation = seed_mail(&pool, "m1", "Your application for QA Engineer Intern - Poughkeepsie - 130043.").await;
+        seed_stored_proposal(&pool, "p1", &confirmation, "IBM", "QA Engineer Intern - Poughkeepsie - 130043").await;
+        let assessment = seed_mail(&pool, "m2", "Please complete the assessment for your application for position 130043 - QA Engineer Intern - Poughkeepsie.").await;
+        seed_stored_proposal(&pool, "p2", &assessment, "IBM", "position 130043 - QA Engineer Intern - Poughkeepsie").await;
+        sqlx::query("UPDATE application_proposals SET implied_status = 'oa' WHERE id = 'p2'")
+            .execute(&pool)
+            .await
+            .expect("oa");
+
+        retitle(&pool, Utc::now(), true).await.expect("retitle");
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, implied_status, verdict_id FROM application_proposals")
+                .fetch_all(&pool)
+                .await
+                .expect("rows");
+        assert_eq!(rows, [("p1".to_string(), "oa".to_string(), "m2".to_string())], "one proposal, at oa, citing the OA email");
+
+        // And settled: its title is read from the email it now cites, so a second run has
+        // nothing left to correct.
+        let again = retitle(&pool, Utc::now(), true).await.expect("second run");
+        assert!(again.retitled.is_empty() && again.duplicates.is_empty(), "{again:?}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_proposal_ahead_of_its_tracked_application_is_left_alone(pool: SqlitePool) {
+        // Tracked at `applied`; the email says OA. That is news, not a duplicate.
+        seed_user(&pool).await;
+        seed_application(&pool, "a1", "Workiva", "Summer 2027 Intern - Software Engineering").await;
+        let verdict = seed_mail(&pool, "m1", "Your application for Summer 2027 Intern - Software Engineering has been Received").await;
+        seed_stored_proposal(&pool, "p1", &verdict, "Workiva", "Summer 2027 Intern - Software Engineering has been Received").await;
+        sqlx::query("UPDATE application_proposals SET implied_status = 'oa'")
+            .execute(&pool)
+            .await
+            .expect("oa");
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        assert_eq!(report.ahead_of_tracker.len(), 1);
+        assert_eq!(proposal_titles(&pool).await.len(), 1, "not removed");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_is_a_dry_run_unless_applied(pool: SqlitePool) {
+        seed_user(&pool).await;
+        let verdict = seed_mail(&pool, "m1", "Your application for Summer 2027 Intern - Software Engineering has been Received").await;
+        seed_stored_proposal(&pool, "p1", &verdict, "Workiva", "Summer 2027 Intern - Software Engineering has been Received").await;
+        let before = proposal_titles(&pool).await;
+
+        let report = retitle(&pool, Utc::now(), false).await.expect("dry run");
+        assert_eq!(report.retitled.len(), 1, "the dry run reports what it would do");
+        assert_eq!(proposal_titles(&pool).await, before, "and writes none of it");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_never_touches_a_reviewed_proposal(pool: SqlitePool) {
+        // A reviewed proposal is an answer you gave; its title is part of what you answered.
+        seed_user(&pool).await;
+        let verdict = seed_mail(&pool, "m1", "Your application for the Compiler Engineering Intern role has been received.").await;
+        seed_stored_proposal(&pool, "p1", &verdict, "NVIDIA", "Compiler Engineering Intern role has been received").await;
+        sqlx::query("UPDATE application_proposals SET reviewed_at = '2026-11-01', accepted = 0")
+            .execute(&pool)
+            .await
+            .expect("review");
+        let before = proposal_titles(&pool).await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        assert!(report.retitled.is_empty());
+        assert_eq!(proposal_titles(&pool).await, before);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_fixes_a_garbled_tracked_title_and_leaves_a_posting_title_alone(pool: SqlitePool) {
+        seed_user(&pool).await;
+        seed_application(&pool, "a1", "Workiva", "Summer 2027 Intern - Software Engineering has been Received").await;
+        seed_application(&pool, "a2", "Qualcomm", "position Machine Learning Engineering Internship - Summer 2027 - 3095746").await;
+        // From a posting. The parser would cut it at " at " if it were ever re-parsed.
+        seed_application(&pool, "a3", "Scale AI", "Software Engineer Intern at Scale - Summer 2027").await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        let titles: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, title FROM internship_applications ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("titles");
+        assert_eq!(
+            titles,
+            [
+                ("a1".to_string(), "Summer 2027 Intern - Software Engineering".to_string()),
+                ("a2".to_string(), "Machine Learning Engineering Internship - Summer 2027 - 3095746".to_string()),
+                ("a3".to_string(), "Software Engineer Intern at Scale - Summer 2027".to_string()),
+            ]
+        );
+        assert_eq!(report.applications.len(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
