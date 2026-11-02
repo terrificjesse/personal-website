@@ -200,6 +200,12 @@ pub async fn load_live_postings(pool: &SqlitePool, source: Option<&str>) -> Resu
 ///   October postings "Summer 2026". The season is kept, because the year is the part that is
 ///   provably wrong and "Summer" is still what a reader filters by.
 fn as_presented(mut posting: Posting) -> Posting {
+    // A board can publish a heading as its company name. Axon's Greenhouse board is titled "Join
+    // Our Talent Community", and that overwrote Simplify's "Axon" on five postings, one of them
+    // live on the public listing (2026-11-02). Its key was right all along, so show that.
+    if !crate::internships::company_match::is_company_name(&normalize::company_key(&posting.company_name)) {
+        posting.company_name = posting.company_key.clone();
+    }
     posting.company_name = normalize::display_company_name(&posting.company_name);
     let existed_since = match posting.posted_at {
         Some(posted) if !posting.posted_at_is_estimated => posted.min(posting.first_seen_at),
@@ -316,6 +322,17 @@ mod tests {
             expired_at: None,
             expiry_reason: None,
         }
+    }
+
+    /// Axon's Greenhouse board publishes "Join Our Talent Community" as its company name.
+    #[test]
+    fn a_heading_published_as_the_company_name_shows_the_company_instead() {
+        let mut heading = row("p1");
+        heading.company_key = "axon".into();
+        heading.company_name = "Join Our Talent Community".into();
+        assert_eq!(as_presented(heading.into_posting()).company_name, "Axon");
+        // A real name is left exactly as the source spelled it.
+        assert_eq!(as_presented(row("p2").into_posting()).company_name, "Acme");
     }
 
     // --- the translation itself, tested directly ---

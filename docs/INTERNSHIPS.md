@@ -427,6 +427,25 @@ except while it is the selected sort, so an old `?sort=deadline` link still says
 The backend still accepts it: unhiding it is one line in `page.tsx`'s `SORTS`, and is the
 thing to do once a source starts supplying deadlines.
 
+### A board's heading is not a company name — 2026-11-02
+
+Axon's Greenhouse board is titled **"Join Our Talent Community"**, and the adapter takes a
+board's title as the company name. That replaced Simplify's "Axon" on five postings, one of them
+live on the public listing. The `company_key` was "axon" throughout; only the displayed name was
+wrong. The inbox then named a Caterpillar application after the same phrase, because a corpus
+name outranks a sender (`docs/HUNT.md`).
+
+Three changes, none of which rewrites a stored row:
+
+- `company_match::NOT_COMPANY_NAMES` gains the heading, so nothing treats it as an employer.
+- **The upsert keeps the stored name** when the incoming one fails `is_company_name`, the same
+  way it already keeps a real name against a slug-derived one (`SLUG_NAMED_SOURCES`). Simplify's
+  "Axon" therefore survives every later Greenhouse sighting.
+- **The read path shows the key instead** (`store::as_presented`) when a stored name is not a
+  company name. The live posting reads "Axon" now, before any collection runs.
+
+Red-checked: each of the two tests fails with its half removed.
+
 ### Openings are folded into one row — contract, 2026-10-19
 
 The live listing showed the same job as several identical rows: Palo Alto Networks had three

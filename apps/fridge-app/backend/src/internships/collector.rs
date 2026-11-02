@@ -612,7 +612,13 @@ async fn upsert_posting(
     .bind(i64::from(estimated))
     .bind(posting.deadline.map(|d| d.to_rfc3339()))
     .bind(now.to_rfc3339())
-    .bind(i64::from(SLUG_NAMED_SOURCES.contains(&posting.source.as_str())))
+    // Keep the stored name when this source cannot know it (a slug), or when what it sent is
+    // not a company name at all: Axon's Greenhouse board titles itself "Join Our Talent
+    // Community", and that replaced Simplify's "Axon" on five postings (2026-11-02).
+    .bind(i64::from(
+        SLUG_NAMED_SOURCES.contains(&posting.source.as_str())
+            || !crate::internships::company_match::is_company_name(&super::normalize::company_key(&posting.company_name)),
+    ))
     .fetch_one(pool)
     .await?;
 
@@ -1380,6 +1386,32 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(names, vec!["Cohere".to_string()], "one posting, and the real name kept");
+    }
+
+    /// A heading a board publishes as its company name never replaces a real one.
+    #[tokio::test]
+    async fn a_heading_published_as_a_company_name_never_replaces_a_real_one() {
+        let pool = test_pool().await;
+        let url = "https://job-boards.greenhouse.io/axontalentcommunity/jobs/7837133003";
+        let named = raw("simplify", "s-1", url, "Software Engineering Intern", "Axon");
+        let heading = raw("greenhouse", "g-1", url, "Software Engineering Intern", "Join Our Talent Community");
+        collect_with(
+            &pool,
+            "manual",
+            vec![
+                FakeSource::arc("simplify", SourceFetch::success(vec![named])),
+                FakeSource::arc("greenhouse", SourceFetch::success(vec![heading])),
+            ],
+            ctx().await,
+        )
+        .await
+        .expect("collects");
+
+        let names: Vec<String> = sqlx::query_scalar("SELECT company_name FROM internship_postings")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["Axon".to_string()], "one posting, and the real name kept");
     }
 
     /// The other direction still works: a slug fills in until a source that knows the name
