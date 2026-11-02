@@ -999,8 +999,25 @@ Run after a `.backup` (`fridge.db.pre-row-fixes-2026-11-02`), with each dry run 
 54 tracked rows, `verify` 54/54 with 0 mismatches, OKC `rejected` through its own proposal,
 Firmware `applied`.
 
-**The cause is still live.** The company guesser can take a sender's display name, a department
-or a person ("Data Solutions", "Aaron Simonds"), over the email's domain. That is its own fix.
+**The cause, fixed the same day.** The company guesser took a sender's display name, a
+department or a person ("Data Solutions", "Aaron Simonds"), over the email's domain.
+`employer_from_sender` now trusts a display name at an employer's own domain only when it
+agrees with that domain (`agrees_with_domain`: one contains the other squashed, or the domain is
+its initials, as `hrt` is Hudson River Trading). On a recruiting platform's domain the display
+name is still all there is, and three platforms the new rule would otherwise have named as the
+employer joined `ATS_DOMAINS`: Gem, HackerRank for Work and ClearCompany.
+
+Of the 16 live senders whose display name and domain disagreed, the domain was right at every
+employer domain. The display name was right only on a platform domain or under an abbreviating
+domain, and both cases are kept. Across all 264 stored messages, re-run old and new with the
+real postings corpus, 2 company guesses change, both OKC's ("data solutions" → "okcthunder"), and
+0 categories. Nutanix no longer reaches this fallback at all: it has since entered the postings
+corpus, which is consulted first.
+
+**What it does not fix:** a domain that abbreviates an employer the corpus spells out. OKC mail
+now reads "okcthunder", which will not match the tracked "Oklahoma City Thunder". That is a
+miss, which rule 8 makes safe, rather than a wrong match. At worst it is an "Okcthunder" offer
+to reject.
 
 #### What this did not change
 

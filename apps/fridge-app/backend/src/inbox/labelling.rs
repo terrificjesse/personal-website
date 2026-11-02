@@ -47,17 +47,18 @@ use super::classify::Category;
 
 /// Mail received at or after this instant has never been seen by the rules being measured.
 ///
-/// The rules last changed on 2026-11-02, revised against the owner's first 90 labels, all of
-/// which are therefore in-sample (`labelsets/fresh-2026-10.csv`, ledger beside it). Set to the
-/// minute of that change rather than the next midnight: every message received before it had
-/// been read while tuning. Before that, 2026-09-22 (`f454449`).
+/// The rules last changed on 2026-11-02, twice: revised against the owner's first 90 labels
+/// (all therefore in-sample: `labelsets/fresh-2026-10.csv`, ledger beside it), and then the
+/// sender fallback of the company guesser, which moved this from 20:46Z to the minute it landed.
+/// Set to the minute rather than the next midnight: every message received before it had been
+/// read while tuning. Before that, 2026-09-22 (`f454449`).
 ///
 /// **Move this whenever `classify.rs` changes**, to the moment of the change. [`HELD_OUT_RULES`]
 /// and its test make that impossible to forget.
-pub const HELD_OUT_SINCE: &str = "2026-11-02T20:46:00+00:00";
+pub const HELD_OUT_SINCE: &str = "2026-11-02T21:25:00+00:00";
 
 /// The rules fingerprint ([`super::labelset::rules_fingerprint`]) [`HELD_OUT_SINCE`] belongs to.
-pub const HELD_OUT_RULES: &str = "1959b41978bc";
+pub const HELD_OUT_RULES: &str = "f3c48143a0ef";
 
 /// How many labels make a first honest measurement. A suggestion shown to the labeller, not a
 /// cap: the shuffle means stopping anywhere is still a random sample.

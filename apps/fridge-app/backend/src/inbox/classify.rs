@@ -640,6 +640,12 @@ const ATS_DOMAINS: &[&str] = &[
     "taleo.net",
     "brassring.com",
     "jobvite.com",
+    // Recruiting platforms that send in an employer's name, found 2026-11-02 when the sender
+    // fallback began preferring a domain over a display name. Without them it would have named
+    // the platform instead: "Epic Games Recruiting <…@appreview.gem.com>" as "gem".
+    "gem.com",
+    "hackerrankforwork.com",
+    "clearcompany.com",
 ];
 
 /// Lowercase, and flatten the punctuation real subject lines actually use.
@@ -1114,6 +1120,14 @@ fn employer_from_sender(sender: &str, headline: &str, context: &Context<'_>) -> 
         .iter()
         .any(|relay| address.ends_with(relay) || address.ends_with(&format!(".{relay}")));
 
+    // The employer's own domain, when the mail came from one: `recruiting.workiva.com` is
+    // Workiva, `myworkday.com` is nobody.
+    let own_domain = address.rsplit('@').next().and_then(|domain| {
+        let is_platform = ATS_DOMAINS.iter().chain(RELAY_DOMAINS.iter()).any(|d| domain.ends_with(d));
+        let labels: Vec<&str> = domain.split('.').collect();
+        (!is_platform && labels.len() >= 2).then(|| labels[labels.len() - 2].to_string())
+    });
+
     // 2. The display name — human-written, and spells the employer the way the employer does.
     //    Checked BEFORE the domain, which gives a squashed slug: one Chicago Trading Company
     //    email carries the name and another only `chicagotrading.com`, and taking the domain
@@ -1122,24 +1136,26 @@ fn employer_from_sender(sender: &str, headline: &str, context: &Context<'_>) -> 
     //    Skipped on a relay. There the display name is a person — on a forwarded Handshake
     //    receipt it is the user themselves, and reading that as an employer would file their
     //    applications under their own name.
+    //
+    //    **And, at an employer's own domain, only when it agrees with that domain** (since
+    //    2026-11-02). There the display name is as often a department or a person as the
+    //    employer: "Data Solutions <…@okcthunder.com>" made a duplicate "Data Solutions"
+    //    application beside the Oklahoma City Thunder one, and "Aaron Simonds
+    //    <…@jobvite.nutanix.com>" proposed a Nutanix application as "Aaron Simonds". Of the 16
+    //    live senders whose two disagreed, the domain was right at every employer domain. The
+    //    display name was right only where the domain is a platform (Gem, HackerRank, Paycom),
+    //    where it is still used, or where the domain abbreviates it (Hudson River Trading at
+    //    `hrt.careers`), which `agrees_with_domain` accepts.
     if !from_relay
         && let Some(name) = clean_employer(&display)
+        && own_domain.as_deref().is_none_or(|label| agrees_with_domain(&name, label))
     {
         return Some(canonicalize(name, context));
     }
 
-    // 3. The domain, unless it belongs to an ATS or a relay — `recruiting.workiva.com` is
-    //    Workiva, `myworkday.com` is nobody.
-    if let Some(domain) = address.rsplit('@').next() {
-        let is_relay = ATS_DOMAINS.iter().chain(RELAY_DOMAINS.iter()).any(|d| domain.ends_with(d));
-        if !is_relay {
-            let labels: Vec<&str> = domain.split('.').collect();
-            if labels.len() >= 2
-                && let Some(name) = clean_employer(labels[labels.len() - 2])
-            {
-                return Some(canonicalize(name, context));
-            }
-        }
+    // 3. The domain, unless it belongs to an ATS or a relay.
+    if let Some(name) = own_domain.as_deref().and_then(clean_employer) {
+        return Some(canonicalize(name, context));
     }
 
     // 4. The local part, where an employer's name ends up when the domain is an ATS:
@@ -1156,6 +1172,16 @@ fn employer_from_sender(sender: &str, headline: &str, context: &Context<'_>) -> 
         .next()
         .and_then(|local| clean_employer(&local.replace(['-', '.', '_'], " ")))
         .map(|name| canonicalize(name, context))
+}
+
+/// Whether a display name and a domain label name the same employer: one contains the other,
+/// squashed ("chicago trading company" and `chicagotrading`), or the label is its initials
+/// ("hudson river trading" and `hrt`).
+fn agrees_with_domain(display: &str, label: &str) -> bool {
+    let squashed = display.replace(' ', "");
+    let initials: String = display.split(' ').filter_map(|word| word.chars().next()).collect();
+    !label.is_empty()
+        && (squashed.contains(label) || label.contains(squashed.as_str()) || initials == label)
 }
 
 /// Spell a guessed employer the way the corpus spells it, when the corpus knows them.
@@ -2005,6 +2031,44 @@ mod tests {
             guess("Jesse Li <jesseli@andrew.cmu.edu>", "Fwd: Application sent to Glencliff Labs — here's what's next"),
             Some("glencliff labs".to_string())
         );
+    }
+
+    /// At an employer's own domain the display name is as often a department or a person.
+    /// Paraphrased from the 16 live senders whose display name and domain disagreed, 2026-11-02.
+    #[test]
+    fn a_department_or_a_person_at_an_employers_own_domain_is_not_the_employer() {
+        let companies: Vec<String> = vec!["stripe".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let guess = |from: &str| classify(Some(from), Some("Your application"), None, &ctx).company_guess;
+
+        // A department.
+        assert_eq!(guess("Data Solutions <datasolutions@okcthunder.com>"), Some("okcthunder".to_string()));
+        assert_eq!(guess("Human Resources <noreply@honeywell.com>"), Some("honeywell".to_string()));
+        // A person, at the employer's own subdomain on an ATS host.
+        assert_eq!(guess("Aaron Simonds <notification@jobvite.nutanix.com>"), Some("nutanix".to_string()));
+        // The ATS's own system name.
+        assert_eq!(guess("Jobvite System <notification@jobvite.nutanix.com>"), Some("nutanix".to_string()));
+    }
+
+    /// The other side: where the display name IS the employer, it is still used.
+    #[test]
+    fn a_display_name_that_agrees_with_its_domain_or_sends_through_a_platform_is_kept() {
+        let companies: Vec<String> = vec!["stripe".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let guess = |from: &str| classify(Some(from), Some("Your application"), None, &ctx).company_guess;
+
+        // Agrees, squashed: the display name spells what the domain squashes.
+        assert_eq!(
+            guess("Chicago Trading Company <careers@chicagotrading.com>"),
+            Some("chicago trading company".to_string())
+        );
+        // Agrees by initials.
+        assert_eq!(guess("Hudson River Trading <no-reply@hrt.careers>"), Some("hudson river trading".to_string()));
+        // A recruiting platform's domain names nobody, so the display name is all there is.
+        assert_eq!(guess("Epic Games Recruiting <no-reply@appreview.gem.com>"), Some("epic games".to_string()));
+        // Whatever the display name cleans to, the platform is never the employer.
+        let microsoft = guess("Microsoft Global Talent Acquisition <noreply@hackerrankforwork.com>");
+        assert!(microsoft.as_deref().is_some_and(|name| name.starts_with("microsoft")), "{microsoft:?}");
     }
 
     #[test]
