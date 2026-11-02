@@ -144,6 +144,11 @@ pub const NOT_COMPANY_NAMES: &[&str] = &[
     "workday",
     "ashby",
     "lever",
+    // A careers-page heading scraped as an employer: 5 postings carried it on 2026-11-02, and
+    // the inbox then named a Caterpillar application after it, because a corpus name outranks
+    // the sender. Not a company, whichever source produced it.
+    "join our talent community",
+    "talent community",
 ];
 
 /// Whether a normalized key names an employer at all.

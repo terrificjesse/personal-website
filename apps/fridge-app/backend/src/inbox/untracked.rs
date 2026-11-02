@@ -315,6 +315,9 @@ const SENTENCE_CONTINUATIONS: &[&str] = &[
     " is being ",
     " position with ",
     " role with ",
+    // Optiver: "…your application for the Institutional Trader Intern (2027 Start - Chicago)
+    // role here at Optiver". " at " already ends the role; this is the "role here" it leaves.
+    " role here",
 ];
 
 /// `text` up to the first of `markers`, compared ASCII-case-insensitively.
@@ -834,6 +837,10 @@ pub struct RetitleReport {
     pub ahead_of_tracker: Vec<(String, String, String, String)>,
     /// Tracked applications whose title carried the same garbling: company, old, new.
     pub applications: Vec<(String, String, String)>,
+    /// Pending proposals whose employer was re-guessed: old company, new company. Added
+    /// 2026-11-02 with the sender-name fix: a recruiter ("Aaron Simonds") or a department
+    /// ("Epic Human Resources") had been stored as the employer.
+    pub renamed: Vec<(String, String)>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -845,6 +852,7 @@ struct PendingTitle {
     title: Option<String>,
     implied_status: String,
     verdict_id: String,
+    from_address: Option<String>,
     subject: Option<String>,
     snippet: Option<String>,
 }
@@ -882,7 +890,7 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
 
     let pending: Vec<PendingTitle> = sqlx::query_as(
         "SELECT p.id, p.user_id, p.company_key, p.company_name, p.title, p.implied_status,
-                p.verdict_id, m.subject, m.snippet
+                p.verdict_id, m.from_address, m.subject, m.snippet
            FROM application_proposals p
            JOIN email_verdicts v ON v.id = p.verdict_id
            JOIN email_messages m ON m.id = v.message_id
@@ -892,14 +900,40 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
     .fetch_all(&mut *tx)
     .await?;
 
+    // The corpus the employer is guessed against, exactly as `backfill` builds it.
+    let corpus: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT lower(company_name) FROM internship_postings WHERE company_name IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let context = super::classify::Context { known_companies: &corpus };
+
     for row in pending {
-        // Exactly what `sync::propose_status` derives for this message today.
-        let Some(title) = role_from(row.subject.as_deref(), row.snippet.as_deref()) else {
-            continue;
-        };
-        if row.title.as_deref() == Some(title.as_str()) {
+        // Exactly what `sync::propose_status` derives for this message today. A role it can no
+        // longer read keeps the stored one rather than losing it.
+        let title = role_from(row.subject.as_deref(), row.snippet.as_deref()).or_else(|| row.title.clone());
+        // The employer, re-guessed by the current classifier from the sender and the subject —
+        // the fields `guess_company` trusts — and kept as stored when today's guess is not one.
+        let guessed = super::classify::classify(
+            row.from_address.as_deref(),
+            row.subject.as_deref(),
+            row.snippet.as_deref(),
+            &context,
+        )
+        .company_guess
+        .filter(|company| is_proposable_company(company));
+        let company_changed = guessed.as_deref().is_some_and(|company| company_key(company) != row.company_key);
+        let title_changed = title != row.title;
+        if !company_changed && !title_changed {
             continue;
         }
+        let company_name = match guessed.as_deref().filter(|_| company_changed) {
+            Some(company) => display_name_for(pool, company).await?,
+            None => row.company_name.clone(),
+        };
+        let row_company_key = if company_changed { company_key(&company_name) } else { row.company_key.clone() };
+        // The label every report line below uses for this proposal's role.
+        let role = title.clone().unwrap_or_else(|| "(no role)".to_string());
 
         let applications: Vec<super::advance::TrackedApplication> = sqlx::query_as(
             "SELECT id, company_name AS company, title FROM internship_applications WHERE user_id = ?",
@@ -908,7 +942,7 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
         .fetch_all(&mut *tx)
         .await?;
         let implied = ApplicationStatus::parse(&row.implied_status);
-        if let Some(tracked_id) = super::advance::match_application(Some(&row.company_name), Some(&title), &applications) {
+        if let Some(tracked_id) = super::advance::match_application(Some(&company_name), title.as_deref(), &applications) {
             // Removed only when the tracker already knows as much as this proposal does. An OA
             // proposal for an application tracked at `applied` is news, not a duplicate, and
             // deleting it would lose the one record that the assessment arrived.
@@ -921,24 +955,24 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
                 _ => true,
             };
             if ahead {
-                report.ahead_of_tracker.push((row.company_name, title, tracked, row.implied_status));
+                report.ahead_of_tracker.push((company_name, role, tracked, row.implied_status));
                 continue;
             }
             sqlx::query("DELETE FROM application_proposals WHERE id = ?")
                 .bind(&row.id)
                 .execute(&mut *tx)
                 .await?;
-            report.already_tracked.push((row.company_name, title));
+            report.already_tracked.push((company_name, role));
             continue;
         }
 
-        let key = role_key(Some(&title));
+        let key = role_key(title.as_deref());
         let taken: Option<(String, String)> = sqlx::query_as(
             "SELECT id, implied_status FROM application_proposals
               WHERE user_id = ? AND company_key = ? AND role_key = ? AND id <> ?",
         )
         .bind(&row.user_id)
-        .bind(&row.company_key)
+        .bind(&row_company_key)
         .bind(&key)
         .bind(&row.id)
         .fetch_optional(&mut *tx)
@@ -968,17 +1002,27 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
                 .bind(&row.id)
                 .execute(&mut *tx)
                 .await?;
-            report.duplicates.push((row.company_name, title, raised));
+            report.duplicates.push((company_name, role, raised));
             continue;
         }
 
-        sqlx::query("UPDATE application_proposals SET title = ?, role_key = ? WHERE id = ?")
-            .bind(&title)
-            .bind(&key)
-            .bind(&row.id)
-            .execute(&mut *tx)
-            .await?;
-        report.retitled.push((row.company_name, row.title, title));
+        sqlx::query(
+            "UPDATE application_proposals SET title = ?, role_key = ?, company_name = ?, company_key = ?
+              WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(&key)
+        .bind(&company_name)
+        .bind(&row_company_key)
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await?;
+        if company_changed {
+            report.renamed.push((row.company_name.clone(), company_name.clone()));
+        }
+        if title_changed {
+            report.retitled.push((company_name, row.title, role));
+        }
     }
 
     let tracked: Vec<(String, String, String)> =
@@ -1015,8 +1059,9 @@ pub async fn retitle(pool: &SqlitePool, now: DateTime<Utc>, apply: bool) -> Resu
 const USAGE: &str = "\
 usage:
   inbox backfill-untracked        re-read stored mail and propose what it implies
-  inbox retitle [--apply]         re-read pending proposals' and tracked titles with the current
-                                  parser (a dry run without --apply)
+  inbox retitle [--apply]         re-read pending proposals' titles and employers, and tracked
+                                  titles, with the current rules (a dry run without --apply)
+  inbox untracked reject-id <id>  reject one proposal by id, where its company is ambiguous
   inbox untracked                 list proposals awaiting your review
   inbox untracked accept <company>   track it  (use `all` for every pending one)
   inbox untracked reject <company>   record that you did not apply there
@@ -1107,6 +1152,10 @@ async fn retitle_cli(pool: &SqlitePool, apply: bool) -> Result<()> {
     for (company, old, new) in &report.retitled {
         println!("    {company}: {:?}\n      -> {new:?}", old.as_deref().unwrap_or("(no role)"));
     }
+    println!("\n  {} pending proposal(s) given a corrected employer", report.renamed.len());
+    for (old, new) in &report.renamed {
+        println!("    {old:?} -> {new:?}");
+    }
     println!("\n  {} pending proposal(s) removed: already in your tracker", report.already_tracked.len());
     for (company, role) in &report.already_tracked {
         println!("    {company}: {role:?}");
@@ -1148,6 +1197,18 @@ async fn untracked_cli(pool: &SqlitePool, args: &[String]) -> Result<()> {
             }
             println!("\n  accept with: inbox untracked accept <company>   (or `all`)");
             return Ok(());
+        }
+        // By id, for the case the company form refuses: two proposals at one employer, one of
+        // them a duplicate. The same `decide` the page's Reject button calls.
+        [verb, id] if verb == "reject-id" => {
+            return match decide(pool, &user_id, id, false).await? {
+                Decision::Rejected => {
+                    println!("rejected {id}");
+                    Ok(())
+                }
+                Decision::NotFound => bail!("no pending proposal {id}"),
+                Decision::Created(_) => bail!("rejecting {id} created an application, which it never should"),
+            };
         }
         [verb, target] if verb == "accept" || verb == "reject" => (verb.as_str(), target.as_str()),
         _ => {
@@ -1265,6 +1326,11 @@ mod tests {
                 "Please complete the assessment for your application for position 130043 - \
                  QA/Test Engineer Intern-Poughkeepsie, NY",
                 "QA/Test Engineer Intern-Poughkeepsie, NY",
+            ),
+            (
+                "Thanks for your application for the Institutional Trader Intern (2027 Start - \
+                 Chicago) role here at Optiver.",
+                "Institutional Trader Intern (2027 Start - Chicago)",
             ),
         ];
         for (snippet, expected) in cases {
@@ -1511,7 +1577,12 @@ mod tests {
     /// A stored message and its verdict, with the text the title is read from.
     async fn seed_mail(pool: &SqlitePool, id: &str, snippet: &str) -> String {
         seed_verdict(pool, id).await;
-        sqlx::query("UPDATE email_messages SET subject = 'Thank you', snippet = ?2 WHERE id = ?1")
+        // From an ATS mailbox that names no employer, so the repair's company re-guess keeps the
+        // company each test stores rather than reading one off this fixture's sender.
+        sqlx::query(
+            "UPDATE email_messages SET subject = 'Thank you', snippet = ?2, from_address = 'no-reply@greenhouse.io'
+              WHERE id = ?1",
+        )
             .bind(id)
             .bind(snippet)
             .execute(pool)
@@ -1646,6 +1717,34 @@ mod tests {
         let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
         assert_eq!(report.ahead_of_tracker.len(), 1);
         assert_eq!(proposal_titles(&pool).await.len(), 1, "not removed");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retitle_renames_a_recruiter_to_the_employer_and_merges_what_that_reveals(pool: SqlitePool) {
+        // "Aaron Simonds" was the recruiter; the domain says Nutanix, and a Nutanix proposal for
+        // the same programme already existed.
+        seed_user(&pool).await;
+        let snippet = "Thank you for applying to our Summer 2027 Internship Program at Nutanix.";
+        let existing = seed_mail(&pool, "m1", snippet).await;
+        seed_stored_proposal(&pool, "p1", &existing, "Nutanix", "Summer 2027 Internship Program").await;
+        let recruiter = seed_mail(&pool, "m2", snippet).await;
+        sqlx::query("UPDATE email_messages SET from_address = 'Aaron Simonds <notification@jobvite.nutanix.com>' WHERE id = 'm2'")
+            .execute(&pool)
+            .await
+            .expect("sender");
+        sqlx::query("UPDATE email_messages SET from_address = 'Nutanix Recruiting <notification@jobvite.nutanix.com>' WHERE id = 'm1'")
+            .execute(&pool)
+            .await
+            .expect("sender");
+        seed_stored_proposal(&pool, "p2", &recruiter, "Aaron Simonds", "Summer 2027 Internship Program").await;
+
+        let report = retitle(&pool, Utc::now(), true).await.expect("retitle");
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, company_key FROM application_proposals")
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+        assert_eq!(rows, [("p1".to_string(), "nutanix".to_string())], "{report:?}");
+        assert_eq!(report.duplicates.len(), 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

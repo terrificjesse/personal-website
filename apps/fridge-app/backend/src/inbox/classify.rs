@@ -978,6 +978,19 @@ pub fn classify_with_body(
     // a stranger's email is about a job.
     let named_company = best_company_named(&sender, &headline, &text, context);
     let from_a_person = !sender.is_empty() && !is_machine_sender(&sender);
+    // An employer's own recruiting mailbox, for employers the postings corpus does not know.
+    // Narrower than `employer_from_sender`, which reads a name off almost any domain and is why
+    // the corpus-only rule above exists: here the display name must agree with the employer's
+    // own domain, as "Sandia Recruiting <sandia-recruiting@sandia.gov>" does. Added 2026-11-02:
+    // Sandia's talent-community invitation, labelled outreach by the owner, had reached Outreach
+    // only through a scraped heading in the corpus ("Join Our Talent Community"), and fell to
+    // disregarded once that junk was filtered.
+    //
+    // **And it has to be about employment** (`JOB_TOPIC`, in the text or the sender line): the
+    // first probe of this rule over the mailbox let in "Cursor Team <team@mail.cursor.com>", a
+    // product email whose display name agrees with its domain like any company's would.
+    let own_mailbox = employer_mailbox(&sender)
+        .filter(|_| hit(&text, JOB_TOPIC).or_else(|| hit(&sender, JOB_TOPIC)).is_some());
 
     // An assessment platform only ever writes to you in a hiring context, so its mail belongs
     // in the folder even when no branch above claimed it. "Verify your CodeSignal account" is
@@ -985,16 +998,22 @@ pub fn classify_with_body(
     // that GATES one, and disregarding it is how you find out too late.
     let from_a_platform = hit(&sender, ASSESSMENT_PLATFORMS);
 
-    if from_ats || from_a_platform.is_some() || (named_company.is_some() && from_a_person) {
+    if from_ats
+        || from_a_platform.is_some()
+        || ((named_company.is_some() || own_mailbox.is_some()) && from_a_person)
+    {
         // The evidence names the condition that actually opened the gate. Reporting the
         // company first looks tidier and lies when a machine sent the mail: a dry run said
         // "names reply in the sender, and a person sent it" about `no-reply@codesignal.com`,
         // which was wrong twice over in one sentence.
-        let evidence = match (&named_company, from_a_platform) {
-            (Some((company, found_in)), _) if from_a_person => {
+        let evidence = match (&named_company, from_a_platform, &own_mailbox) {
+            (Some((company, found_in)), _, _) if from_a_person => {
                 format!("names {company} in the {found_in}, and a person sent it")
             }
-            (_, Some(platform)) => {
+            (None, None, Some(company)) if from_a_person => {
+                format!("from {company}'s own recruiting mailbox, and a person sent it")
+            }
+            (_, Some(platform), _) => {
                 format!("from the assessment platform {platform:?}, but names no application")
             }
             _ => "from an ATS domain, but matches no application".to_string(),
@@ -1078,6 +1097,10 @@ const SENDER_ROLE_WORDS: &[&str] = &[
     "reply", "noreply", "donotreply", "jobs", "job", "hr", "people", "no", "do", "not",
     "the", "at", "via", "info", "admin", "mail", "mailer", "system", "systemmessage",
     "message", "messages", "alerts", "alert", "service", "services", "us", "inc", "llc",
+    // "Epic Human Resources <careers@epic.com>" named the employer "epic human resources",
+    // 2026-11-02: it contains the domain, so `agrees_with_domain` accepts it whole. Stripped only
+    // from the ends, like every word here, so a name with "human" inside it keeps it.
+    "human", "resources",
 ];
 
 /// Hosts that send on somebody else's behalf, so their domain names no employer.
@@ -1172,6 +1195,20 @@ fn employer_from_sender(sender: &str, headline: &str, context: &Context<'_>) -> 
         .next()
         .and_then(|local| clean_employer(&local.replace(['-', '.', '_'], " ")))
         .map(|name| canonicalize(name, context))
+}
+
+/// The employer, when the mail comes from that employer's own mailbox: a display name that
+/// agrees with a domain that is not a platform or a relay. `None` for everything else, including
+/// a department or a person at that domain, whose display name does not agree.
+fn employer_mailbox(sender: &str) -> Option<String> {
+    let (display, address) = split_sender(sender);
+    let domain = address.rsplit('@').next()?;
+    if ATS_DOMAINS.iter().chain(RELAY_DOMAINS.iter()).any(|d| domain.ends_with(d)) {
+        return None;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    let label = labels.len().checked_sub(2).map(|i| labels[i])?;
+    clean_employer(&display).filter(|name| agrees_with_domain(name, label))
 }
 
 /// Whether a display name and a domain label name the same employer: one contains the other,
@@ -2048,6 +2085,58 @@ mod tests {
         assert_eq!(guess("Aaron Simonds <notification@jobvite.nutanix.com>"), Some("nutanix".to_string()));
         // The ATS's own system name.
         assert_eq!(guess("Jobvite System <notification@jobvite.nutanix.com>"), Some("nutanix".to_string()));
+        // A department that contains the domain, which agreement alone would keep whole.
+        assert_eq!(guess("Epic Human Resources <careers@epic.com>"), Some("epic".to_string()));
+    }
+
+    /// An employer the corpus does not know, writing from its own recruiting mailbox. Sandia's
+    /// talent-community invitation, labelled outreach by the owner, had reached Outreach only
+    /// through a scraped heading in the corpus; once that junk was filtered it fell to
+    /// disregarded.
+    #[test]
+    fn an_employers_own_recruiting_mailbox_is_outreach_without_the_corpus() {
+        let companies: Vec<String> = vec!["stripe".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let invite = classify(
+            Some("Sandia Recruiting <sandia-recruiting@sandia.gov>"),
+            Some("You are invited to join Sandia's Talent Community!"),
+            Some("We invite you to join our Talent Community to stay updated on opportunities."),
+            &ctx,
+        );
+        assert_eq!(invite.category, Category::Outreach, "{invite:?}");
+
+        // A product mailbox agrees with its domain like any company's; it is not about a job.
+        let product = classify(
+            Some("Example Team <team@mail.exampleapp.com>"),
+            Some("New in Example: faster tab completion"),
+            Some("Here is what shipped this week."),
+            &ctx,
+        );
+        assert_eq!(product.category, Category::Disregarded, "{product:?}");
+
+        // A department at that kind of domain is not the employer's mailbox, and the guard is
+        // the same agreement the company guess uses.
+        let department = classify(
+            Some("Data Solutions <datasolutions@example-team.com>"),
+            Some("Quarterly newsletter"),
+            Some("Highlights from the season."),
+            &ctx,
+        );
+        assert_eq!(department.category, Category::Disregarded, "{department:?}");
+    }
+
+    /// A careers-page heading scraped into the postings corpus as a company.
+    #[test]
+    fn a_heading_in_the_postings_corpus_is_not_an_employer() {
+        let companies: Vec<String> = vec!["join our talent community".to_string()];
+        let ctx = Context { known_companies: &companies };
+        let verdict = classify(
+            Some("cat@myworkday.com"),
+            Some("Application Received for 2027 Summer Corporate Intern"),
+            Some("Thank you for applying. Join our Talent Community for updates."),
+            &ctx,
+        );
+        assert_ne!(verdict.company_guess.as_deref(), Some("join our talent community"), "{verdict:?}");
     }
 
     /// The other side: where the display name IS the employer, it is still used.

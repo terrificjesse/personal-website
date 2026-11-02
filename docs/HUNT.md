@@ -1014,6 +1014,37 @@ real postings corpus, 2 company guesses change, both OKC's ("data solutions" →
 0 categories. Nutanix no longer reaches this fallback at all: it has since entered the postings
 corpus, which is consulted first.
 
+**A follow-up sweep, same evening.** The review queue still held wrong employers:
+
+| Stored | Cause | Fix |
+|---|---|---|
+| "Epic Human Resources" | The display name *contains* the domain, so agreement keeps it whole | "human" and "resources" join `SENDER_ROLE_WORDS`, stripped from the ends like "recruiting" |
+| "Join Our Talent Community" (Caterpillar, also two Sandia mails) | A careers-page heading scraped into the postings corpus as a company (5 postings); a corpus name outranks the sender | `company_match::NOT_COMPANY_NAMES` |
+| "Aaron Simonds", plus Nutanix's program-level offer | A recruiter's name, and the program name for a role already offered | `inbox retitle` now re-guesses the employer too; then `inbox untracked reject-id` |
+| "Gmcareers" | GM's talent-community form, and General Motors is already tracked | `reject-id` |
+
+Filtering the corpus heading had a cost the probe caught. Sandia's talent-community invitation,
+labelled `outreach` by the owner, had reached Outreach only *through* that heading, and fell to
+disregarded without it, which would have been real mail disregarded. So the outreach gate gained
+`employer_mailbox`: a person-sent mail from an employer's own mailbox whose display name agrees
+with the domain, which must also be about employment (`JOB_TOPIC` in the text or sender line).
+The job-topic half exists because the first probe of the rule let in "Cursor Team
+<team@mail.cursor.com>", a product email. With it, over all 264 stored messages, 3 categories
+move, all away from disregarded: two IBM talent mails (one labelled `oa`) and Epic's feedback
+mail (labelled `outreach`). On the 90 labels nothing changes in-sample: 88/90, 0 junk, 0 real
+mail disregarded.
+
+**A probe that never ran looked like a pass.** The first run of that comparison reported no
+changes because the code did not compile, so the "after" file was empty and the diff had nothing
+to add. Every probe since checks that both sides have all 264 rows before it compares.
+
+`inbox retitle` re-derives a pending offer's employer with `classify` on the sender, subject and
+snippet against the live corpus. When today's guess is not proposable, it keeps the stored
+company. Applied 2026-11-02 after a `.backup` (`fridge.db.pre-sweep-2026-11-02`): 2 offers
+renamed (Caterpillar, Epic), the renamed Aaron Simonds offer merged as a duplicate, Optiver's
+tracked title lost "role here". A second run changes nothing. 38 offers remain, all real
+questions for the owner.
+
 **What it does not fix:** a domain that abbreviates an employer the corpus spells out. OKC mail
 now reads "okcthunder", which will not match the tracked "Oklahoma City Thunder". That is a
 miss, which rule 8 makes safe, rather than a wrong match. At worst it is an "Okcthunder" offer
