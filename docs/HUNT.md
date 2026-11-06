@@ -1540,6 +1540,48 @@ That can be worth it for a real defect, but it is the cost to weigh.
 The 10 messages' subjects and senders were deliberately not read for this, only their totals, so
 they remain held out. This was a **self-review**, against regenerated artifacts.
 
+### Later on 2026-11-06: the owner reported wrong labels, and they were right
+
+Nothing above could have shown this. The score only covers the 90 labelled messages, and every
+check on labels compared the database with itself. There are two separate problems.
+
+**1. Stale labels in Gmail, while the stored verdict is right.** `inbox audit-labels`, new and
+read-only, compares what is actually on each message with its verdict: 256 of 275 agree and 19 do
+not. 18 are named in its output and 1 is sealed or held out, so only counted.
+
+The cause is in `sync.rs`. Each pass walks the newest 100 messages, including ones it has already
+stored, and re-decides their label using the running binary's rules. `apply_label` adds the new
+label and overwrites `labels_applied`, **but never removes the old label**. A later `reclassify`
+then finds the record already correct and removes nothing, so `reclassify --labels` reports no
+drift and the old label stays on the message with no record of it.
+
+The evidence is a clean cut. 29 messages moved between two labelled categories on 2026-11-02. The
+18 received up to Oct 1 came out clean, and all 11 received from Oct 3 on kept the old label. The
+100th newest stored message at that moment was from Oct 1 at 18:23Z, which is close to that cut but
+not exact: the newest clean message arrived two minutes later, so it sits just inside that count.
+Gmail's list and our stored rows need not match one for one. **The cause is read from the code and
+fits this evidence, but no test or run has reproduced it yet.** The other 7 are 4 corrections from
+before removal existed, and 3 messages that have been disregarded at some point.
+
+Provenance matters because `SupersededLabel` exists so a hand-added label is never stripped. 15 of
+the 18 have an earlier verdict projecting the stray label, and 1 more has it in `labels_applied`.
+**2 have no evidence the agent applied the label**, so they should not be removed on assumption.
+
+**2. Wrong verdicts outside the labelled sample.** Reading the bodies of the older mail turned up
+six clearly wrong verdicts among the 145 messages the owner did not label: three missed rejections
+(of 27 visible, so at least 11%), an assessment invitation read as an interview because of "next
+rounds of selection", a required form with a deadline routed to Outreach with no alert, and a
+confirmation routed to Outreach. **This is not a score.** The rules' author found these by keyword
+and by eye, so there may be more, and it only sets a lower bound.
+
+The cost is concrete: one tracker row still reads `interview` after a rejection, and two pending
+offers read `applied` for applications that were rejected.
+
+**Nothing has been changed yet.** Fixing the verdicts changes `classify.rs`, which restarts the
+held-out window, and fixing the labels writes to the owner's mailbox, so both wait for the owner.
+This was a **self-review**. `compare` was checked by breaking it (3 of its tests fail), and the
+findings come from the mailbox and message bodies, not from reasoning about the rules.
+
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
 The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first

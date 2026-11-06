@@ -92,8 +92,8 @@ pub(super) async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client,
 /// Gmail answered 403 `rateLimitExceeded` for 52 of 83 on the first attempt. That is not a
 /// source pushing back on a scraper — it is our own mailbox asking us to slow down, so the
 /// scraping rule about giving up fast does not apply. Pace, and retry once.
-const FETCH_PACING: std::time::Duration = std::time::Duration::from_millis(150);
-const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const FETCH_PACING: std::time::Duration = std::time::Duration::from_millis(150);
+pub(super) const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(super) async fn fetch_body_politely(
     client: &reqwest::Client,
@@ -441,7 +441,11 @@ pub async fn relabel(pool: &SqlitePool, changes: &[Change]) -> Result<Vec<String
 /// the verdict and the label are written together. They can still come apart: a relabel that
 /// half-succeeded, or — as on 2026-09-10 — a correction applied before this module could remove
 /// anything, which updated `labels_applied` to the new name and left the old one on the message
-/// with nothing recording it. This finds that state from the data rather than from memory.
+/// with nothing recording it.
+///
+/// **It finds the first of those and cannot find the second.** It compares a verdict with our own
+/// record, and in the second case the record already reads correctly. `inbox audit-labels` reads
+/// the mailbox and finds both.
 pub async fn label_drift(pool: &SqlitePool) -> Result<Vec<Change>> {
     let rows: Vec<StoredVerdict> = sqlx::query_as(
         "SELECT m.id, m.gmail_message_id, m.from_address, m.subject, m.snippet,

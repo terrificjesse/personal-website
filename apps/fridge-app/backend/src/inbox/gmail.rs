@@ -209,6 +209,21 @@ pub async fn fetch_message(
     })
 }
 
+/// The label ids on a message right now. `format=minimal` carries no headers and no body.
+pub async fn message_label_ids(
+    client: &reqwest::Client,
+    token: &str,
+    id: &str,
+) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Minimal {
+        #[serde(rename = "labelIds", default)]
+        label_ids: Vec<String>,
+    }
+    let url = format!("{API}/messages/{id}?format=minimal");
+    Ok(get_json::<Minimal>(client, token, &url).await?.label_ids)
+}
+
 /// The best text/plain the payload offers, else text/html stripped to text.
 ///
 /// Prefers plain over html wherever a multipart/alternative offers both: stripping tags is a

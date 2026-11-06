@@ -104,7 +104,7 @@ impl Finding {
 }
 
 /// Ids the agent has undertaken not to read. See the module docs.
-fn sealed_ids() -> BTreeSet<String> {
+pub(super) fn sealed_ids() -> BTreeSet<String> {
     let mut sealed = BTreeSet::new();
     let Ok(entries) = std::fs::read_dir("labelsets") else {
         return sealed;

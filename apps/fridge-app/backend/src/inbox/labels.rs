@@ -157,7 +157,7 @@ const LABELLED: &[Category] = &[
 ];
 
 /// Whether a label name is one this agent projects.
-fn is_ours(name: &str) -> bool {
+pub(super) fn is_ours(name: &str) -> bool {
     LABELLED
         .iter()
         .filter_map(|category| label_for(*category))
