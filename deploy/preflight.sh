@@ -90,7 +90,15 @@ else
   fi
 fi
 
-# --- 4. Google, all or nothing --------------------------------------------------------------
+# --- 4. the listening address ---------------------------------------------------------------
+# The backend's default is every interface, so a host with this unset serves the API on plain
+# HTTP at :8080 past the proxy. Exactly the address deploy/Caddyfile proxies to: anything else
+# is either that exposure or a proxy that cannot reach the backend.
+if [[ "$(get BIND_ADDRESS)" != "127.0.0.1" ]]; then
+  problems+=("BIND_ADDRESS must be 127.0.0.1 behind the proxy (found: '$(get BIND_ADDRESS)'); unset means every interface")
+fi
+
+# --- 5. Google, all or nothing --------------------------------------------------------------
 # Half-configured is the failure that reports "Google OAuth not configured" at boot and then
 # looks like a missing route at the callback.
 google_present=0
@@ -102,7 +110,7 @@ if (( google_present > 0 && google_absent > 0 )); then
   problems+=("Google OAuth is half-configured: $google_present of 3 set. Set all three or none")
 fi
 
-# --- 5. the inbox agent ---------------------------------------------------------------------
+# --- 6. the inbox agent ---------------------------------------------------------------------
 # UNSET IS NOT OFF: the interval defaults to 900s, and labelling defaults ON. Both are fine on
 # a laptop and are decisions on a host that runs unattended against a real mailbox (task 10k).
 interval="$(get INBOX_SYNC_INTERVAL_SECS)"

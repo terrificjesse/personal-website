@@ -125,7 +125,7 @@ never had it is worse than carrying nullable columns for a phase.
 ## Backend (`apps/fridge-app/backend/`)
 
 Rust, axum, sqlx (SQLite, file `fridge.db`, gitignored). Migrations in `migrations/`. Run:
-`cargo run` (binds `0.0.0.0:8080`). Test: `cargo test`.
+`cargo run` (binds `0.0.0.0:8080` unless `BIND_ADDRESS` says otherwise). Test: `cargo test`.
 
 - `src/auth.rs` — **[learn]** password hashing/verification, session issue/validate, Google
   OAuth. Read its module doc before touching it: placeholder bodies deliberately differ —
@@ -302,8 +302,11 @@ Deliberate choices worth not "fixing":
   ```
 
   Any output at all means one is still modified. Silence is the pass.
-- Backend binds `0.0.0.0` on purpose. Every data route now requires a session, but
-  `COOKIE_SECURE` defaults to off (plain HTTP on a LAN), so still trusted networks only.
+- Backend binds `0.0.0.0` by default, on purpose, for phones on the LAN. Every data route except
+  the public internship listing requires a session, but `COOKIE_SECURE` defaults to off (plain
+  HTTP on a LAN), so that default is for trusted networks only. **A deployed host sets
+  `BIND_ADDRESS=127.0.0.1`**, and `deploy/preflight.sh` refuses to start without it, because the
+  default would serve the API on plain HTTP past the proxy.
 - `apps/fridge-app/backend/.env.example` documents every env var; `.env` is gitignored.
   **Copying it verbatim leaves every line commented out** — the file is written as
   documentation. `dotenvy` then sets nothing and the backend logs `Google OAuth not

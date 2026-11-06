@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(8080);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from((bind_ip(std::env::var("BIND_ADDRESS").ok().as_deref())?, port));
     println!("fridge_backend listening on http://{addr}");
 
     // Awaits a connection from the frontend
@@ -160,4 +160,48 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// The address to listen on: `BIND_ADDRESS`, or every interface when it is unset.
+///
+/// **Every interface is the development default**, because opening the frontend from a phone on
+/// the LAN needs the API reachable there too. A deployed backend sits behind Caddy on the same
+/// machine and must not be reachable any other way, so `deploy/env.production.example` sets
+/// `127.0.0.1` and `deploy/preflight.sh` refuses anything else.
+///
+/// **A value that does not parse stops the server.** Falling back, the way `PORT` does, would
+/// turn a typo in the setting that exists to close the public port into the port being open,
+/// with nothing to show for it but a healthy-looking service.
+fn bind_ip(configured: Option<&str>) -> anyhow::Result<std::net::IpAddr> {
+    match configured {
+        None => Ok(std::net::IpAddr::from([0, 0, 0, 0])),
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("BIND_ADDRESS {raw:?} is not an IP address")),
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::bind_ip;
+
+    #[test]
+    fn unset_listens_everywhere_for_lan_development() {
+        assert_eq!(bind_ip(None).unwrap().to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn a_configured_address_is_the_one_used() {
+        let ip = bind_ip(Some("127.0.0.1")).unwrap();
+        assert!(ip.is_loopback(), "{ip}");
+    }
+
+    /// Falling back here would open the port the setting exists to close.
+    #[test]
+    fn a_value_that_does_not_parse_refuses_rather_than_listening_everywhere() {
+        for bad in ["", "localhost", "127.0.0.1:8080", "127.0.0"] {
+            assert!(bind_ip(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 }

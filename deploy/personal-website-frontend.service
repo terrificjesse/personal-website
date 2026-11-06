@@ -4,6 +4,10 @@
 # It listens on loopback only. Nothing but the reverse proxy should be able to reach it, and
 # binding it publicly would put a second origin on the host — the thing § One origin exists
 # to avoid.
+#
+# **Through the --hostname flag, and only that.** `next start` reads PORT from the environment
+# but not HOSTNAME, so the `Environment=HOSTNAME=127.0.0.1` this file used to carry did nothing,
+# and it listened on every interface while this comment said otherwise.
 
 [Unit]
 Description=Hunt frontend (Next.js)
@@ -19,11 +23,10 @@ WorkingDirectory=/opt/personal-website/frontend
 
 Environment=NODE_ENV=production
 Environment=PORT=3000
-Environment=HOSTNAME=127.0.0.1
 # NEXT_PUBLIC_* is baked in at BUILD time, not read here — see docs/DEPLOY.md § Redeploy.
 EnvironmentFile=-/etc/personal-website/frontend.env
 
-ExecStart=/usr/bin/npm run start
+ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1
 
 Restart=on-failure
 RestartSec=5s
