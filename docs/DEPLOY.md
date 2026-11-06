@@ -234,10 +234,13 @@ Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04
     sudo cp /opt/personal-website/deploy/personal-website-backend.service /opt/personal-website/deploy/personal-website-frontend.service /etc/systemd/system/
     sudo cp /opt/personal-website/deploy/Caddyfile /etc/caddy/Caddyfile
     sudo sed -i 's/hunt\.example\.com/YOUR-DOMAIN/' /etc/caddy/Caddyfile
+    systemd-analyze verify /etc/systemd/system/personal-website-backend.service /etc/systemd/system/personal-website-frontend.service
     sudo systemctl daemon-reload
     sudo systemctl enable --now personal-website-backend personal-website-frontend
     sudo systemctl restart caddy
     ```
+    `systemd-analyze verify` should print nothing about these two units. It is the check that
+    catches a setting in the wrong section, which systemd otherwise only warns about in the journal.
 12. Sign in, connect Gmail, and confirm the checks under **Is it alive?** below. Reconnect even
     with a database brought over from the laptop: its stored token keeps working until it expires,
     but reconnecting is what proves the deployed redirect URI works.
@@ -318,6 +321,15 @@ Logs:
 journalctl -u personal-website-backend -f
 ```
 
+**The backend stops retrying after five failed starts in a minute**, and stays down until told
+otherwise. `Start request repeated too quickly` means the limit tripped, and it refuses a manual
+restart too, even after you have fixed the cause. Read the journal, fix what it names, then:
+
+```bash
+sudo systemctl reset-failed personal-website-backend
+sudo systemctl restart personal-website-backend
+```
+
 Reachable the way it should be, and no other way. Both processes should be on `127.0.0.1`, and
 the second command, run from **another machine**, should time out or be refused:
 
@@ -341,19 +353,20 @@ between noticing in an hour and noticing in a fortnight is whether anybody looks
 
 ---
 
-## Required code changes — all done as of 2026-11-05
+## Required code changes — all done as of 2026-11-06
 
 **Nothing in this section blocks the deploy any more.** It is kept struck through rather than
 deleted: each row is a defect that only became visible once someone wrote down what deploying
 actually involves, which is the argument for writing the runbook before the deploy rather than
-during it. The first three were found by 10h and fixed by the sessions after it; the two below
-them were found by checking this runbook against the code two months later, which is the argument
-for doing that before following it.
+during it. The Gmail link, the listening addresses and the restart limit were found by checking
+this runbook against the code two months later, which is the argument for doing that before
+following it. The rest were found by 10h and fixed by the sessions after it.
 
 | What | Where | Why it matters |
 |---|---|---|
 | ~~The Gmail link went to `localhost`~~ | `frontend/src/app/internships/InboxPanel.tsx`, `lib/authApi.ts` | **Done 2026-11-05.** Connect and Reconnect were a literal `http://localhost:8080/auth/gmail/start`, so on a deployed site the click went to the visitor's own machine. Now `gmailConnectUrl()`, through `apiBase()` like every other backend URL |
 | ~~Both processes listened on every interface~~ | `src/main.rs`, `deploy/personal-website-frontend.service`, `deploy/preflight.sh` | **Done 2026-11-05.** The backend hardcoded `0.0.0.0`, serving the API on plain HTTP at `:8080` past the proxy. The frontend unit set `HOSTNAME`, which `next start` does not read, so it did the same at `:3000` while its comment said loopback. Now `BIND_ADDRESS=127.0.0.1` (required by the preflight; the default stays every interface, for LAN development) and `--hostname 127.0.0.1` |
+| ~~The restart limit could never trip~~ | `deploy/personal-website-backend.service` | **Done 2026-11-06.** `StartLimitBurst` and `StartLimitIntervalSec` sat under `[Service]`. systemd's parser still accepts the burst there, as a legacy alias, but has no `[Service]` entry for `StartLimitIntervalSec`, so the 60 seconds was ignored and the default interval applied. Five starts cannot fit in that window at `RestartSec=5s`, so a broken config would have restarted forever while the comment above it said otherwise. Both moved to `[Unit]`. |
 | ~~The extension cannot reach a deployed backend~~ | `apps/hunt-extension/manifest.json` | **Done 2026-09-02.** `optional_host_permissions` lets any https origin be *requested*; the extension asks for exactly the backend URL in Settings, from the **Test connection** click. No manifest edit or reload per hostname, and no code change when the host moves |
 | ~~The rate limiter cannot see the caller behind a proxy~~ | `apps/fridge-app/backend/src/rate_limit.rs` | **Done 2026-09-02.** `X-Forwarded-For` is trusted only when the TCP peer is loopback, taking the last hop. From any other peer it is ignored, which is the property a direct-exposure deployment depends on |
 | ~~The tier file path is compiled in~~ | `src/internships/prestige.rs` | **Done 2026-09-02.** `INTERNSHIP_COMPANY_TIERS`, then beside the executable, then the build path — and it now logs which one it read |
@@ -524,6 +537,9 @@ run as the units run it, against a throwaway database with every background work
 ### What could not be rehearsed here, and is still genuinely untested
 
 - **systemd** does not run on macOS. The units are path-checked and never started.
+  The restart-limit fix was checked against systemd's manual and its parser table, not seen
+  tripping. Step 11's `systemd-analyze verify` is the first real check, and the first broken start
+  is the first real test.
 - **TLS and DNS**: Caddy's certificate provisioning needs the real domain to resolve.
 - **The Google OAuth round trip**, both redirect URIs.
 - **Build time and memory on a small box.** The 9.2 s above is an incremental compile on a

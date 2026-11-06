@@ -13,6 +13,12 @@ Description=Hunt backend (axum)
 Documentation=file:///opt/personal-website/docs/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
+# Five failed starts inside a minute stops the retry loop rather than hammering a broken config.
+# These two belong in [Unit]. Under [Service], systemd takes the burst and ignores the interval,
+# which leaves a 10-second window that 5-second restarts can never fill, so it never stops.
+# Once this trips, restarting is refused until `systemctl reset-failed`: docs/DEPLOY.md § Is it alive?
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -31,9 +37,6 @@ ExecStart=/opt/personal-website/apps/fridge-app/backend/target/release/fridge_ba
 
 Restart=on-failure
 RestartSec=5s
-# Five failures inside a minute stops the retry loop rather than hammering a broken config.
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 StandardOutput=journal
 StandardError=journal
