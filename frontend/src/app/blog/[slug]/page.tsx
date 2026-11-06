@@ -2,6 +2,7 @@
 
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
+import { unavailableMessage } from "@/lib/apiClient";
 import { fetchPostBySlug, type BlogPost } from "@/lib/blogApi";
 import { MarkdownBody } from "../MarkdownBody";
 
@@ -23,7 +24,7 @@ export default function BlogPostPage({
         if (!cancelled) setPost(data);
       })
       .catch(() => {
-        if (!cancelled) setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        if (!cancelled) setError(unavailableMessage("this post"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

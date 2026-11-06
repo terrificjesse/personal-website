@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fetchReviews, type ReviewWithRecipe } from "@/lib/reviewsApi";
+import { unavailableMessage } from "@/lib/apiClient";
 import { useApiError } from "@/lib/useApiError";
 
 export default function ReviewHistoryPage() {
@@ -14,7 +15,7 @@ export default function ReviewHistoryPage() {
   useEffect(() => {
     fetchReviews()
       .then(setReviews)
-      .catch((err) => setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?")))
+      .catch((err) => setError(handleApiError(err, unavailableMessage("your reviews"))))
       .finally(() => setLoading(false));
   }, [handleApiError]);
 

@@ -8,6 +8,7 @@ import { fetchShoppingList } from "@/lib/shoppingListApi";
 import { LikedRecipesSection } from "./LikedRecipesSection";
 import { RecipeCard } from "./RecipeCard";
 import { RecipeFilterBar } from "./RecipeFilterBar";
+import { unavailableMessage } from "@/lib/apiClient";
 import { useApiError } from "@/lib/useApiError";
 
 export default function RecipesPage() {
@@ -60,7 +61,7 @@ export default function RecipesPage() {
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
+        setError(handleApiError(err, unavailableMessage("recipes")));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

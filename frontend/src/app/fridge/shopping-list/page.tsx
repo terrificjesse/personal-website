@@ -14,6 +14,7 @@ import {
 } from "@/lib/shoppingListApi";
 import { AddShoppingItemForm } from "./AddShoppingItemForm";
 import { SuggestedItemsPanel } from "./SuggestedItemsPanel";
+import { unavailableMessage } from "@/lib/apiClient";
 import { useApiError } from "@/lib/useApiError";
 
 export default function ShoppingListPage() {
@@ -36,7 +37,7 @@ export default function ShoppingListPage() {
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
+        setError(handleApiError(err, unavailableMessage("your shopping list")));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

@@ -16,7 +16,7 @@ import { UnauthorizedError } from "./apiClient";
  * Returns the message to display, so the call site stays a one-liner:
  *
  * ```ts
- * .catch((err) => setError(handleApiError(err, "Couldn't reach the fridge API…")))
+ * .catch((err) => setError(handleApiError(err, unavailableMessage("your fridge"))))
  * ```
  */
 export function useApiError() {

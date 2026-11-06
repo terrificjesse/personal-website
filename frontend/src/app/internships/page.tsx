@@ -11,6 +11,7 @@ import { CvProfileEditor } from "./CvProfileEditor";
 import { ExtensionAccess } from "./ExtensionAccess";
 import { AnalyticsPanel } from "./AnalyticsPanel";
 import { ResumeVariantsPanel } from "./ResumeVariantsPanel";
+import { unavailableMessage } from "@/lib/apiClient";
 import { useApiError } from "@/lib/useApiError";
 import { fetchMe, type AuthenticatedUser } from "@/lib/authApi";
 import {
@@ -70,6 +71,16 @@ const SIGN_IN_HREF = "/login?next=/internships";
  * So none of them may even *mount* until `/auth/me` has said someone is signed in. Rendering
  * them optimistically and letting them fail would bounce every visitor off a public page.
  */
+/**
+ * `fetch` rejects with a TypeError when no response came back at all, and its message is the
+ * browser's own ("Failed to fetch"), which is not something to show a visitor to a public page.
+ * An error the API client raised from a real response is written for people, so it stays.
+ */
+function listingErrorMessage(err: unknown): string {
+  if (err instanceof Error && !(err instanceof TypeError)) return err.message;
+  return unavailableMessage("the listings");
+}
+
 export default function InternshipsPage() {
   return (
     <Suspense fallback={<InternshipsPageFallback />}>
@@ -141,9 +152,7 @@ function InternshipsPageContent() {
         setError(
           handleApiError(
             err,
-            err instanceof Error
-              ? err.message
-              : "Couldn't reach the internships API.",
+            listingErrorMessage(err),
           ),
         );
       } finally {
@@ -215,7 +224,7 @@ function InternshipsPageContent() {
       setError(
         handleApiError(
           err,
-          err instanceof Error ? err.message : "Couldn't load more postings.",
+          listingErrorMessage(err),
         ),
       );
     } finally {

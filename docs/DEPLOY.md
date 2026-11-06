@@ -367,6 +367,7 @@ following it. The rest were found by 10h and fixed by the sessions after it.
 | ~~The Gmail link went to `localhost`~~ | `frontend/src/app/internships/InboxPanel.tsx`, `lib/authApi.ts` | **Done 2026-11-05.** Connect and Reconnect were a literal `http://localhost:8080/auth/gmail/start`, so on a deployed site the click went to the visitor's own machine. Now `gmailConnectUrl()`, through `apiBase()` like every other backend URL |
 | ~~Both processes listened on every interface~~ | `src/main.rs`, `deploy/personal-website-frontend.service`, `deploy/preflight.sh` | **Done 2026-11-05.** The backend hardcoded `0.0.0.0`, serving the API on plain HTTP at `:8080` past the proxy. The frontend unit set `HOSTNAME`, which `next start` does not read, so it did the same at `:3000` while its comment said loopback. Now `BIND_ADDRESS=127.0.0.1` (required by the preflight; the default stays every interface, for LAN development) and `--hostname 127.0.0.1` |
 | ~~The restart limit could never trip~~ | `deploy/personal-website-backend.service` | **Done 2026-11-06.** `StartLimitBurst` and `StartLimitIntervalSec` sat under `[Service]`. systemd's parser still accepts the burst there, as a legacy alias, but has no `[Service]` entry for `StartLimitIntervalSec`, so the 60 seconds was ignored and the default interval applied. Five starts cannot fit in that window at `RestartSec=5s`, so a broken config would have restarted forever while the comment above it said otherwise. Both moved to `[Unit]`. |
+| ~~Visitors were told about the backend's port~~ | `frontend/src/lib/apiClient.ts`, the blog, fridge and internship pages | **Done 2026-11-06.** With the API down, six pages said "Is the backend running on :8080?" and the public listing showed the browser's own "Failed to fetch". `unavailableMessage` keeps the port hint for `next dev` only. |
 | ~~The extension cannot reach a deployed backend~~ | `apps/hunt-extension/manifest.json` | **Done 2026-09-02.** `optional_host_permissions` lets any https origin be *requested*; the extension asks for exactly the backend URL in Settings, from the **Test connection** click. No manifest edit or reload per hostname, and no code change when the host moves |
 | ~~The rate limiter cannot see the caller behind a proxy~~ | `apps/fridge-app/backend/src/rate_limit.rs` | **Done 2026-09-02.** `X-Forwarded-For` is trusted only when the TCP peer is loopback, taking the last hop. From any other peer it is ignored, which is the property a direct-exposure deployment depends on |
 | ~~The tier file path is compiled in~~ | `src/internships/prestige.rs` | **Done 2026-09-02.** `INTERNSHIP_COMPANY_TIERS`, then beside the executable, then the build path — and it now logs which one it read |
@@ -533,6 +534,20 @@ run as the units run it, against a throwaway database with every background work
 | `BIND_ADDRESS=localhost` | Exits 1 with the reason; nothing listens |
 | Preflight on a filled-in copy of the example | Passes. Refuses `BIND_ADDRESS` unset, `0.0.0.0` and `::1` |
 | The link, signed in on the production build | Renders the configured API URL plus `/auth/gmail/start`. `localhost:8080` appears nowhere in the client bundle, and every API call on the signed-in page went to the configured URL |
+
+### Rehearsed again, 2026-11-06 — what a visitor sees when the API is down
+
+A production build from a scratch copy with the API URL pointed at a closed port, then `next dev`
+against a stub answering 500. The fridge pages were reached with a made-up session cookie, which
+is all `proxy.ts` checks, on a throwaway hostname.
+
+| Check | Result |
+|---|---|
+| Production: `/blog`, `/blog/<slug>`, `/internships`, and the fridge, shopping list, recipes and reviews pages | Each says "Couldn't load … Please try again in a moment." |
+| The production client bundle | "Is the backend running" appears in no file |
+| `next dev`, `/blog` | Keeps the hint: "Couldn't load the blog. Is the backend running on :8080?" |
+| `/internships` when the API answers 500 | Keeps the client's own message: "Could not load internships (500)" |
+| **Control: the browser's error for a closed port** | A `TypeError` reading "Failed to fetch", which is what the listing used to show |
 
 ### What could not be rehearsed here, and is still genuinely untested
 

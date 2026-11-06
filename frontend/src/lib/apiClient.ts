@@ -48,6 +48,19 @@ export function apiBase(): string {
 }
 
 /**
+ * What to show when a page could not get its data from the backend.
+ *
+ * Visitors read this on the deployed site, where "is the backend running on :8080?" means nothing
+ * and names an internal port. The hint survives for `next dev`, where it is usually the answer.
+ * `next build` inlines `NODE_ENV`, so the hint is not in the production bundle at all.
+ */
+export function unavailableMessage(what: string): string {
+  return process.env.NODE_ENV === "development"
+    ? `Couldn't load ${what}. Is the backend running on :${BACKEND_PORT}?`
+    : `Couldn't load ${what}. Please try again in a moment.`;
+}
+
+/**
  * Thrown when the backend says the session is missing or expired.
  *
  * A distinct type rather than a generic `Error` so callers can tell "you need to sign in"

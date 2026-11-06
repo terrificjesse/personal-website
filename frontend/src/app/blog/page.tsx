@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { unavailableMessage } from "@/lib/apiClient";
 import { BLOG_PAGE_SIZE, fetchPosts, type BlogPost, type BlogSortOrder } from "@/lib/blogApi";
 import { fetchMe } from "@/lib/authApi";
 
@@ -83,7 +84,7 @@ export default function BlogPage() {
       })
       .catch(() => {
         if (cancelled) return;
-        setError("Couldn't reach the blog API. Is the backend running on :8080?");
+        setError(unavailableMessage("the blog"));
         // Clear the list too. Leaving the previous query's results under an error banner
         // presents stale content as though it answered the current search.
         setPosts([]);

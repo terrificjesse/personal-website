@@ -6,6 +6,7 @@ import { addItem, fetchItems, removeItem, type AddItemInput, type FridgeItem } f
 import { AddItemForm } from "./AddItemForm";
 import { ExpirationBadge } from "./ExpirationBadge";
 import { GroceryListPopup } from "./GroceryListPopup";
+import { unavailableMessage } from "@/lib/apiClient";
 import { useApiError } from "@/lib/useApiError";
 
 export default function FridgePage() {
@@ -26,7 +27,7 @@ export default function FridgePage() {
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(handleApiError(err, "Couldn't reach the fridge API. Is the backend running on :8080?"));
+        setError(handleApiError(err, unavailableMessage("your fridge")));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
