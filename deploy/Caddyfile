@@ -1,7 +1,8 @@
 # One origin, two upstreams. Install to /etc/caddy/Caddyfile.
 #
 # Caddy over nginx+certbot for one reason: automatic HTTPS with no renewal cron to forget.
-# If the host already runs nginx, docs/DEPLOY.md § Reverse proxy says what changes.
+# If the host already runs nginx, reproduce the two routes below, the path stripping and the two
+# header lines included.
 #
 # THE ORDER OF THESE ROUTES MATTERS. `/api/*` is matched first; everything else falls through
 # to Next. Reversing them serves the SPA for API calls, which arrives at the browser as JSON
