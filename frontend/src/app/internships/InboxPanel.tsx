@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useApiError } from "@/lib/useApiError";
+import { gmailConnectUrl } from "@/lib/authApi";
 import { StatusProposals } from "./StatusProposals";
 import {
   getInboxStatus,
@@ -30,13 +31,6 @@ import {
 } from "@/lib/internshipsApi";
 import { UntrackedApplications } from "./UntrackedApplications";
 
-/// Where the Gmail consent round trip starts.
-///
-/// **Must be reached on the same host `GMAIL_REDIRECT_URI` names**, which is `localhost` — the
-/// state cookie is host-scoped and `SameSite=Lax`, so starting the flow on `127.0.0.1` or a LAN
-/// address means the cookie never comes back and the callback fails its own check.
-const GMAIL_CONNECT_URL = "http://localhost:8080/auth/gmail/start";
-
 function outcomeTone(outcome: string): string {
   if (outcome === "success") return "text-green-700 dark:text-green-400";
   if (outcome === "skipped") return "text-neutral-500";
@@ -45,6 +39,10 @@ function outcomeTone(outcome: string): string {
 
 export function InboxPanel() {
   const handleError = useApiError();
+  // Safe to compute during render, unlike the sign-in URL in `CredentialsForm`: the internships
+  // page mounts this panel only once `/auth/me` has answered, so it is never server-rendered and
+  // there is no server/client difference in the host for React to report.
+  const connectUrl = gmailConnectUrl();
   const [status, setStatus] = useState<InboxStatus | null>(null);
   const [proposals, setProposals] = useState<StatusProposal[]>([]);
   const [message, setMessage] = useState<string | null>(null);
@@ -95,7 +93,7 @@ export function InboxPanel() {
     return (
       <section className="text-sm text-neutral-500 dark:text-neutral-400">
         Optional:{" "}
-        <a className="underline" href={GMAIL_CONNECT_URL}>
+        <a className="underline" href={connectUrl}>
           connect Gmail
         </a>{" "}
         to track replies to your applications automatically.
@@ -151,7 +149,7 @@ export function InboxPanel() {
               branch below) was never reachable when it was actually needed. Reconnecting is
               always safe: the callback overwrites the stored token, and `prompt=consent` is
               what makes Google re-issue a refresh token rather than silently returning none. */}
-          <a className="underline" href={GMAIL_CONNECT_URL}>
+          <a className="underline" href={connectUrl}>
             Reconnect
           </a>
           <details className="mt-0.5 text-xs text-neutral-500">
