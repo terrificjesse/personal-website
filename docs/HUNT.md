@@ -1500,6 +1500,46 @@ because of a confirmation. A classifier revision does not move a tracker row on 
 was left for the owner, who asked for it to be set back. That is done; see "`application-events
 merge`, `repair --note`, and `inbox accept-status`".
 
+### Re-evaluated 2026-11-06: there is no new measurement yet
+
+The owner asked for the classifier to be looked at again. The rules have not changed since the
+revision above (`6507e8bbebc9`), and nothing blind has been graded against them, so this could
+check the system's consistency but not its accuracy on new mail.
+
+| Check | Result | What it can tell you |
+|---|---|---|
+| `labelset score` on the 90 labels, with bodies, on a copy of the database and ledger | 88 of 90, junk to Outreach 0 of 16, real mail disregarded 0 of 74, pressing missed 1 of 9 | The revision's figures reproduce. **In-sample**, so not accuracy |
+| `inbox diagnose` over all 275 stored messages | 0 verdicts would change; 2 bodies unreadable | The database matches today's rules |
+| Same run, with the body against without | 29 of 275 classify differently | The share the body-blind half of `labelset gate` cannot exercise |
+| `labelset gate` | Synthetic 11 of 12, stress set 15 of 15, no regression | Hand-written fixtures, so this guards against regressions and says nothing about real mail |
+| The held-out window, since 2026-11-02T21:38Z | 10 messages, 0 labelled | 2.6 a day, so the target of 40 arrives around 2026-11-18 |
+
+**The only blind number is still the one from before the revision:** 69 of 90 (77%, exact 95%
+interval 67–85%), with junk to Outreach 5 of 16 (11–59%), real mail disregarded 0 of 74 (0–5%) and
+pressing mail missed 2 of 9 (3–60%). The revision was fitted to those same messages, so 88 of 90
+is an upper bound on what to expect, not an estimate.
+
+**A round of 40 cannot answer the pressing-mail question.** Pressing mail was 9 of the 90, so 40
+messages hold about 4. Missing none of 4 only bounds the miss rate at 60%. It does measure overall
+agreement (36 of 40 would be 76–97%) and real mail disregarded (0 of about 33 would be under 11%).
+Getting the miss rate under 20% needs about 17 pressing messages with none missed: about 170
+messages, or two months at this rate. **13e should not lean on a round of 40 for this.**
+
+**The sealed set is no longer a shortcut.** `labelsets/sealed-2026-09.csv` has 30 rows and no
+labels. Seven come from the senders its README already calls spent. Of the other 23, 13 have a
+subject that appears word for word in an agent transcript, so at most 10 are still unseen by that
+test. Some of those 13 may be template subjects shared with other mail, but a reader cannot tell
+which. Counted by script, printing only totals. Whole-corpus probes during the 2026-11-02 revision
+and earlier sessions could not keep a seal, and `inbox diagnose`'s redaction covers only that one
+tool. The labelling page also refuses anything outside the window, so this set has no easy route
+to labels either.
+
+**Changing `classify.rs` restarts the window**, so a fix made now turns those 10 messages in-sample.
+That can be worth it for a real defect, but it is the cost to weigh.
+
+The 10 messages' subjects and senders were deliberately not read for this, only their totals, so
+they remain held out. This was a **self-review**, against regenerated artifacts.
+
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 
 The run at `04:32` on 2026-09-03 created 28 postings and expired 36, including the first
