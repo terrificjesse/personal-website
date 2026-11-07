@@ -54,12 +54,17 @@ use super::classify::Category;
 /// Set to the minute rather than the next midnight: every message received before it had been
 /// read while tuning. Before that, 2026-09-22 (`f454449`).
 ///
+/// **Moved again on 2026-11-07**, when the owner reported wrong labels and asked for the rules to
+/// be fixed: four missed rejection wordings, round words checked after assessments, a required
+/// step with a deadline, and one confirmation wording (`docs/HUNT.md` § "Fixed on 2026-11-07").
+/// The 10 messages that had arrived since 2026-11-02 were read for that, so they are in-sample now.
+///
 /// **Move this whenever `classify.rs` changes**, to the moment of the change. [`HELD_OUT_RULES`]
 /// and its test make that impossible to forget.
-pub const HELD_OUT_SINCE: &str = "2026-11-02T21:38:00+00:00";
+pub const HELD_OUT_SINCE: &str = "2026-11-07T19:04:00+00:00";
 
 /// The rules fingerprint ([`super::labelset::rules_fingerprint`]) [`HELD_OUT_SINCE`] belongs to.
-pub const HELD_OUT_RULES: &str = "6507e8bbebc9";
+pub const HELD_OUT_RULES: &str = "3ade537efcc7";
 
 /// How many labels make a first honest measurement. A suggestion shown to the labeller, not a
 /// cap: the shuffle means stopping anywhere is still a random sample.

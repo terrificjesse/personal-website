@@ -170,6 +170,23 @@ const REJECTION: &[&str] = &[
     "not a fit at this time",
     "position has been filled",
     "role has been filled",
+    // Four real rejections no marker above recognised, found 2026-11-06/07. Each is negated or
+    // names the decision, so none can read an invitation as a refusal:
+    //   "we have decided not to proceed with your candidacy at this time" (read as outreach)
+    "not to proceed with your candidacy",
+    "not proceed with your candidacy",
+    //   "the difficult decision to not move forward with your candidacy" — the split infinitive
+    //   is not a substring of "not to move forward" or "not moving forward"
+    "not move forward with your candidacy",
+    "decision to not move forward",
+    //   "the credentials of other candidates may better fit our needs at this time"
+    "other candidates may better fit",
+    "other candidates better fit",
+    //   "Unfortunately, you haven't met the requirements for this position". The hedges below
+    //   keep "if you have not met the requirements" out.
+    "haven't met the requirements",
+    "have not met the requirements",
+    "did not meet the requirements",
 ];
 
 /// Phrases that turn a sentence into a description of what MIGHT happen to you.
@@ -227,6 +244,12 @@ const REJECTION_HYPOTHETICAL: &[&str] = &[
     "if you were not",
     "if you are not",
     "if you're not",
+    // For the "met the requirements" markers above: a confirmation explaining what happens to an
+    // applicant who has not is not saying you are one.
+    "if you have not",
+    "if you haven't",
+    "if you did not",
+    "if you didn't",
 ];
 
 /// The sentence holding byte `at`: from just after the previous `.`, `!` or `?` to the next.
@@ -432,11 +455,21 @@ const INTERVIEW: &[&str] = &[
     "schedule time",
     "meet with the team",
     "like to speak with you",
-    // Rounds and slot-booking, which invite you without using the word "interview" as a verb.
-    // The 13f gate caught the absence of these: tightening this list dropped `syn-012`,
-    // *"Please book a time — final round"*, whose snippet reads "select a slot for your final
-    // round interview". That is an invitation with no invitation verb anywhere in it, and it is
-    // exactly the miss rule 8 says costs the most.
+];
+
+/// Rounds and slot-booking, which invite you without using the word "interview" as a verb.
+///
+/// The 13f gate caught the absence of these: tightening [`INTERVIEW`] dropped `syn-012`,
+/// *"Please book a time — final round"*, whose snippet reads "select a slot for your final round
+/// interview". That is an invitation with no invitation verb anywhere in it, and it is exactly
+/// the miss rule 8 says costs the most.
+///
+/// **Checked after the assessment branches, since 2026-11-07.** In [`INTERVIEW`] they outranked
+/// every assessment, and IBM's invitation, "we'd like to invite you to complete this Coding
+/// Assessment", was read as an interview because a later sentence said strong candidates "will be
+/// prioritized for next rounds of selection". A round word says there is another stage; it does
+/// not say which. When the mail also hands you an assessment, the assessment is that stage.
+const INTERVIEW_ROUNDS: &[&str] = &[
     "next round",
     "final round",
     "round interview",
@@ -478,6 +511,51 @@ const ASSESSMENT: &[&str] = &[
     "assessment have expired",
     "assessments have expired",
 ];
+
+/// A step you are asked to take by a deadline, when the mail never calls it an assessment.
+///
+/// Two real ones reached Outreach with no alert, and the owner asked on 2026-11-06 for both to be
+/// `oa`, the folder that means "act on this":
+///
+/// - Meta, 2026-10-22: "please log into your Career Profile account and complete the prescreen form
+///   within the next 4 days". The deadline passed with nothing raised.
+/// - Amazon, 2026-10-30: "Kindly respond within 5 business days so we can keep things moving".
+///
+/// **All three parts in one stated sentence**: a polite request, a verb that asks for work, and a
+/// deadline counted from now. "We will respond within 5 business days" has no request in it, and a
+/// hedged sentence ("if selected, please complete…") does not count. Checked after the account-mail
+/// gate, so "please confirm your email within 24 hours" stays account mail, and before the
+/// confirmation markers, which most of these also contain.
+const REQUIRED_STEP_ASK: &[&str] = &["please ", "kindly "];
+const REQUIRED_STEP_VERB: &[&str] =
+    &["complete", "respond", "reply", "submit", "fill out", "fill in", "return"];
+
+/// Whether a sentence names a deadline counted from now: "within the next 4 days", "within 5
+/// business days", "within 48 hours".
+fn has_relative_deadline(sentence: &str) -> bool {
+    sentence.match_indices("within ").any(|(at, word)| {
+        let after = &sentence[at + word.len()..];
+        let window: String = after.chars().take(24).collect();
+        let counts = window.starts_with("the next")
+            || window.chars().next().is_some_and(|c| c.is_ascii_digit())
+            || ["one ", "two ", "three ", "four ", "five ", "seven ", "ten ", "a week", "a day"]
+                .iter()
+                .any(|number| window.starts_with(number));
+        counts && ["day", "hour", "week"].iter().any(|unit| window.contains(unit))
+    })
+}
+
+/// The first stated sentence asking for a step by a deadline, and where it starts.
+fn required_step(text: &str) -> Option<usize> {
+    REQUIRED_STEP_ASK.iter().find_map(|ask| {
+        text.match_indices(ask).map(|(at, _)| at).find(|&at| {
+            let sentence = sentence_around(text, at);
+            stated(text, at, PROSPECTIVE)
+                && REQUIRED_STEP_VERB.iter().any(|verb| sentence.contains(verb))
+                && has_relative_deadline(sentence)
+        })
+    })
+}
 
 /// An invitation *to* an assessment, where the two words are separated by template prose.
 /// "We're thrilled to invite you to the next step of the recruiting process — the assessments!"
@@ -528,6 +606,11 @@ const CONFIRMATION: &[&str] = &[
     "application sent to",
     "submitted your application",
     "for submitting your",
+    // ZipRecruiter, 2026-10-05, read as outreach: "Thanks so much for applying to the Software
+    // Engineer - Intern role". Rejection is checked first, so a refusal that opens this way is
+    // still a refusal.
+    "thanks so much for applying",
+    "thank you so much for applying",
     // From the owner's labels, 2026-11-02. Each was read as outreach:
     //   Amazon: "Thank you for completing your Amazon Assessment… a confirmation that your
     //            assessment was successfully submitted". Checked after the OA branches, so an
@@ -843,6 +926,7 @@ pub fn classify_with_body(
 
     // Then the two that need a response from you. Interview before assessment: "interview" is
     // the more specific claim, and an email that mentions both is usually inviting you to one.
+    // Only the explicit invitations, though; see `INTERVIEW_ROUNDS` for why round words wait.
     if let Some((marker, at)) = hit_stated(&text, INTERVIEW, PROSPECTIVE) {
         return verdict(
             Category::Interview,
@@ -901,6 +985,13 @@ pub fn classify_with_body(
             format!("assessment pair: {a:?} + {b:?} — {} / {}", quote_at(a, at), quote(b)),
         );
     }
+    if let Some((marker, at)) = hit_stated(&text, INTERVIEW_ROUNDS, PROSPECTIVE) {
+        return verdict(
+            Category::Interview,
+            0.75,
+            format!("interview round: {marker:?} — {}", quote_at(marker, at)),
+        );
+    }
 
     // Account mail an application sets off. See `ACCOUNT_MAIL`, including why a subject that
     // names an internship is exempt. **Before the confirmation markers**: Greenhouse's
@@ -913,6 +1004,17 @@ pub fn classify_with_body(
             Category::Disregarded,
             0.7,
             format!("account mail in the subject: {marker:?} — {}", quote(marker)),
+        );
+    }
+
+    // A step with a deadline, about employment. See `REQUIRED_STEP_ASK`.
+    if let Some(at) = required_step(&text)
+        && hit(&text, JOB_TOPIC).is_some()
+    {
+        return verdict(
+            Category::Oa,
+            0.65,
+            format!("a required step with a deadline — {}", sentence_around(&text, at).trim()),
         );
     }
 
@@ -2352,6 +2454,108 @@ mod tests {
 
     /// The other side of `PROSPECTIVE`: a hedge in one sentence must not cancel a plain ask in
     /// another, and the hedges are narrow enough that an ordinary "if" or "may" is not one.
+/// The wrong verdicts the owner reported on 2026-11-06 and 2026-11-07, paraphrased. Each was a
+    /// real email whose wording no rule recognised.
+    #[test]
+    fn rejections_worded_around_the_candidacy_or_the_requirements_are_rejections() {
+        for (subject, body) in [
+            ("Thank you from Examplecorp",
+             "Thank you for meeting with us. However, after careful review, we have decided not \
+              to proceed with your candidacy at this time."),
+            ("Update on your application",
+             "Thank you for your interest in the role. Unfortunately, we have made the difficult \
+              decision to not move forward with your candidacy at this time."),
+            ("Thank You",
+             "Thank you for your interest in employment with Examplecorp. After careful \
+              consideration, the credentials of other candidates may better fit our needs."),
+            ("Application Update: Software Engineering Intern",
+             "Thank you for applying for the position. Unfortunately, you haven't met the \
+              requirements for this position, and you may qualify for other positions."),
+        ] {
+            let verdict = classify_body("Recruiting <recruiting@examplecorp.com>", subject, body);
+            assert_eq!(verdict.category, Category::Rejection, "{subject} -> {verdict:?}");
+        }
+    }
+
+    /// A confirmation explaining what happens to applicants who fall short is not a rejection.
+    #[test]
+    fn requirements_described_conditionally_are_not_a_rejection() {
+        let verdict = classify_body(
+            "Careers <careers@examplecorp.com>",
+            "Thank you for applying",
+            "Thank you for applying. If you have not met the requirements for this position, we \
+             will let you know by email.",
+        );
+        assert_eq!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
+    /// IBM's invitation, paraphrased: an assessment handed to you, with a round mentioned later.
+    #[test]
+    fn an_assessment_invitation_mentioning_later_rounds_is_an_assessment() {
+        let verdict = classify_body(
+            "Talent Acquisition <talent@examplecorp.com>",
+            "Action Required: Coding Assessment for completion",
+            "We'd like to invite you to complete this Coding Assessment. Candidates using the \
+             preferred languages will be prioritized for next rounds of selection.",
+        );
+        assert_eq!(verdict.category, Category::Oa, "{verdict:?}");
+    }
+
+    /// The other side of moving round words below the assessment branches: with no assessment
+    /// in the mail, a round is still an interview.
+    #[test]
+    fn a_round_with_no_assessment_is_still_an_interview() {
+        let verdict = classify_body(
+            "Recruiting <recruiting@examplecorp.com>",
+            "Please book a time",
+            "Congratulations! Please select a slot for your final round interview.",
+        );
+        assert_eq!(verdict.category, Category::Interview, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_required_step_with_a_deadline_is_pressing() {
+        for (subject, body) in [
+            ("Complete your prescreen form",
+             "Thanks for your interest in joining Examplecorp! We need some additional information \
+              to complete our review of your application. Please log into your account and \
+              complete the prescreen form within the next 4 days."),
+            ("Action Required | Confirm Your Application Details",
+             "Thank you for applying to the Software Engineer Intern position. Please reply with \
+              your graduation date. Kindly respond within 5 business days so we can keep things \
+              moving."),
+        ] {
+            let verdict = classify_body("Recruiting <recruiting@examplecorp.com>", subject, body);
+            assert_eq!(verdict.category, Category::Oa, "{subject} -> {verdict:?}");
+        }
+    }
+
+    /// The near misses the required-step rule must not catch: a promise to reply to you, a
+    /// request with no deadline, and a hedged one.
+    #[test]
+    fn a_deadline_without_a_request_of_you_is_not_a_required_step() {
+        // Each names the application, so the job-topic gate is open and the rule itself decides.
+        for body in [
+            "Thank you for applying. We will respond to your application within 5 business days.",
+            "Thank you for applying. Please complete your application profile when you have a moment.",
+            "Thank you for applying. If selected, please complete the application form within the \
+             next 3 days.",
+        ] {
+            let verdict = classify_body("Recruiting <recruiting@examplecorp.com>", "Thank you", body);
+            assert_eq!(verdict.category, Category::Confirmation, "{body} -> {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn thanks_so_much_for_applying_is_a_confirmation() {
+        let verdict = classify_body(
+            "Careers <careers@examplecorp.com>",
+            "Thanks for your interest in Examplecorp!",
+            "Hi, thanks so much for applying to the Software Engineer - Intern role at Examplecorp!",
+        );
+        assert_eq!(verdict.category, Category::Confirmation, "{verdict:?}");
+    }
+
     #[test]
     fn a_real_invitation_survives_a_hedged_sentence_beside_it() {
         for (subject, body, expected) in [
