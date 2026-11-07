@@ -95,7 +95,7 @@ pub async fn connect(
     code: &str,
     now: DateTime<Utc>,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = super::gmail::http_client();
     let redirect = redirect_uri();
 
     let response = client
@@ -197,7 +197,7 @@ pub async fn access_token(
 
     let refresh_token = refresh_token.ok_or_else(|| anyhow!("no Gmail account is connected"))?;
 
-    let response = reqwest::Client::new()
+    let response = super::gmail::http_client()
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("client_id", client_id),

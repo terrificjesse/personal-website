@@ -12,6 +12,29 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use std::time::Duration;
+
+/// How long one Gmail or Google OAuth request may take before it counts as failed.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client for every Gmail and Google OAuth call.
+///
+/// **With a timeout, which `reqwest::Client::new()` does not have.** On 2026-11-07 a
+/// `reclassify --apply` sat for 25 minutes on one Gmail request that never answered, holding an
+/// open connection and using no CPU. The live sync makes the same calls on a timer, and one hung
+/// request there would stop all syncing until a restart, with nothing in any log. A timeout turns
+/// that into an ordinary failed request, which every caller already handles.
+pub fn http_client() -> reqwest::Client {
+    client_with_timeout(REQUEST_TIMEOUT)
+}
+
+fn client_with_timeout(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .timeout(timeout)
+        .build()
+        .expect("an HTTP client with a timeout builds")
+}
 
 const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 
@@ -376,6 +399,30 @@ fn code_only(source: &str) -> String {
     }
 
     use super::*;
+
+    /// A server that accepts the connection and never answers, which is what hung the
+    /// 2026-11-07 run. The request has to come back as an error, not wait forever.
+    #[tokio::test]
+    async fn a_request_nobody_answers_fails_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = client_with_timeout(Duration::from_millis(300));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            get_json::<ProfileResponse>(&client, "token", &format!("http://{address}/profile")),
+        )
+        .await;
+        match outcome {
+            Ok(result) => assert!(result.is_err(), "a request nobody answered succeeded"),
+            Err(_) => panic!("the request was still waiting after 5 seconds: no timeout"),
+        }
+    }
 
     fn part(mime: &str, data: &str) -> Payload {
         Payload {

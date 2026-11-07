@@ -126,7 +126,7 @@ pub async fn run(
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = gmail::http_client();
 
     // The classifier is pure (rule 1), so what it may know about the world is passed in.
     // Loaded once per pass rather than per message: it is one query and a run is a hundred

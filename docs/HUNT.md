@@ -1577,10 +1577,56 @@ and by eye, so there may be more, and it only sets a lower bound.
 The cost is concrete: one tracker row still reads `interview` after a rejection, and two pending
 offers read `applied` for applications that were rejected.
 
-**Nothing has been changed yet.** Fixing the verdicts changes `classify.rs`, which restarts the
-held-out window, and fixing the labels writes to the owner's mailbox, so both wait for the owner.
+**Nothing was changed that day.** Fixing the verdicts changes `classify.rs`, which restarts the
+held-out window, and fixing the labels writes to the owner's mailbox, so both waited for the owner.
+The owner approved all of it the next day; see "Fixed on 2026-11-07" below.
 This was a **self-review**. `compare` was checked by breaking it (3 of its tests fail), and the
 findings come from the mailbox and message bodies, not from reasoning about the rules.
+
+### Fixed on 2026-11-07
+
+The owner approved all four fixes and reported one more wrong verdict: a rejection on Nov 4,
+"you haven't met the requirements for this position", stored as a confirmation.
+
+**The sync no longer leaves a replaced label behind** (`8af3e32`). Seen mail is labelled from its
+newest stored verdict instead of a fresh run of the rules, and `apply_label` removes the label it
+replaces before recording the change.
+
+**The rules** (`53d5967`, rules `3ade537efcc7`):
+- Four rejection wordings: not proceeding or not moving forward "with your candidacy", other
+  candidates who "may better fit", and not having "met the requirements".
+- Round words are checked after the assessment branches.
+- A polite request, a work verb and a relative deadline in one stated sentence is an OA.
+- One more confirmation wording.
+
+Over all 278 stored messages, 9 verdicts moved: the 8 intended and a ninth missed rejection, from
+the sealed set. None of the 9 is among the owner's 90 labels, so the in-sample 88 of 90 is
+unchanged by construction. `HELD_OUT_SINCE` moved to 2026-11-07T19:04Z, so the 10 messages from
+after Nov 2 are in-sample now.
+
+**Gmail matches the verdicts on 276 of 278 messages.** Applying the 9 moves removed each one's old
+label. `inbox audit-labels --apply` then removed 17 stray labels, every one provably ours: 15 by an
+earlier verdict, 1 by the record, and 1 on a sealed message. The 2 left are the ones with no
+record, and they are the owner's to remove. `reclassify --labels` reports no drift.
+
+**A hang found on the way** (this commit). The first re-run of `reclassify --apply` sat for 25
+minutes on one Gmail request with no timeout, and the live sync used the same client.
+`gmail::http_client()` now gives every Gmail and OAuth call a 30-second timeout. Its test fails,
+by hanging past its 5-second guard, when the timeout is removed. The run it interrupted had written
+nothing.
+
+**Tracker corrections, all waiting for the owner:**
+- Three rejections are proposed: Optiver from interview, Roblox and Workiva from applied.
+- One proposal should be declined: Amazon applied → oa, raised by the required-step rule from a
+  request to confirm a graduation date. The owner had already replied, and no assessment exists.
+  It is a known cost of mapping "act on this" onto `oa`.
+- Three rejections belong to roles that are still pending offers (NASCO, McKinsey, and the Nov 4
+  Microsoft role), so they can only follow once those offers are accepted (`inbox
+  backfill-status`).
+
+This was a **self-review**, against artifacts. Every new rule's test fails when its rule is
+broken, and the dry run's 9 moves were each read before applying. Both audits ran against the live
+mailbox.
 
 ### Should a collection run raise an alert? Asked 2026-09-03, answered no
 

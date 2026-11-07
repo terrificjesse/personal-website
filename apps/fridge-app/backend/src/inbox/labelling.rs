@@ -221,7 +221,7 @@ pub async fn body_for(
     let token = super::oauth::access_token(pool, user_id, client_id, client_secret)
         .await
         .ok()?;
-    let client = reqwest::Client::new();
+    let client = super::gmail::http_client();
     super::reclassify::fetch_body_politely(&client, &token, gmail_message_id)
         .await
         .ok()?

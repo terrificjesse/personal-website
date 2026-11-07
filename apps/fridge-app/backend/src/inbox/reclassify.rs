@@ -83,7 +83,7 @@ pub(super) async fn gmail_session(pool: &SqlitePool) -> Option<(reqwest::Client,
     let token = super::oauth::access_token(pool, &user_id, &client_id, &client_secret)
         .await
         .ok()?;
-    Some((reqwest::Client::new(), token))
+    Some((gmail::http_client(), token))
 }
 
 /// Gmail's per-user quota is per MINUTE, and a re-classification is a burst.
@@ -349,7 +349,7 @@ pub async fn relabel(pool: &SqlitePool, changes: &[Change]) -> Result<Vec<String
     let client_id = std::env::var("GOOGLE_CLIENT_ID")?;
     let client_secret = std::env::var("GOOGLE_CLIENT_SECRET")?;
     let token = super::oauth::access_token(pool, &user_id, &client_id, &client_secret).await?;
-    let client = reqwest::Client::new();
+    let client = gmail::http_client();
     let ids = labels::ensure_all(&client, &token).await?;
 
     let mut stale = Vec::new();
