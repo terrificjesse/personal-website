@@ -213,6 +213,25 @@ impl SupersededLabel {
         Some(SupersededLabel(recorded.to_string()))
     }
 
+    /// A label of ours left beside the one a message's verdict now calls for, which the record no
+    /// longer names.
+    ///
+    /// That state is what the sync defect fixed on 2026-11-07 left behind: a later write
+    /// overwrote `labels_applied` without removing the label it replaced. **The provenance is
+    /// still this agent's own record**, only an older part of it: an earlier verdict on this
+    /// message projected exactly this label. A label you added by hand to a message we never
+    /// classified that way cannot be built here.
+    pub fn left_by_an_earlier_verdict(stray: &str, verdicts: &[Category], now: Category) -> Option<Self> {
+        let stray = stray.trim();
+        if !is_ours(stray) || label_for(now) == Some(stray) {
+            return None;
+        }
+        verdicts
+            .iter()
+            .any(|category| label_for(*category) == Some(stray))
+            .then(|| SupersededLabel(stray.to_string()))
+    }
+
     /// A recorded label with nothing to replace it — the message's category now projects none.
     ///
     /// Rule 7 has two clauses, and a correction *toward* `disregarded` is where they meet: a
@@ -399,6 +418,46 @@ fn code_only(source: &str) -> String {
         );
         assert_eq!(
             SupersededLabel::from_recorded(Some("Starred"), "Hunt/Confirmed"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_label_an_earlier_verdict_projected_can_come_off() {
+        assert_eq!(
+            SupersededLabel::left_by_an_earlier_verdict(
+                "Hunt/Interview",
+                &[Category::Interview, Category::Confirmation],
+                Category::Confirmation,
+            ),
+            Some(SupersededLabel("Hunt/Interview".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_label_no_verdict_ever_projected_cannot() {
+        assert_eq!(
+            SupersededLabel::left_by_an_earlier_verdict(
+                "Hunt/Outreach",
+                &[Category::Disregarded],
+                Category::Disregarded,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_label_the_verdict_calls_for_is_never_stray() {
+        assert_eq!(
+            SupersededLabel::left_by_an_earlier_verdict("Hunt/OA", &[Category::Oa], Category::Oa),
+            None
+        );
+    }
+
+    #[test]
+    fn a_label_we_do_not_project_is_never_stray() {
+        assert_eq!(
+            SupersededLabel::left_by_an_earlier_verdict("Important", &[Category::Oa], Category::Confirmation),
             None
         );
     }

@@ -192,15 +192,24 @@ pub async fn run(
             // these made the backlog permanently unlabellable — the label could only ever be
             // written in the same pass that first stored the message.
             //
-            // Classification is a pure function and cheap, so deciding the label again costs
-            // nothing. The verdict is NOT re-stored and the counts are not touched: those
-            // measure new work, and inflating them would break rule 7's invariant.
+            // **The label comes from the STORED verdict, never from the rules again.** Until
+            // 2026-11-07 this re-ran the classifier and labelled from the result without storing
+            // it. After any rule change, that put a label on the mailbox that no verdict backed,
+            // and `apply_label` did not remove the old one either. 11 messages ended up with two
+            // labels, and the record showed only the new one, so no check could see the old.
+            // See docs/HUNT.md § "Later on 2026-11-06". A rule change reaches stored mail through
+            // `inbox reclassify --apply`, which writes the verdict and the label together.
             if let Some(ids) = &label_ids {
-                let verdict = verdict_for(&message, &context);
-                if let Err(err) =
-                    apply_label(pool, &client, &token, ids, &message, verdict.category, now).await
-                {
-                    eprintln!("inbox: could not label {}: {err:?}", message.id);
+                match stored_category(pool, &message.id).await {
+                    Ok(Some(category)) => {
+                        if let Err(err) =
+                            apply_label(pool, &client, &token, ids, &message, category, now).await
+                        {
+                            eprintln!("inbox: could not label {}: {err:?}", message.id);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => eprintln!("inbox: could not read the verdict for {}: {err:?}", message.id),
                 }
             }
             continue;
@@ -486,12 +495,54 @@ fn labelling_enabled() -> bool {
     !std::env::var("INBOX_APPLY_LABELS").is_ok_and(|v| v == "false" || v == "0")
 }
 
-/// Put the category's label on a message, once.
+/// What has to change on a message for it to carry exactly its verdict's label.
+#[derive(Debug, PartialEq, Eq)]
+struct LabelChange {
+    add: Option<&'static str>,
+    remove: Option<labels::SupersededLabel>,
+}
+
+/// The labels to add and take off, given what we last recorded putting on the message.
 ///
-/// Records the write on our side before returning. Gmail treats a repeated add as a no-op, but
-/// "harmless if the remote API behaves" is weaker than not calling it twice — and the record
-/// also answers "which of my emails has this touched", which is worth being able to ask about
-/// the first thing in this project that changes someone else's account.
+/// **Removal is the half that was missing.** `apply_label` used to add the new label and
+/// overwrite the record, so the old label stayed on the message with nothing recording it. A
+/// later `reclassify` then compared its verdict with that record, found them equal, and removed
+/// nothing. `SupersededLabel` still decides what may come off, so a label you added yourself
+/// never does.
+fn label_change(recorded: Option<&str>, category: Category) -> LabelChange {
+    match labels::label_for(category) {
+        Some(name) if recorded == Some(name) => LabelChange { add: None, remove: None },
+        Some(name) => LabelChange {
+            add: Some(name),
+            remove: labels::SupersededLabel::from_recorded(recorded, name),
+        },
+        // Rule 7: a disregarded message carries none of our labels. A new one is left alone; one
+        // we labelled earlier has that label taken off, as `reclassify` already does.
+        None => LabelChange { add: None, remove: labels::SupersededLabel::withdrawn(recorded) },
+    }
+}
+
+/// The category of the newest stored verdict for one Gmail message.
+async fn stored_category(pool: &SqlitePool, gmail_message_id: &str) -> Result<Option<Category>> {
+    let category: Option<String> = sqlx::query_scalar(
+        "SELECT v.category FROM email_verdicts v
+           JOIN email_messages m ON m.id = v.message_id
+          WHERE m.gmail_message_id = ? ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1",
+    )
+    .bind(gmail_message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(category.as_deref().and_then(Category::parse))
+}
+
+/// Make a message carry exactly its category's label, once.
+///
+/// Adds the new label, takes off the one it replaced, and only then records the change. If a
+/// removal fails, the record still names the old label, so the next pass tries again rather than
+/// forgetting it. Gmail treats a repeated add as a no-op, but "harmless if the remote API
+/// behaves" is weaker than not calling it twice — and the record also answers "which of my
+/// emails has this touched", which is worth being able to ask about the first thing in this
+/// project that changes someone else's account.
 async fn apply_label(
     pool: &SqlitePool,
     client: &reqwest::Client,
@@ -501,33 +552,35 @@ async fn apply_label(
     category: Category,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    // Rule 7: a disregarded message is recorded and the inbox is left alone.
-    let Some(name) = labels::label_for(category) else {
-        return Ok(false);
-    };
-    let Some(label_id) = label_ids.get(name) else {
-        return Ok(false);
-    };
-
-    let already: Option<Option<String>> = sqlx::query_scalar(
+    let recorded: Option<String> = sqlx::query_scalar(
         "SELECT labels_applied FROM email_messages WHERE gmail_message_id = ?",
     )
     .bind(&message.id)
     .fetch_optional(pool)
-    .await?;
-    if let Some(Some(applied)) = already
-        && applied == name
-    {
+    .await?
+    .flatten();
+
+    let change = label_change(recorded.as_deref(), category);
+    if change.add.is_none() && change.remove.is_none() {
         return Ok(false);
     }
-
-    labels::apply(client, token, &message.id, label_id).await?;
+    if let Some(name) = change.add {
+        let Some(label_id) = label_ids.get(name) else {
+            return Ok(false);
+        };
+        labels::apply(client, token, &message.id, label_id).await?;
+    }
+    if let Some(stale) = &change.remove
+        && let Some(old_id) = label_ids.get(stale.name())
+    {
+        labels::remove_superseded(client, token, &message.id, old_id, stale).await?;
+    }
 
     sqlx::query(
         "UPDATE email_messages SET labels_applied = ?1, labels_applied_at = ?2
           WHERE gmail_message_id = ?3",
     )
-    .bind(name)
+    .bind(change.add)
     .bind(now.to_rfc3339())
     .bind(&message.id)
     .execute(pool)
@@ -1297,6 +1350,89 @@ mod tests {
             companies.iter().any(|c| c == "workiva"),
             "an employer you applied to must be one the classifier can name: {companies:?}"
         );
+    }
+
+    fn removed(change: &LabelChange) -> Option<&str> {
+        change.remove.as_ref().map(labels::SupersededLabel::name)
+    }
+
+    /// The defect of 2026-11: a verdict moved from interview to confirmation, the new label went
+    /// on, and the old one stayed with nothing recording it.
+    #[test]
+    fn a_changed_verdict_takes_the_old_label_off() {
+        let change = label_change(Some("Hunt/Interview"), Category::Confirmation);
+        assert_eq!(change.add, Some("Hunt/Confirmed"));
+        assert_eq!(removed(&change), Some("Hunt/Interview"));
+    }
+
+    #[test]
+    fn the_label_already_there_is_no_change() {
+        assert_eq!(
+            label_change(Some("Hunt/OA"), Category::Oa),
+            LabelChange { add: None, remove: None }
+        );
+    }
+
+    #[test]
+    fn a_first_label_removes_nothing() {
+        let change = label_change(None, Category::Rejection);
+        assert_eq!(change.add, Some("Hunt/Rejected"));
+        assert_eq!(removed(&change), None);
+    }
+
+    #[test]
+    fn mail_now_disregarded_loses_our_label_and_gains_none() {
+        let change = label_change(Some("Hunt/Outreach"), Category::Disregarded);
+        assert_eq!(change.add, None);
+        assert_eq!(removed(&change), Some("Hunt/Outreach"));
+    }
+
+    /// Rule 7: a disregarded message nobody labelled is never touched.
+    #[test]
+    fn new_disregarded_mail_is_left_alone() {
+        assert_eq!(
+            label_change(None, Category::Disregarded),
+            LabelChange { add: None, remove: None }
+        );
+    }
+
+    /// A name we do not project is not ours, whatever the column says, so it never comes off.
+    #[test]
+    fn a_label_we_do_not_project_is_never_removed() {
+        assert_eq!(removed(&label_change(Some("Important"), Category::Oa)), None);
+    }
+
+    /// The other half of the defect: already-seen mail was labelled by re-running the rules.
+    /// It now follows the newest stored verdict, which a re-run of the rules does not change.
+    #[tokio::test]
+    async fn seen_mail_is_labelled_from_its_newest_stored_verdict() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO email_messages (id, user_id, gmail_message_id, subject, created_at)
+             VALUES ('m1', 'u1', 'g1', 'Application update', ?1)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("message");
+        for (id, category, at) in [
+            ("v1", "confirmation", "2026-11-01T00:00:00+00:00"),
+            ("v2", "rejection", "2026-11-02T00:00:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO email_verdicts (id, message_id, category, classifier, created_at)
+                 VALUES (?1, 'm1', ?2, 'rules', ?3)",
+            )
+            .bind(id)
+            .bind(category)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .expect("verdict");
+        }
+        assert_eq!(stored_category(&pool, "g1").await.expect("read"), Some(Category::Rejection));
+        assert_eq!(stored_category(&pool, "unknown").await.expect("read"), None);
     }
 
     async fn test_pool() -> SqlitePool {

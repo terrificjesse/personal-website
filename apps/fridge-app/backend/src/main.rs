@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
             return inbox::reclassify::main(&pool, &args[1..]).await;
         }
         Some("inbox") if args.get(1).map(String::as_str) == Some("audit-labels") => {
-            return inbox::label_audit::main(&pool).await;
+            return inbox::label_audit::main(&pool, &args[2..]).await;
         }
         Some("inbox") if args.get(1).map(String::as_str) == Some("diagnose") => {
             return inbox::diagnose::main(&pool, &args[1..]).await;
