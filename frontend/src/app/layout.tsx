@@ -22,7 +22,6 @@ export const metadata: Metadata = {
 const tabs = [
   { href: "/fridge", label: "Fridge" },
   { href: "/blog", label: "Blog" },
-  { href: "/internships", label: "Internships" },
 ];
 
 export default function RootLayout({
@@ -46,6 +45,14 @@ export default function RootLayout({
                 {tab.label}
               </Link>
             ))}
+            {/*
+              The internships site is its own website since 2026-11-11, and `proxy.ts` redirects
+              /internships to it. A plain <a>, not <Link>: Link would fetch the route client-side,
+              and that request cannot follow a redirect to another origin.
+            */}
+            <a href="/internships" className="text-sm opacity-80 hover:opacity-100">
+              Internships
+            </a>
             <SessionNav />
           </nav>
         </header>

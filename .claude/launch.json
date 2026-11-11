@@ -1,21 +1,23 @@
 {
   "_comment": [
-    "Both ports are fixed, and neither may be reassigned. `autoPort: true` looks harmless and",
+    "Every port is fixed, and none may be reassigned. `autoPort: true` looks harmless and",
     "is not: on this project a moved port fails silently rather than loudly.",
     "",
-    "BACKEND, port 8080 — two independent reasons:",
-    "  1. `BACKEND_PORT = 8080` is a hardcoded constant in frontend/src/lib/apiClient.ts:16.",
+    "BACKEND, port 8080 \u2014 two independent reasons:",
+    "  1. `BACKEND_PORT = 8080` is a hardcoded constant in both sites' src/lib/apiClient.ts.",
     "     `apiBase()` derives the host from wherever the page was opened but always appends",
     "     this port, so every API call goes to :8080 whatever the backend is listening on.",
     "  2. GOOGLE_REDIRECT_URI is http://localhost:8080/auth/google/callback, and .env says",
     "     outright that it must match the Google console entry exactly, INCLUDING THE PORT.",
-    "     A moved port cannot be fixed locally — it needs an edit in Google Cloud.",
+    "     A moved port cannot be fixed locally \u2014 it needs an edit in Google Cloud.",
     "",
-    "FRONTEND, port 3000 — CORS, and this one was `autoPort: true` until 2026-09-05:",
-    "  The backend's ALLOWED_ORIGINS and FRONTEND_ORIGIN both name localhost:3000. A frontend",
-    "  that started on 3001 would have every credentialed request rejected by the browser with",
-    "  no server error, so the whole app would read as signed-out with nothing in any log.",
-    "  Failing to start is strictly better than that.",
+    "PERSONAL SITE, port 3000, and INTERNSHIPS SITE, port 3001 \u2014 CORS and redirects:",
+    "  The backend's default ALLOWED_ORIGINS names exactly these two, FRONTEND_ORIGIN defaults to",
+    "  3000 and HUNT_SITE_ORIGIN to 3001, and the personal site's proxy.ts sends /internships to",
+    "  3001. A site that started anywhere else would have every credentialed request rejected by",
+    "  the browser with no server error, so it would read as signed-out with nothing in any log.",
+    "  Failing to start is strictly better than that. The personal site was `autoPort: true`",
+    "  until 2026-09-05; the internships site was split out of it on 2026-11-11.",
     "",
     "If a port is genuinely occupied, free it rather than reassigning it."
   ],
@@ -24,15 +26,31 @@
     {
       "name": "personal-website-frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "cwd": "frontend",
       "port": 3000,
       "autoPort": false
     },
     {
+      "name": "hunt-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "cwd": "apps/hunt-web",
+      "port": 3001,
+      "autoPort": false
+    },
+    {
       "name": "fridge-backend",
       "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run"],
+      "runtimeArgs": [
+        "run"
+      ],
       "cwd": "apps/fridge-app/backend",
       "port": 8080,
       "autoPort": false

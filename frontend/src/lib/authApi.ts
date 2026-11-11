@@ -85,21 +85,6 @@ export async function fetchMe(): Promise<AuthenticatedUser | null> {
 }
 
 /**
- * Where to send the browser to connect, or reconnect, a Gmail account for the inbox agent.
- *
- * Through `apiBase()` like every other backend URL. This was a literal
- * `http://localhost:8080/auth/gmail/start` until 2026-11-05, which on a deployed site sent the
- * click to the visitor's own machine.
- *
- * **Must be reached on the same host `GMAIL_REDIRECT_URI` names.** The state cookie is host-scoped
- * and `SameSite=Lax`, so a flow started anywhere else never gets its cookie back and the callback
- * fails its own check. In development that means opening the site at `localhost`, not `127.0.0.1`.
- */
-export function gmailConnectUrl(): string {
-  return `${apiBase()}/auth/gmail/start`;
-}
-
-/**
  * Where to send the browser to start Google sign-in.
  *
  * A full page navigation, not a fetch: the flow is a series of cross-origin redirects through

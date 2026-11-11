@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
- * Route protection for the fridge tab.
+ * Route protection for the fridge tab, and the redirect to the internships site.
  *
  * Note the filename: this version of Next renamed the `middleware` convention to `proxy`
  * (see `node_modules/next/dist/docs/01-app/03-api-reference/03-file-conventions/proxy.md`).
@@ -30,6 +30,24 @@ const SESSION_COOKIE = "fridge_session";
 /** Signed-out visitors are sent here. */
 const LOGIN_PATH = "/login";
 
+/** Where the internships site listens locally. See `apps/hunt-web/`. */
+const HUNT_SITE_PORT = 3001;
+
+/**
+ * The internships site's origin. Its own website since 2026-11-11 (`docs/HUNT.md` § "The
+ * internships site, split out").
+ *
+ * `HUNT_SITE_URL` when set. It is read at request time, because the proxy runs on the server, so
+ * a deployment sets it in `frontend.env` without a rebuild. Otherwise it is this request's own
+ * hostname on port 3001, which keeps the link working from a phone on the LAN the same way
+ * `apiBase()` does for the API.
+ */
+function huntSiteOrigin(request: NextRequest): string {
+  const configured = process.env.HUNT_SITE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  return `${request.nextUrl.protocol}//${request.nextUrl.hostname}:${HUNT_SITE_PORT}`;
+}
+
 /**
  * Only the *absence* of the cookie is acted on, and that asymmetry is deliberate.
  *
@@ -48,7 +66,14 @@ const LOGIN_PATH = "/login";
  * way `SessionNav` does. Never here.
  */
 export default function proxy(request: NextRequest) {
-  const { pathname } = request.nextUrl;
+  const { pathname, search } = request.nextUrl;
+
+  // The Internships tab moved to its own site. The nav links here, and so do old bookmarks.
+  // 307 rather than 308: a browser caches a permanent redirect, and the site's address is a
+  // deployment setting that may still change.
+  if (pathname === "/internships" || pathname.startsWith("/internships/")) {
+    return NextResponse.redirect(`${huntSiteOrigin(request)}${pathname}${search}`, 307);
+  }
 
   if (request.cookies.has(SESSION_COOKIE)) {
     return NextResponse.next();
@@ -76,15 +101,10 @@ export const config = {
   // `/login` and `/register` are deliberately **not** matched. They must always render, or a
   // stale cookie locks the user out of the only page that could fix it.
   //
-  // **The internship listing is public since 2026-10-19; everything under it is not.** The
-  // ranked list and its source dropdown are open on the backend, so `/internships` itself
-  // renders for anyone and hides its personal panels when `/auth/me` says nobody is signed in.
-  // The applied tracker, run health and labelling pages all 401 without a session, so they
-  // stay gated here.
-  //
-  // `:path+` is what makes that split, and the one-character difference matters: `:path*`
-  // matches zero or more segments, so it gated `/internships` itself; `:path+` needs at least
-  // one, so it gates only the sub-pages (path-to-regexp syntax; see the matcher section of
-  // this convention's doc, linked at the top of this file).
-  matcher: ["/fridge/:path*", "/blog/admin/:path*", "/internships/:path+"],
+  // **`/internships` and everything under it now redirect** to the internships site, which has
+  // its own `proxy.ts` gating its sub-pages (2026-11-11). `:path*` here, deliberately: it
+  // matches zero or more segments, so `/internships` itself is redirected too. Until the split
+  // this was `:path+`, which left the public listing ungated (path-to-regexp syntax; see the
+  // matcher section of this convention's doc, linked at the top of this file).
+  matcher: ["/fridge/:path*", "/blog/admin/:path*", "/internships/:path*"],
 };
