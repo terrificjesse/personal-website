@@ -920,3 +920,160 @@ mod event_paging_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod quota_tests {
+    //! S14 (docs/PUBLIC_API_STRESS_TEST.md, second pass). One signed-in account wrote 45,410
+    //! maximum-length answers in 10 seconds, growing the database from 49 MB to 1,128 MB; listing
+    //! them built a 1 GB response, and four of those took the server to 2.8 GiB. Every collection
+    //! an account can append to has to stop somewhere. Driven through the real router, so a cap
+    //! the route does not enforce cannot pass.
+    use axum::http::StatusCode;
+    use uuid::Uuid;
+
+    /// A router on a fresh database, and a session cookie for one registered account.
+    async fn signed_in() -> (String, String, sqlx::SqlitePool) {
+        let path = std::env::temp_dir().join(format!("quota-{}.db", Uuid::new_v4()));
+        let pool = crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("pool");
+        let app = crate::routes::build_router(crate::routes::AppState {
+            pool: pool.clone(),
+            catalog: std::sync::Arc::new(crate::foodkeeper::Catalog::load().expect("catalog")),
+            recipe_catalog: std::sync::Arc::new(
+                crate::themealdb::Catalog::load().expect("recipe catalog"),
+            ),
+            google_oauth: None,
+            rate_limits: crate::rate_limit::RateLimits::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("serve");
+        });
+        let base = format!("http://{address}");
+        let response = reqwest::Client::new()
+            .post(format!("{base}/auth/register"))
+            .json(&serde_json::json!({
+                "email": "quota@example.com",
+                "password": "a-long-enough-password",
+            }))
+            .send()
+            .await
+            .expect("register");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("fridge_session="))
+            .and_then(|value| value.split(';').next())
+            .expect("session cookie")
+            .to_string();
+        (base, cookie, pool)
+    }
+
+    async fn post(base: &str, cookie: &str, path: &str, body: serde_json::Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header("cookie", cookie)
+            .json(&body)
+            .send()
+            .await
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn the_answer_library_stops_at_its_ceiling() {
+        let (base, cookie, _) = signed_in().await;
+        for n in 0..500 {
+            let response = post(&base, &cookie, "/hunt/answers", serde_json::json!({
+                "question_text": format!("Question {n}"),
+                "answer_text": "An answer.",
+            }))
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED, "answer {n} is within the ceiling");
+        }
+        let response = post(&base, &cookie, "/hunt/answers", serde_json::json!({
+            "question_text": "One too many",
+            "answer_text": "An answer.",
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "the 501st answer is refused");
+    }
+
+    #[tokio::test]
+    async fn resume_variants_stop_at_their_ceiling() {
+        let (base, cookie, _) = signed_in().await;
+        for n in 0..100 {
+            let response = post(&base, &cookie, "/hunt/resume-variants", serde_json::json!({
+                "label": format!("Variant {n}"),
+            }))
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED, "variant {n} is within the ceiling");
+        }
+        let response = post(&base, &cookie, "/hunt/resume-variants", serde_json::json!({
+            "label": "One too many",
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "the 101st variant is refused");
+    }
+
+    #[tokio::test]
+    async fn live_extension_tokens_stop_at_their_ceiling_and_revoking_frees_a_slot() {
+        let (base, cookie, _) = signed_in().await;
+        let mut first_id = String::new();
+        for n in 0..20 {
+            let response = post(&base, &cookie, "/hunt/tokens", serde_json::json!({})).await;
+            assert_eq!(response.status(), StatusCode::CREATED, "token {n} is within the ceiling");
+            if n == 0 {
+                let minted: serde_json::Value = response.json().await.expect("json");
+                first_id = minted["id"].as_str().expect("id").to_string();
+            }
+        }
+        let response = post(&base, &cookie, "/hunt/tokens", serde_json::json!({})).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "the 21st live token is refused");
+
+        let revoked = reqwest::Client::new()
+            .delete(format!("{base}/hunt/tokens/{first_id}"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("revoke");
+        assert!(revoked.status().is_success(), "revoke: {}", revoked.status());
+        let response = post(&base, &cookie, "/hunt/tokens", serde_json::json!({})).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "revoking one frees a slot");
+    }
+
+    /// Revoked tokens stay as tombstones, so minting and revoking in a loop was the way round a
+    /// cap on live tokens.
+    #[tokio::test]
+    async fn revoked_token_tombstones_do_not_accumulate_without_limit() {
+        let (base, cookie, pool) = signed_in().await;
+        for _ in 0..130 {
+            let minted: serde_json::Value = post(&base, &cookie, "/hunt/tokens", serde_json::json!({}))
+                .await
+                .json()
+                .await
+                .expect("json");
+            let id = minted["id"].as_str().expect("id").to_string();
+            reqwest::Client::new()
+                .delete(format!("{base}/hunt/tokens/{id}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .expect("revoke");
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hunt_tokens")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 100, "the newest 100 revoked tokens are kept as tombstones");
+    }
+}

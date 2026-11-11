@@ -387,6 +387,46 @@ pub async fn delete(pool: &SqlitePool, id: &str, user_id: &str) -> Result<bool> 
 mod tests {
     use super::*;
 
+    /// S14 (docs/PUBLIC_API_STRESS_TEST.md, second pass). Each edit keeps the text it
+    /// replaced, so editing one answer in a loop grew the database without limit. Only the most
+    /// recent revisions are kept.
+    #[tokio::test]
+    async fn an_answer_keeps_a_bounded_number_of_revisions() {
+        let pool = test_pool().await;
+        user(&pool, "u1").await;
+        let user = "u1".to_string();
+        let answer = save(
+            &pool,
+            &user,
+            answer("Tell us about a project", "Version 0", None),
+            Utc::now(),
+        )
+        .await
+        .expect("save")
+        .expect("valid");
+        for n in 1..=60 {
+            edit(&pool, &answer.id, &user, &format!("Version {n}"), Utc::now())
+                .await
+                .expect("edit")
+                .expect("edited");
+        }
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM answer_revisions WHERE answer_id = ?")
+            .bind(&answer.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(kept, 50, "the newest 50 revisions are kept");
+        let newest: String = sqlx::query_scalar(
+            "SELECT answer_text FROM answer_revisions WHERE answer_id = ?
+              ORDER BY replaced_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&answer.id)
+        .fetch_one(&pool)
+        .await
+        .expect("newest");
+        assert_eq!(newest, "Version 59", "the most recent replaced text survives");
+    }
+
     async fn test_pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("answers-{}.db", Uuid::new_v4()));
         crate::db::init_pool(&format!("sqlite://{}?mode=rwc", path.display()))

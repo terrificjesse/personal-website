@@ -319,6 +319,54 @@ mod tests {
         IpAddr::from([192, 0, 2, last_octet])
     }
 
+    fn in_one_64(n: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, 0, 0, n, n, n, n])
+    }
+
+    /// S11 (docs/PUBLIC_API_STRESS_TEST.md, second pass). One IPv6 /64 is one subscriber, and
+    /// every address in it is theirs to use: keyed on the full address, registration admitted
+    /// 5,676 accounts in 8 seconds from one /64, with no 429.
+    #[test]
+    fn addresses_in_one_ipv6_64_share_one_budget() {
+        let limits = RateLimits::default();
+        let now = Instant::now();
+        for n in 0..REGISTER_MAX_ATTEMPTS as u16 {
+            assert!(
+                limits
+                    .check(Endpoint::Register, in_one_64(n + 1), &format!("p{n}@example.com"), now)
+                    .is_ok(),
+                "attempt {n} is within the budget"
+            );
+        }
+        assert!(
+            limits.check(Endpoint::Register, in_one_64(999), "fresh@example.com", now).is_err(),
+            "a sixth address in the same /64 is the same caller"
+        );
+    }
+
+    #[test]
+    fn separate_ipv6_64s_have_separate_budgets() {
+        let limits = RateLimits::default();
+        let now = Instant::now();
+        for n in 0..REGISTER_MAX_ATTEMPTS as u16 {
+            assert!(limits.check(Endpoint::Register, in_one_64(n + 1), &format!("p{n}@example.com"), now).is_ok());
+        }
+        let elsewhere = IpAddr::from([0x2001, 0xdb8, 0, 1, 0, 0, 0, 1]);
+        assert!(limits.check(Endpoint::Register, elsewhere, "other@example.com", now).is_ok());
+    }
+
+    /// The same IPv4 caller written as an IPv4-mapped IPv6 address must not get a second budget.
+    #[test]
+    fn an_ipv4_mapped_address_is_its_ipv4_address() {
+        let limits = RateLimits::default();
+        let now = Instant::now();
+        for n in 0..REGISTER_MAX_ATTEMPTS {
+            assert!(limits.check(Endpoint::Register, ip(7), &format!("p{n}@example.com"), now).is_ok());
+        }
+        let mapped = IpAddr::V6(std::net::Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped());
+        assert!(limits.check(Endpoint::Register, mapped, "fresh@example.com", now).is_err());
+    }
+
     #[test]
     fn login_refuses_the_eleventh_attempt() {
         let limits = RateLimits::default();
