@@ -496,7 +496,11 @@ would drop the application once the posting is gone (trap 1 by the back door), a
 `p.expired_at IS NULL` alone would report a **vanished** posting as live, since `NULL IS NULL`
 is true. `posting_is_live` is three-valued and a `None` must never render as "Closed".
 
-## Frontend — `frontend/src/app/internships/`
+## Frontend — `apps/hunt-web/src/app/internships/`
+
+Its own website since 2026-11-11, split out of the personal site's tab with the same backend and
+account (`docs/HUNT.md` § "The internships site, split out"). It was `frontend/src/app/internships/`
+until then, so older entries in this file and in `docs/PLAN.md` use that path.
 
 | File | What it is |
 |---|---|

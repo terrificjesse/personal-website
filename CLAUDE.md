@@ -14,25 +14,28 @@ had already drifted a whole phase behind: no `apps/hunt-extension/` in its repo 
 govern autofill — so the agent reading it was working from a repo that stopped existing in
 August. Two hand-maintained copies of one rules file diverge; a symlink cannot. **If you find
 yourself editing `AGENTS.md`, you are editing this file — that is the point. Never replace it
-with a copy.** (`frontend/` is the one exception: `next dev` generates and re-adds
-`frontend/AGENTS.md` on its own, so there `frontend/CLAUDE.md` imports it with `@AGENTS.md`
-and the direction is reversed. Leave that pair alone.)
+with a copy.** (`frontend/` and `apps/hunt-web/` are the exceptions: `next dev` generates and
+re-adds an `AGENTS.md` in each on its own, so there `CLAUDE.md` imports it with `@AGENTS.md` and
+the direction is reversed. Leave those pairs alone.)
 
 ## Repo layout
 
 ```
 personal-website/
-  frontend/                 # Next.js app (App Router, TypeScript). The site shell + all tabs.
+  frontend/                 # The personal site: Next.js (App Router, TypeScript), port 3000.
     app/
       fridge/                # Fridge tab lives here (added in Phase 1)
       blog/                  # Blog tab (added Phase 6) — public reading + admin-only editor
-      internships/           # Internship tab (Phase 7) — scraped SWE internship postings
       ...other tabs later, not in scope yet
+                             # /internships redirects to the internships site (proxy.ts)
   apps/
     fridge-app/
       backend/               # Rust API service. Serves the fridge app, the blog, internships,
                              #   *and* the hunt alert channel (src/hunt/, Phase 8).
       CLAUDE.md               # fridge-app-specific notes (data model, endpoints, phase status)
+    hunt-web/                # The internships site, its own website since 2026-11-11, port 3001.
+                             #   The Phase 7 tab's pages, same backend and account.
+                             #   docs/HUNT.md § "The internships site, split out"
     hunt-extension/          # Firefox MV3 extension (Phase 8) — desktop alerts, later autofill
       CLAUDE.md               # governs Phase 8 wherever its code lives, backend half included
   content/
@@ -213,7 +216,7 @@ seam, and rule 4 still applies to it.
 | Lane | Owns | Typical work |
 |---|---|---|
 | **A — backend** | `apps/fridge-app/backend/src/**`, `migrations/` | Rust, SQL, sources, the inbox agent |
-| **B — client** | `frontend/src/**`, `apps/hunt-extension/**` | React, the extension, anything in a browser |
+| **B — client** | `frontend/src/**`, `apps/hunt-web/src/**`, `apps/hunt-extension/**` | React, the extension, anything in a browser |
 | **C — docs** | `docs/**`, the rules files | Reconciliation, phase write-ups, specs |
 
 Lane C is written by whoever finishes first; it is never a *concurrent* lane, because two

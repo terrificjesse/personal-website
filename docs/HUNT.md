@@ -774,7 +774,7 @@ full on the applications page, because a decision waiting for you is not optiona
 
 - **The interval worker** (`inbox::sync::spawn`), so a sync is not something you remember to
   POST. Spawned rather than awaited: a slow Gmail cannot delay startup.
-- **The proposals panel** (`frontend/src/app/internships/InboxPanel.tsx`), showing the causing
+- **The proposals panel** (`apps/hunt-web/src/app/internships/InboxPanel.tsx`), showing the causing
   email beside each proposed transition. Rule 2's audit trail is worthless if the only way to
   read it is SQL.
 - **The inbox line in the extension popup** (`popup.js:597`), reporting *no account* / *no sync
@@ -1270,7 +1270,7 @@ does not change, and the tracker row is still created only by an explicit click.
 ### Built 2026-09-02, end to end
 
 Migration `0024`, `src/hunt/variants.rs`, four routes, and a variant picker on the popup's
-track offer store the attribution. `frontend/src/app/internships/ResumeVariantsPanel.tsx` closes
+track offer store the attribution. `apps/hunt-web/src/app/internships/ResumeVariantsPanel.tsx` closes
 the setup loop on the site: it lists, creates, renames, retires, restores and deletes variants.
 Archived variants stay in the list with a **Retired** badge, and each row shows its
 `application_count`, making it visible that a rename keeps every linked application.
