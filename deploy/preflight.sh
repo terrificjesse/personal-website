@@ -62,6 +62,18 @@ elif [[ "$(get FRONTEND_ORIGIN)" != https://* ]]; then
   problems+=("FRONTEND_ORIGIN is not https:// — a Secure cookie will never be sent")
 fi
 
+# The internships site, its own origin since 2026-11-11 (docs/HUNT.md § "The internships site,
+# split out"). Gmail connect and its Google sign-in return there, and both set cookies on the host
+# their callback names, so a callback on the wrong host leaves that site signed out.
+hunt_origin="$(get HUNT_SITE_ORIGIN)"
+if [[ -z "$hunt_origin" ]]; then
+  problems+=("HUNT_SITE_ORIGIN is unset; Gmail connect and its sign-in would return to localhost:3001")
+elif [[ "$hunt_origin" != https://* ]]; then
+  problems+=("HUNT_SITE_ORIGIN is not https:// — a Secure cookie will never be sent")
+elif [[ "$hunt_origin" == "$(get FRONTEND_ORIGIN)" ]]; then
+  problems+=("HUNT_SITE_ORIGIN equals FRONTEND_ORIGIN; the two sites are separate origins")
+fi
+
 # --- 3. the database ------------------------------------------------------------------------
 # A relative path resolves against WorkingDirectory, so a deploy that moves the checkout
 # silently creates a second, empty database. An absolute path outside every checkout is the
@@ -109,6 +121,20 @@ done
 if (( google_present > 0 && google_absent > 0 )); then
   problems+=("Google OAuth is half-configured: $google_present of 3 set. Set all three or none")
 fi
+# One callback per site, each on its own host, because the session cookie lands on the host of
+# the callback Google returns to.
+if (( google_present == 3 )); then
+  frontend_origin="$(get FRONTEND_ORIGIN)"
+  if [[ "$(get GOOGLE_REDIRECT_URI)" != "$frontend_origin"/* ]]; then
+    problems+=("GOOGLE_REDIRECT_URI must be on FRONTEND_ORIGIN ($frontend_origin); the sign-in cookie lands on the callback's host")
+  fi
+  hunt_redirect="$(get HUNT_GOOGLE_REDIRECT_URI)"
+  if [[ -z "$hunt_redirect" ]]; then
+    problems+=("HUNT_GOOGLE_REDIRECT_URI is unset; signing in with Google on the internships site would leave it signed out")
+  elif [[ -n "$hunt_origin" && "$hunt_redirect" != "$hunt_origin"/* ]]; then
+    problems+=("HUNT_GOOGLE_REDIRECT_URI must be on HUNT_SITE_ORIGIN ($hunt_origin)")
+  fi
+fi
 
 # --- 6. the inbox agent ---------------------------------------------------------------------
 # UNSET IS NOT OFF: the interval defaults to 900s, and labelling defaults ON. Both are fine on
@@ -122,6 +148,10 @@ if [[ "$interval" != "0" ]]; then
     problems+=("the inbox sync is enabled (INBOX_SYNC_INTERVAL_SECS='${interval:-unset -> 900}') but Google OAuth is not fully configured")
   fi
   set_and_nonempty GMAIL_REDIRECT_URI || problems+=("GMAIL_REDIRECT_URI is unset while the inbox sync is enabled")
+  gmail_redirect="$(get GMAIL_REDIRECT_URI)"
+  if [[ -n "$gmail_redirect" && -n "$hunt_origin" && "$gmail_redirect" != "$hunt_origin"/* ]]; then
+    problems+=("GMAIL_REDIRECT_URI must be on HUNT_SITE_ORIGIN ($hunt_origin); Gmail connect starts there and its state cookie lives there")
+  fi
   case "$(get INBOX_APPLY_LABELS)" in
     true|false|0|1) ;;
     *) problems+=("INBOX_APPLY_LABELS must be set explicitly (it defaults to ON). Task 10k decided ON on 2026-09-03; this check stops the value being inherited rather than chosen") ;;

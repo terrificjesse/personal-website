@@ -42,9 +42,12 @@ const HUNT_SITE_PORT = 3001;
  * hostname on port 3001, which keeps the link working from a phone on the LAN the same way
  * `apiBase()` does for the API.
  */
-function huntSiteOrigin(request: NextRequest): string {
+function huntSiteOrigin(request: NextRequest): string | null {
   const configured = process.env.HUNT_SITE_URL?.trim();
   if (configured) return configured.replace(/\/+$/, "");
+  // A deployment has no right answer to guess: the same hostname on 3001 is behind the firewall,
+  // so the redirect would time out and look like the internships site is down.
+  if (process.env.NODE_ENV === "production") return null;
   return `${request.nextUrl.protocol}//${request.nextUrl.hostname}:${HUNT_SITE_PORT}`;
 }
 
@@ -72,7 +75,15 @@ export default function proxy(request: NextRequest) {
   // 307 rather than 308: a browser caches a permanent redirect, and the site's address is a
   // deployment setting that may still change.
   if (pathname === "/internships" || pathname.startsWith("/internships/")) {
-    return NextResponse.redirect(`${huntSiteOrigin(request)}${pathname}${search}`, 307);
+    const origin = huntSiteOrigin(request);
+    if (!origin) {
+      console.error("proxy: HUNT_SITE_URL is unset, so /internships cannot be redirected");
+      return new NextResponse(
+        "The internships site's address is not configured on this server (HUNT_SITE_URL).",
+        { status: 503 },
+      );
+    }
+    return NextResponse.redirect(`${origin}${pathname}${search}`, 307);
   }
 
   if (request.cookies.has(SESSION_COOKIE)) {

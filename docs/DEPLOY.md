@@ -1,22 +1,26 @@
 # Deploying the hunt tooling — runbook
 
 **Phase 10h.** Everything here that is not a secret lives in `deploy/`. Nothing in this repo
-holds a key, a token or a real hostname; `hunt.example.com` is a placeholder throughout.
+holds a key, a token or a real hostname. `example.com` (the personal site) and `hunt.example.com`
+(the internships site) are placeholders throughout.
 
 The first reason to deploy is that **the inbox agent runs when the laptop is closed** — Phase
 13's checkpoint needs a fortnight of real mail, and the clock on that only starts here. See
 `docs/PLAN.md` § Phases 10–13. Since 2026-10-19 there is a second: the internship listing is
 public, so a deployed site is also what visitors use.
 
-**Corrected against the code on 2026-11-05.** Nothing here has yet been run on a real host, and
-§ Rehearsed says exactly which parts have and have not been run anywhere.
+**Corrected against the code on 2026-11-05, and for two sites on 2026-11-11.** The internships
+tab became its own website that day (`docs/HUNT.md` § "The internships site, split out"). Nothing
+here has yet been run on a real host, and § Rehearsed says exactly which parts have and have not
+been run anywhere.
 
 ---
 
 ## Before you start — what this actually is
 
-**One machine, three processes, one domain name.** Caddy listens on 443 and hands `/` to the
-Next.js frontend and `/api/*` to the Rust backend. SQLite is a file on that machine's disk, not
+**One machine, four processes, two hostnames.** Caddy listens on 443 and serves two sites: the
+personal site at `example.com` and the internships site at `hunt.example.com`. Each hands `/` to its
+own Next.js app and `/api/*` to the one Rust backend. SQLite is a file on that machine's disk, not
 a service. Nothing is containerised and nothing is clustered, because one person's job hunt does
 not need it.
 
@@ -28,8 +32,8 @@ your laptop; what does not work on a laptop is a fortnight of continuous polling
 | What | Why | Notes |
 |---|---|---|
 | A small Linux VPS | Somewhere that stays on | **≥ 2 GB RAM and ≥ 20 GB disk.** Not a 1 GB box: `cargo build --release` links the backend in one process and will be OOM-killed, and the Rust `target/` directory alone runs to several GB |
-| A domain name | Caddy provisions a TLS certificate against it, and Google's OAuth client demands an `https://` redirect | Any registrar. This is the only item with a lead time — DNS has to resolve *before* the first deploy |
-| A Google Cloud OAuth client | Sign-in, and the Gmail scope the inbox agent runs on | Free. The client you already use locally is fine: add the two deployed redirect URIs to it |
+| A domain name, and two DNS records | Caddy provisions a TLS certificate for each site, and Google's OAuth client demands an `https://` redirect | Any registrar. A subdomain such as `hunt.` costs nothing extra; both records must point at the server. This is the only item with a lead time — DNS has to resolve *before* the first deploy |
+| A Google Cloud OAuth client | Sign-in, and the Gmail scope the inbox agent runs on | Free. The client you already use locally is fine: add the three deployed redirect URIs to it |
 
 Nothing else. No managed database, no object store, no CI runner.
 
@@ -38,8 +42,8 @@ Nothing else. No managed database, no object store, no CI runner.
 Three of the steps are ordered by something other than preference, and getting them out of
 order costs a retry rather than data:
 
-1. **DNS resolves → then deploy.** Caddy gets its certificate on first start by answering a
-   challenge on the domain. Start it before the record propagates and it fails, backs off, and
+1. **DNS resolves → then deploy.** Caddy gets each certificate on first start by answering a
+   challenge on that hostname, so both records have to resolve. Start it before the record propagates and it fails, backs off, and
    you wait.
 2. **The frontend's API URL is baked in at build time.** `NEXT_PUBLIC_*` is compiled into the
    browser bundle. Setting it in the service file after the fact does nothing — you have to
@@ -71,16 +75,23 @@ corpus starts accumulating.
 
 ---
 
-## One origin, one host
+## One origin per site
 
-Both processes sit behind a single origin: Caddy serves the Next frontend at `/` and the Rust
-backend at `/api/*`, path-stripped.
+Each site is a single origin: Caddy serves that site's Next app at `/` and the one Rust backend at
+`/api/*`, path-stripped. The personal site and the internships site are two such origins, with the
+same backend, the same database and the same account behind both.
 
-**This is not a preference.** `fridge_session` is `SameSite=Lax`. A split origin
+**Single-origin within a site is not a preference.** `fridge_session` is `SameSite=Lax`. A split origin
 (`app.example.com` + `api.example.com`) makes every API call cross-site, so the cookie must
 become `SameSite=None; Secure` to survive — a strictly weaker cookie, for no gain. One origin
 keeps `Lax` working and makes CORS irrelevant for the site itself. `docs/PLAN.md` § After
 Phase 5 reached the same conclusion from the other direction.
+
+**Two sites means two cookies.** The session cookie is host-only, so signing in on one site does
+not sign you in on the other; you sign in on each, with the same account. That is also why each
+site has its own Google callback (`HUNT_GOOGLE_REDIRECT_URI`): the cookie lands on whichever host
+the callback is on. Locally both sites are on `localhost` and share one cookie, because cookies
+ignore port.
 
 The Firefox extension is unaffected either way: it authenticates with a `hunt_tokens` bearer
 precisely because no cookie can reach a `moz-extension://` page.
@@ -96,10 +107,11 @@ database nobody writes to.
 /opt/personal-website-build/      HOME for builds: the Rust toolchain and the npm cache
 /etc/personal-website/backend.env     secrets, mode 600, owned by `personal-website`
 /etc/personal-website/backup.env      backup paths, mode 600
-/etc/personal-website/frontend.env    optional, non-secret build/runtime knobs
+/etc/personal-website/frontend.env    the personal site's runtime knobs: HUNT_SITE_URL
 /var/lib/personal-website/fridge.db   the database, outside every checkout
 /var/backups/personal-website/        verified snapshots, mode 700: they hold the Gmail token
-/var/log/caddy/hunt.log   access log; app logs go to the journal
+/var/log/caddy/site.log   personal site access log; app logs go to the journal
+/var/log/caddy/hunt.log   internships site access log
 ```
 
 **Why builds get their own `HOME`.** The service user's home is the checkout, whose `.cargo/` is
@@ -132,18 +144,19 @@ tried and means alerting is degraded.
 
 ## First deploy
 
-Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04, and
-`hunt.example.com` stands for your domain throughout.
+Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04. `example.com`
+stands for the personal site's hostname and `hunt.example.com` for the internships site's.
 
 1. ~~**Gate — merge `phase-10-hardening`.**~~ **Done 2026-09-02.** 10g, 10i and 10j are in;
    the combined suite is 758 passing, which is exactly the two branches' additions with nothing
    lost, plus clippy at 36 and a clean `tsc`/`eslint`.
 2. **On the laptop: merge what should go live to `main`, and push it.** `main` is what gets
    cloned. See "Which branch gets deployed" below.
-3. **Register both redirect URIs in Google Cloud Console** — they must match **exactly**:
-   `https://hunt.example.com/api/auth/google/callback` and
-   `https://hunt.example.com/api/auth/gmail/callback`. A mismatch is an opaque
-   `redirect_uri_mismatch`. See "Google's limits on Gmail" below for what else to set there.
+3. **Register all three redirect URIs in Google Cloud Console** — they must match **exactly**:
+   `https://example.com/api/auth/google/callback` (sign-in on the personal site),
+   `https://hunt.example.com/api/auth/google/callback` (sign-in on the internships site) and
+   `https://hunt.example.com/api/auth/gmail/callback` (Gmail, which is an internships feature). A
+   mismatch is an opaque `redirect_uri_mismatch`. See "Google's limits on Gmail" below for what else to set there.
 4. **Firewall and tools.** Both processes now listen on loopback only, so the firewall is a second
    layer rather than the only one:
    ```bash
@@ -181,7 +194,18 @@ Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04
    relative `DATABASE_URL` or one inside a checkout, a `BIND_ADDRESS` other than `127.0.0.1`,
    half-configured Google credentials, an unparseable sync interval, and an unset
    `INBOX_APPLY_LABELS` (decided ON — see below; the check remains so the value is never
-   inherited).
+   inherited). Since the split it also refuses a missing or non-https `HUNT_SITE_ORIGIN`, one equal
+   to `FRONTEND_ORIGIN`, and any callback on the wrong site's host: `GOOGLE_REDIRECT_URI` must be
+   on the personal site, while `HUNT_GOOGLE_REDIRECT_URI` and `GMAIL_REDIRECT_URI` must be on the
+   internships site.
+
+   The personal site needs one runtime setting of its own, the internships site's address. Its
+   `proxy.ts` redirects `/internships` there, and answers 503 rather than guessing when it is
+   unset:
+   ```bash
+   sudo install -m 644 -o personal-website -g personal-website /dev/null /etc/personal-website/frontend.env
+   echo 'HUNT_SITE_URL=https://hunt.example.com' | sudo tee /etc/personal-website/frontend.env > /dev/null
+   ```
 8. Build both halves. The first build takes 20–40 minutes on a small box. Install the Rust
    toolchain, then:
    ```bash
@@ -195,11 +219,16 @@ Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04
    (`docs/PUBLIC_API_STRESS_TEST.md`, S1). The backend prints a `WARNING` at startup when that
    has happened — check `journalctl -u personal-website-backend` after the first start.
    ```bash
-   sudo -u personal-website env HOME=/opt/personal-website-build NEXT_PUBLIC_FRIDGE_API_URL=https://hunt.example.com/api sh -c 'cd /opt/personal-website/frontend && npm ci && npm run build'
+   sudo -u personal-website env HOME=/opt/personal-website-build NEXT_PUBLIC_FRIDGE_API_URL=https://example.com/api sh -c 'cd /opt/personal-website/frontend && npm ci && npm run build'
+   sudo -u personal-website env HOME=/opt/personal-website-build NEXT_PUBLIC_FRIDGE_API_URL=https://hunt.example.com/api sh -c 'cd /opt/personal-website/apps/hunt-web && npm ci && npm run build'
    ```
+   **Each site's API URL is its own origin**, so each reaches the backend through its own `/api`
+   and its cookie stays same-origin. Swapping them builds a site whose every call is cross-site,
+   which reads as permanently signed out.
+
    **`NEXT_PUBLIC_*` is baked in at build time.** Setting it in the service file does nothing —
    the browser bundle already contains whatever was set when `next build` ran. Getting this
-   wrong points the deployed site at `https://hunt.example.com:8080`, which the proxy does not
+   wrong points the deployed site at `https://example.com:8080`, which the proxy does not
    serve, and every call fails as a bare network error.
 9. **Bring your data over**, or skip this to start empty. Stop the laptop's backend first: two
    copies syncing one mailbox would both label it and both alert. On the laptop:
@@ -231,19 +260,24 @@ Ordered. The gates are marked and are not optional. Commands assume Ubuntu 24.04
     is wrong.
 11. Install the units and the proxy config from `deploy/`, then start them:
     ```bash
-    sudo cp /opt/personal-website/deploy/personal-website-backend.service /opt/personal-website/deploy/personal-website-frontend.service /etc/systemd/system/
+    sudo cp /opt/personal-website/deploy/personal-website-backend.service /opt/personal-website/deploy/personal-website-frontend.service /opt/personal-website/deploy/personal-website-hunt.service /etc/systemd/system/
     sudo cp /opt/personal-website/deploy/Caddyfile /etc/caddy/Caddyfile
-    sudo sed -i 's/hunt\.example\.com/YOUR-DOMAIN/' /etc/caddy/Caddyfile
-    systemd-analyze verify /etc/systemd/system/personal-website-backend.service /etc/systemd/system/personal-website-frontend.service
+    sudo sed -i -e 's/hunt\.example\.com/YOUR-HUNT-HOSTNAME/g' -e 's/example\.com/YOUR-HOSTNAME/g' /etc/caddy/Caddyfile
+    systemd-analyze verify /etc/systemd/system/personal-website-backend.service /etc/systemd/system/personal-website-frontend.service /etc/systemd/system/personal-website-hunt.service
+    caddy validate --config /etc/caddy/Caddyfile
     sudo systemctl daemon-reload
-    sudo systemctl enable --now personal-website-backend personal-website-frontend
+    sudo systemctl enable --now personal-website-backend personal-website-frontend personal-website-hunt
     sudo systemctl restart caddy
     ```
-    `systemd-analyze verify` should print nothing about these two units. It is the check that
+    **The internships site's hostname is replaced first**, and that order matters: the second
+    pattern would otherwise turn `hunt.example.com` into `hunt.YOUR-HOSTNAME`, which is only right
+    if that is the hostname you chose. `systemd-analyze verify` should print nothing about these
+    three units. It is the check that
     catches a setting in the wrong section, which systemd otherwise only warns about in the journal.
-12. Sign in, connect Gmail, and confirm the checks under **Is it alive?** below. Reconnect even
-    with a database brought over from the laptop: its stored token keeps working until it expires,
-    but reconnecting is what proves the deployed redirect URI works.
+12. Sign in on **both** sites, connect Gmail on the internships site, and confirm the checks under
+    **Is it alive?** below. Reconnect even with a database brought over from the laptop: its stored
+    token keeps working until it expires, but reconnecting is what proves the deployed redirect URI
+    works. Signing in on each site is what proves its own Google callback does.
 
 ## Which branch gets deployed
 
@@ -276,9 +310,9 @@ sudo -u personal-website git -C /opt/personal-website pull
 **This pulls whatever branch the clone tracked.** If you deployed a named branch rather than
 `main`, say so here in your own copy — a `pull` that silently tracks the wrong branch is the
 same failure as step 6, arriving later and with a running service on top of it.
-Then rebuild both halves exactly as in step 8 — **the frontend must be rebuilt, not just
-restarted**, whenever `NEXT_PUBLIC_FRIDGE_API_URL` or any frontend code changes — re-run the
-preflight, and `sudo systemctl restart personal-website-backend personal-website-frontend`.
+Then rebuild everything exactly as in step 8 — **each site must be rebuilt, not just
+restarted**, whenever its `NEXT_PUBLIC_FRIDGE_API_URL` or its code changes — re-run the
+preflight, and `sudo systemctl restart personal-website-backend personal-website-frontend personal-website-hunt`.
 
 Migrations run at boot inside `db::init_pool`. **An applied migration is immutable**: sqlx
 compares checksums and refuses to start with `migration N was previously applied but has been
@@ -307,7 +341,7 @@ construction. Copying `fridge.db` alone while the service is running can capture
 
 ### One thing not to change without checking
 
-`apiBase()` (`frontend/src/lib/apiClient.ts`) falls back to `http://127.0.0.1:8080` when there
+`apiBase()` (`src/lib/apiClient.ts`, one copy in each site) falls back to `http://127.0.0.1:8080` when there
 is no `window` — server-side. Nothing calls the backend from the server today (`proxy.ts`
 deliberately does not), so this never fires. If server-side code is ever added, note that
 `NEXT_PUBLIC_FRIDGE_API_URL` would send it out through the public origin and back in, which
@@ -330,12 +364,19 @@ sudo systemctl reset-failed personal-website-backend
 sudo systemctl restart personal-website-backend
 ```
 
-Reachable the way it should be, and no other way. Both processes should be on `127.0.0.1`, and
-the second command, run from **another machine**, should time out or be refused:
+Reachable the way it should be, and no other way. All three processes should be on `127.0.0.1`,
+and the second command, run from **another machine**, should time out or be refused:
 
 ```bash
-sudo ss -ltnp | grep -E ':(3000|8080) '
+sudo ss -ltnp | grep -E ':(3000|3001|8080) '
 curl -m 5 http://YOUR-SERVER-IP:8080/health
+```
+
+The personal site's link to the internships site. A `location:` naming the internships site is
+right, and a 503 means `HUNT_SITE_URL` is missing from `frontend.env`:
+
+```bash
+curl -sI https://example.com/internships | grep -iE '^(HTTP|location)'
 ```
 
 The inbox agent, from outside the extension — the popup's inbox line is one view of this, and
@@ -549,6 +590,28 @@ is all `proxy.ts` checks, on a throwaway hostname.
 | `/internships` when the API answers 500 | Keeps the client's own message: "Could not load internships (500)" |
 | **Control: the browser's error for a closed port** | A `TypeError` reading "Failed to fetch", which is what the listing used to show |
 
+### Rehearsed again, 2026-11-11 — two sites, one backend
+
+Production builds of both sites from scratch copies, each with its API URL baked in as step 8
+does. The backend ran on a copy of the database with its Gmail account deleted and every background
+job off, all on a throwaway hostname so no real sign-in cookie could be touched.
+
+| Check | Result |
+|---|---|
+| The personal site's Internships link | Lands on the internships site's listing, all 4,514 postings, with no CORS error |
+| An old `/internships/applications` bookmark on the personal site | Redirected to the internships site, which sends a signed-out visitor to its own sign-in page |
+| `HUNT_SITE_URL` | Read at runtime, not build time. **Unset in production: a 503 with the reason**, and a log line |
+| Signed in with a generated test account on the internships site | Tracker loads; the personal site sees the same sign-in, as expected on one local host |
+| Gmail consent declined | Returns to the internships site's listing |
+| `GET /auth/google/start?site=hunt` | Sends `HUNT_GOOGLE_REDIRECT_URI` to Google and sets `google_oauth_site=hunt`. With no parameter, the personal redirect URI |
+| Google callback errors | Return to the site that started. A forged site cookie returns to the personal site |
+| CORS | Both sites admitted, any other origin refused |
+| Preflight | Passes the filled-in example. Refuses each callback on the wrong host, a missing `HUNT_SITE_ORIGIN`, and the two sites sharing an origin |
+
+**Not rehearsed:** the Caddyfile's two site blocks and its shared snippet (`caddy` is not installed
+here, which is why step 11 now runs `caddy validate`), the new systemd unit, and a real Google
+round trip through either callback.
+
 ### What could not be rehearsed here, and is still genuinely untested
 
 - **systemd** does not run on macOS. The units are path-checked and never started.
@@ -610,7 +673,7 @@ Nothing below can be done by an agent: it needs an account, a card, DNS, or a de
    Measured on a real copy during Checkpoint 11: `responded 0 → 1`, `reached_oa 0 → 1`, with no
    indication in the response that the log had been empty.
 11. Update the extension: set its Settings backend URL to `https://hunt.example.com/api`, its site
-   URL to `https://hunt.example.com`, and press **Test connection**, which is what triggers
+   URL to `https://hunt.example.com` (the internships site), and press **Test connection**, which is what triggers
    Firefox's permission prompt for that origin — accept it. No manifest edit and no reload: the
    grant is per origin and happens at runtime. `ALLOWED_ORIGINS` needs no entry for the extension,
    because the backend admits any `moz-extension://` origin.

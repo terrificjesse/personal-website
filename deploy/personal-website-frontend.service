@@ -1,5 +1,6 @@
-# Frontend: Next.js, `next start` against a production build.
-# Install to /etc/systemd/system/personal-website-frontend.service.
+# Personal site: Next.js, `next start` against a production build of frontend/.
+# Install to /etc/systemd/system/personal-website-frontend.service. The internships site has its
+# own unit, personal-website-hunt.service, since 2026-11-11.
 #
 # It listens on loopback only. Nothing but the reverse proxy should be able to reach it, and
 # binding it publicly would put a second origin on the host — the thing § One origin exists
@@ -24,6 +25,8 @@ WorkingDirectory=/opt/personal-website/frontend
 Environment=NODE_ENV=production
 Environment=PORT=3000
 # NEXT_PUBLIC_* is baked in at BUILD time, not read here — see docs/DEPLOY.md § Redeploy.
+# frontend.env is read at runtime, and must set HUNT_SITE_URL to the internships site: proxy.ts
+# redirects /internships there, and answers 503 rather than guessing when it is unset.
 EnvironmentFile=-/etc/personal-website/frontend.env
 
 ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1

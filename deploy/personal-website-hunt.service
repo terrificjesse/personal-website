@@ -1,0 +1,41 @@
+# Internships site: Next.js, `next start` against a production build of apps/hunt-web.
+# Install to /etc/systemd/system/personal-website-hunt.service.
+#
+# Split out of the personal site on 2026-11-11 (docs/HUNT.md § "The internships site, split
+# out"). Everything in personal-website-frontend.service applies here, so read its comments; the
+# differences are the directory, the port and the log name.
+
+[Unit]
+Description=Hunt internships site (Next.js)
+Documentation=file:///opt/personal-website/docs/DEPLOY.md
+After=network-online.target personal-website-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personal-website
+Group=personal-website
+WorkingDirectory=/opt/personal-website/apps/hunt-web
+
+Environment=NODE_ENV=production
+Environment=PORT=3001
+# NEXT_PUBLIC_* is baked in at BUILD time, not read here — see docs/DEPLOY.md § Redeploy.
+
+# Loopback only, through --hostname: `next start` ignores HOSTNAME. See the frontend unit.
+ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1
+
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=personal-website-hunt
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Runtime caches, as in the frontend unit.
+ReadWritePaths=/opt/personal-website/apps/hunt-web/.next
+
+[Install]
+WantedBy=multi-user.target
