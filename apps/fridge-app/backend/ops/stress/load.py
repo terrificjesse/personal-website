@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
+import random
 import statistics
 import sys
 import time
@@ -48,6 +50,22 @@ def summarize(label: str, latencies: list[float], statuses: Counter, elapsed: fl
     }
 
 
+def request_headers(args) -> dict:
+    """Fixed `--header`s, plus a fresh X-Forwarded-For per request when asked.
+
+    The backend trusts X-Forwarded-For only from a loopback peer, which is what Caddy is in
+    production and what this client is against the isolated server. Rotating it inside one /64
+    is how S11 stands in for one IPv6 user cycling their own addresses.
+    """
+    headers = dict(h.split(":", 1) for h in args.header)
+    headers = {k.strip(): v.strip() for k, v in headers.items()}
+    if args.xff_ipv6_prefix:
+        net = ipaddress.IPv6Network(args.xff_ipv6_prefix)
+        host = net.network_address + random.getrandbits(128 - net.prefixlen)
+        headers["x-forwarded-for"] = str(host)
+    return headers
+
+
 async def run_load(args) -> dict:
     latencies: list[float] = []
     statuses: Counter = Counter()
@@ -66,14 +84,15 @@ async def run_load(args) -> dict:
                 body = None
                 if args.body:
                     body = args.body.replace("{uniq}", uuid.uuid4().hex)
+                headers = request_headers(args)
                 started = time.monotonic()
                 try:
                     if args.method == "GET":
-                        r = await client.get(args.url)
+                        r = await client.get(args.url, headers=headers)
                     else:
                         r = await client.request(
                             args.method, args.url, content=body,
-                            headers={"content-type": "application/json"},
+                            headers={"content-type": "application/json", **headers},
                         )
                     statuses[r.status_code] += 1
                 except httpx.TimeoutException:
@@ -86,6 +105,12 @@ async def run_load(args) -> dict:
         await asyncio.gather(*(worker() for _ in range(args.concurrency)))
         elapsed = time.monotonic() - started
 
+    if args.latencies_out:
+        # Raw samples, so runs split across processes can be merged into true percentiles
+        # rather than an average of each process's own.
+        with open(args.latencies_out, "w") as out:
+            json.dump({"elapsed": elapsed, "latencies": latencies,
+                       "statuses": {str(k): v for k, v in statuses.items()}}, out)
     return summarize(f"load c={args.concurrency}", latencies, statuses, elapsed)
 
 
@@ -120,6 +145,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--method", default="GET")
     parser.add_argument("--body", default=None, help="'{uniq}' is replaced per request")
+    parser.add_argument("--header", action="append", default=[],
+                        help="'Name: value', repeatable")
+    parser.add_argument("--xff-ipv6-prefix", default=None,
+                        help="a /64 or similar: each request gets a random X-Forwarded-For in it")
+    parser.add_argument("--latencies-out", default=None,
+                        help="write raw latencies and statuses here, for merging")
     args = parser.parse_args()
 
     result = asyncio.run(run_load(args) if args.mode == "load" else run_probe(args))

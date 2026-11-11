@@ -13,6 +13,8 @@
 #   - Every background job is switched off: the collector would scrape third-party job boards,
 #     and all of them would contend for SQLite and corrupt the measurements.
 #   - PORT=18080: the developer's own backend keeps :8080.
+#   - BIND_ADDRESS=127.0.0.1: the copy still holds your applications and email addresses, and
+#     the default is every interface, which would serve them to the LAN for the length of a run.
 #
 # Never call POST /internships/collect against it: that one performs a real scrape.
 set -euo pipefail
@@ -28,7 +30,7 @@ pid=$(lsof -nP -iTCP:18080 -sTCP:LISTEN -t || true)
 [ -n "$pid" ] && kill "$pid" && while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
 cd "$WORKDIR"
 env -i HOME="$HOME" PATH="$PATH" \
-  DATABASE_URL="sqlite://$WORKDIR/stress.db?mode=rwc" PORT=18080 \
+  DATABASE_URL="sqlite://$WORKDIR/stress.db?mode=rwc" PORT=18080 BIND_ADDRESS=127.0.0.1 \
   BLOG_SYNC_INTERVAL_SECS=0 INTERNSHIP_COLLECT_INTERVAL_SECS=0 INTERNSHIP_EXPIRY_INTERVAL_SECS=0 \
   INBOX_SYNC_INTERVAL_SECS=0 INBOX_APPLY_LABELS=false \
   HUNT_NUDGE_INTERVAL_SECS=0 HUNT_DEADLINE_INTERVAL_SECS=0 \
