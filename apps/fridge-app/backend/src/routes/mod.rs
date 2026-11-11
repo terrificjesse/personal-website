@@ -73,7 +73,11 @@ impl FromRef<AppState> for RateLimits {
 // Generates a Vector with the origins that the frontend is able to read responses from:
 fn allowed_origins() -> Vec<HeaderValue> {
     let configured = std::env::var("ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:3000,http://127.0.0.1:3000".to_string());
+        // Both sites: the personal one on 3000 and the internships site on 3001 (2026-11-11).
+        .unwrap_or_else(|_| {
+            "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"
+                .to_string()
+        });
 
     configured
         .split(',')

@@ -119,10 +119,10 @@ pub async fn callback(
     }
 }
 
+/// Back to the internships site, which is its own origin since 2026-11-11 (`docs/HUNT.md`
+/// § "The internships site, split out"). Gmail is a feature of that site only.
 fn front_end(query: &str) -> String {
-    let base = std::env::var("FRONTEND_ORIGIN")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-    format!("{base}/internships?{query}")
+    format!("{}/internships?{query}", super::auth::hunt_site_origin())
 }
 
 #[derive(Debug, Serialize)]

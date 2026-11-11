@@ -260,6 +260,29 @@ fn oauth_state_cookie(state: String) -> Cookie<'static> {
         .build()
 }
 
+/// Which site a Google sign-in started from. Lives exactly as long as the state cookie.
+const GOOGLE_SITE_COOKIE_NAME: &str = "google_oauth_site";
+
+fn oauth_site_cookie(site: Site) -> Cookie<'static> {
+    Cookie::build((GOOGLE_SITE_COOKIE_NAME, site.name()))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(cookie_secure())
+        .path("/")
+        .max_age(time::Duration::minutes(OAUTH_STATE_COOKIE_MINUTES))
+        .build()
+}
+
+fn expired_oauth_site_cookie() -> Cookie<'static> {
+    Cookie::build((GOOGLE_SITE_COOKIE_NAME, ""))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(cookie_secure())
+        .path("/")
+        .max_age(time::Duration::ZERO)
+        .build()
+}
+
 /// Deletes the cookie for the Google flow
 fn expired_oauth_state_cookie() -> Cookie<'static> {
     Cookie::build((GOOGLE_STATE_COOKIE_NAME, ""))
@@ -548,17 +571,97 @@ fn frontend_origin() -> String {
     std::env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string())
 }
 
+/// Where the internships site lives. Its own origin since 2026-11-11.
+pub fn hunt_site_origin() -> String {
+    std::env::var("HUNT_SITE_ORIGIN").unwrap_or_else(|_| "http://localhost:3001".to_string())
+}
+
+/// Which of the two sites a Google sign-in started from, and so where it returns.
+///
+/// See `docs/HUNT.md` § "The internships site, split out". The session cookie lands on the host
+/// of whichever callback Google returns to, so each site needs its own redirect URI and its own
+/// landing page. The choice is one of two names, never a URL, so it cannot become an open
+/// redirect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Site {
+    Personal,
+    Hunt,
+}
+
+impl Site {
+    /// Only the exact name `hunt` selects the internships site. Anything else, including no
+    /// parameter at all, is the personal site, which is where sign-in always returned before.
+    fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("hunt") => Site::Hunt,
+            _ => Site::Personal,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Site::Personal => "personal",
+            Site::Hunt => "hunt",
+        }
+    }
+
+    fn origin(self) -> String {
+        match self {
+            Site::Personal => frontend_origin(),
+            Site::Hunt => hunt_site_origin(),
+        }
+    }
+
+    /// Where a successful sign-in lands.
+    fn landing(self) -> &'static str {
+        match self {
+            Site::Personal => "/fridge",
+            Site::Hunt => "/internships",
+        }
+    }
+}
+
+/// The Google config for one site: the internships site's own redirect URI when one is set.
+///
+/// Locally both sites call the backend on the same host, so one redirect URI serves both and
+/// `hunt_redirect` is unset. `src/auth.rs` takes the redirect URI from the config it is handed,
+/// so nothing there changes.
+fn config_for(site: Site, config: &GoogleOAuthConfig, hunt_redirect: Option<String>) -> GoogleOAuthConfig {
+    let mut config = config.clone();
+    if site == Site::Hunt
+        && let Some(uri) = hunt_redirect.filter(|uri| !uri.trim().is_empty())
+    {
+        config.redirect_uri = uri;
+    }
+    config
+}
+
+fn hunt_google_redirect() -> Option<String> {
+    std::env::var("HUNT_GOOGLE_REDIRECT_URI").ok()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GoogleStartQuery {
+    pub site: Option<String>,
+}
+
 /// Sets up the config to connect with Google auth
 pub async fn google_start(
     State(config): State<Option<GoogleOAuthConfig>>,
     jar: CookieJar,
+    Query(query): Query<GoogleStartQuery>,
 ) -> Result<(CookieJar, Redirect), AuthError> {
     let config = config.ok_or(AuthError::OAuthNotConfigured)?;
+    let site = Site::from_name(query.site.as_deref());
+    let config = config_for(site, &config, hunt_google_redirect());
 
     let state = auth::generate_oauth_state();
     let url = auth::google_authorize_url(&config, &state);
 
-    Ok((jar.add(oauth_state_cookie(state)), Redirect::to(&url)))
+    Ok((
+        jar.add(oauth_state_cookie(state)).add(oauth_site_cookie(site)),
+        Redirect::to(&url),
+    ))
 }
 
 // Fields for the redirect
@@ -583,14 +686,18 @@ pub async fn google_callback(
     let expected = jar
         .get(GOOGLE_STATE_COOKIE_NAME)
         .map(|c| c.value().to_string());
+    // The site the sign-in started from. Must be the same redirect URI `google_start` sent, or
+    // Google refuses the code exchange.
+    let site = Site::from_name(jar.get(GOOGLE_SITE_COOKIE_NAME).map(|c| c.value()));
+    let config = config_for(site, &config, hunt_google_redirect());
 
-    // Delete the cookie
-    let jar = jar.add(expired_oauth_state_cookie());
+    // Delete the cookies
+    let jar = jar.add(expired_oauth_state_cookie()).add(expired_oauth_site_cookie());
 
     if query.error.is_some() {
         return Ok((
             jar,
-            Redirect::to(&format!("{}/login?error=google", frontend_origin())),
+            Redirect::to(&format!("{}/login?error=google", site.origin())),
         ));
     }
 
@@ -609,7 +716,7 @@ pub async fn google_callback(
 
     Ok((
         jar.add(session_cookie(session.token)),
-        Redirect::to(&format!("{}/fridge", frontend_origin())),
+        Redirect::to(&format!("{}{}", site.origin(), site.landing())),
     ))
 }
 
@@ -713,6 +820,56 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::net::IpAddr;
+
+    fn google_config() -> GoogleOAuthConfig {
+        GoogleOAuthConfig {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "https://example.com/api/auth/google/callback".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_the_exact_name_hunt_selects_the_internships_site() {
+        assert_eq!(Site::from_name(Some("hunt")), Site::Hunt);
+        for other in [None, Some(""), Some("HUNT"), Some("personal"), Some("https://evil.example.com"), Some("//evil.example.com")] {
+            assert_eq!(Site::from_name(other), Site::Personal, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn each_site_lands_on_its_own_page() {
+        assert_eq!(Site::Personal.landing(), "/fridge");
+        assert_eq!(Site::Hunt.landing(), "/internships");
+        assert_eq!(Site::from_name(Some(Site::Hunt.name())), Site::Hunt);
+    }
+
+    /// The session cookie lands on the callback's host, so a hunt sign-in has to come back
+    /// through the hunt site's own redirect URI when one is configured.
+    #[test]
+    fn the_internships_site_uses_its_own_redirect_uri() {
+        let hunt = Some("https://hunt.example.com/api/auth/google/callback".to_string());
+        assert_eq!(
+            config_for(Site::Hunt, &google_config(), hunt.clone()).redirect_uri,
+            "https://hunt.example.com/api/auth/google/callback"
+        );
+        assert_eq!(
+            config_for(Site::Personal, &google_config(), hunt).redirect_uri,
+            "https://example.com/api/auth/google/callback"
+        );
+    }
+
+    /// Locally both sites share a host, so an unset or blank override keeps the one URI.
+    #[test]
+    fn without_its_own_redirect_uri_the_internships_site_shares_the_personal_one() {
+        for unset in [None, Some(String::new()), Some("  ".to_string())] {
+            assert_eq!(
+                config_for(Site::Hunt, &google_config(), unset).redirect_uri,
+                "https://example.com/api/auth/google/callback"
+            );
+        }
+    }
+
 
     #[test]
     fn a_short_password_is_rejected() {
