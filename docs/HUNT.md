@@ -1655,6 +1655,64 @@ is not "a run happened", it is "the job you are waiting on is gone", it has an o
 and it is one alert rather than 36. It is not built, and it is not urgent while the applied
 tracker holds two rows — but it is the version of this idea that would earn a kind of its own.
 
+## The internships site, split out — 2026-11-11 (spec, written before the code)
+
+The owner asked for the internships tab and the extension to be a separate website. Their
+answers: **its own website, the same backend and account**, its code in this repo, and the
+personal site keeps a link to it. So this is a frontend split. No data moves, no second
+database, and `src/auth.rs` is untouched.
+
+| | Personal site | Internships site |
+|---|---|---|
+| Code | `frontend/` | `apps/hunt-web/` (new) |
+| Local port | 3000 | 3001 |
+| Pages | fridge, blog, login, register | `/internships` and the three pages under it, login, register; `/` redirects to `/internships` |
+| Deployed at | `example.com` | `hunt.example.com` |
+
+The new site keeps the `/internships/...` paths, so the Gmail redirect and the extension change only
+in their origin. Each site has its own copy of the small shared client files (`apiClient`,
+`authApi`, `useApiError`). They are short, and a shared package would add a workspace for three
+files.
+
+### The seams
+
+**Google sign-in returns you to the site you started from.**
+`GET /auth/google/start?site=hunt` sets a `google_oauth_site` cookie beside the state cookie. With
+no parameter, or any other value, the site is the personal one. The value is one of two names and
+never a URL, so it cannot become an open redirect. The callback reads the cookie:
+
+| Site | Redirect URI sent to Google | After sign-in | On error |
+|---|---|---|---|
+| personal | `GOOGLE_REDIRECT_URI` | `FRONTEND_ORIGIN/fridge` | `FRONTEND_ORIGIN/login?error=google` |
+| hunt | `HUNT_GOOGLE_REDIRECT_URI`, else `GOOGLE_REDIRECT_URI` | `HUNT_SITE_ORIGIN/internships` | `HUNT_SITE_ORIGIN/login?error=google` |
+
+Each site needs its own redirect URI once deployed. The session cookie is set by the callback's
+response, so it lands on the callback's host, and a hunt sign-in that came back through the
+personal site's host would leave the hunt site signed out. Locally both sites call the backend at
+`localhost:8080`, so one redirect URI serves both. `routes/auth.rs` is `[gen]` request plumbing,
+and `src/auth.rs` already takes the redirect URI from the config it is handed.
+
+**Gmail connect** returns to `HUNT_SITE_ORIGIN/internships?gmail=...` (default
+`http://localhost:3001`). Its own `GMAIL_REDIRECT_URI` must be on the hunt host once deployed, for
+the same cookie reason.
+
+**CORS.** The default `ALLOWED_ORIGINS` gains `http://localhost:3001` and `http://127.0.0.1:3001`.
+A deployment lists both sites.
+
+**The personal site's link.** The nav's Internships entry is a plain link to `/internships`, and
+`proxy.ts` redirects that path and everything under it to the internships site: `HUNT_SITE_URL` at
+runtime, else the same hostname on port 3001, so a phone on the LAN follows it too. Old bookmarks
+keep working.
+
+**The extension.** The default site URL becomes `http://localhost:3001`. An installed copy keeps
+whatever was saved, so its settings need the new URL once.
+
+**Cookies.** Locally both sites are on host `localhost` and share one sign-in, because cookies
+ignore port. Deployed, they are two hosts with two cookies, so you sign in on each. Same account.
+
+**Deploy.** Caddy gets two site blocks, each serving its own Next app and proxying `/api` to the
+one backend. Each site stays a single origin, which is what `docs/DEPLOY.md` § One origin requires.
+
 ## The extension — `apps/hunt-extension/`
 
 Firefox MV3, plain JS. No bundler, no framework, no TypeScript, no dependencies.
