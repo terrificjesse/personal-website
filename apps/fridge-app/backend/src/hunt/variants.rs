@@ -19,6 +19,11 @@ use uuid::Uuid;
 /// Longest label and note we store. Unbounded client text is a denial-of-service vector, not a
 /// feature — the same cap the answer library and the blog body carry.
 pub const MAX_LABEL_LENGTH: usize = 120;
+
+/// How many résumé variants one account may keep. A person tailors a handful; 100 leaves room
+/// for every role they could apply to and stops the unbounded growth S14 found
+/// (`docs/PUBLIC_API_STRESS_TEST.md`, second pass). A policy number: change it here.
+pub const MAX_VARIANTS_PER_USER: i64 = 100;
 pub const MAX_NOTES_LENGTH: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -56,6 +61,8 @@ pub enum Refused {
     DuplicateLabel,
     /// Applications reference it, so deleting would destroy the attribution.
     InUse,
+    /// The account already has [`MAX_VARIANTS_PER_USER`].
+    LimitReached,
 }
 
 const COLUMNS: &str = "v.id, v.label, v.notes, v.created_at, v.archived_at,
@@ -96,15 +103,18 @@ pub async fn create(
     let notes = body.notes.as_deref().and_then(|n| clean(n, MAX_NOTES_LENGTH));
 
     let id = Uuid::new_v4().to_string();
+    // The ceiling is part of the insert, so concurrent creates cannot all see room.
     let insert = sqlx::query(
         "INSERT INTO resume_variants (id, user_id, label, notes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE (SELECT COUNT(*) FROM resume_variants WHERE user_id = ?2) < ?6",
     )
     .bind(&id)
     .bind(user_id)
     .bind(&label)
     .bind(&notes)
     .bind(now.to_rfc3339())
+    .bind(MAX_VARIANTS_PER_USER)
     .execute(pool)
     .await;
 
@@ -115,6 +125,9 @@ pub async fn create(
             return Ok(Err(Refused::DuplicateLabel));
         }
         return Err(err.into());
+    }
+    if insert.is_ok_and(|done| done.rows_affected() == 0) {
+        return Ok(Err(Refused::LimitReached));
     }
 
     Ok(Ok(get(pool, user_id, &id)

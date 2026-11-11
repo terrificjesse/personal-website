@@ -1,5 +1,15 @@
 # Public API — stress test
 
+> **Second pass, 2026-11-11.** Two confirmed and fixed, two refuted, three held or measured. See
+> "Second pass" at the end.
+>
+> | | |
+> |---|---|
+> | **Confirmed & fixed** | S11 per-address limits bypassed from one IPv6 /64, S14 one account grows the database without a ceiling (45,410 answers, +1 GB, a 1 GB response, 2.8 GiB of memory) |
+> | **Measured, as predicted** | S9 listing throughput fell to two-thirds as the corpus grew by half |
+> | **Refuted** | S10 gzip is nearly free; S13 the extension's page lookup is cheaper than the listing |
+> | **Held** | S12 malformed alert cursors, S15 neither Next server is a bottleneck |
+>
 > **First pass, 2026-10-21.** Three confirmed, four refuted, one held.
 >
 > | | |
@@ -228,3 +238,127 @@ on an isolated copy (`ops/stress/run-isolated.sh`).
 | S13 | The extension's page lookup (`/hunt/posting-for`) scans every row and parses each URL | Over 20 ms per request at 7,937 rows, and below the listing's throughput. Its code comment's "~1,400 rows" is stale |
 | S14 | One account can grow the database without a ceiling: answers have a size cap and no count cap | 2,000 maximum-length answers are all accepted and the database grows by about 40 MB |
 | S15 | Neither Next server is the bottleneck after the split | The internships site's `/internships` page and the personal site's `/internships` redirect each sustain over 500 req/s at 16 clients |
+
+## Second pass, 2026-11-11 — results
+
+Release build, isolated copy, 14 cores, 4,514 live postings (7,937 rows). Load above one Python
+process's ceiling was split across four processes and their raw samples merged (`ops/stress/
+merge.py`). Self-review only: no independent reviewer saw this pass.
+
+### S9 — Listing throughput fell with the corpus — MEASURED, AS PREDICTED
+
+No compression, so it compares with the first pass:
+
+| Clients | Requests/s | p50 | p99 | First pass, fixed |
+|---:|---:|---:|---:|---:|
+| 1 | 53.2 | 18 ms | 24 ms | — |
+| 4 | 164.3 | 24 ms | 29 ms | 238.2 /s |
+| 16 | **195.2** | 81 ms | 108 ms | 295.3 /s |
+| 56 | 190.7 | 289 ms | 340 ms | 287.2 /s |
+
+Two-thirds of the first pass's throughput for half again the corpus, with zero errors: S3's
+whole-corpus ranking is the scaling limit, exactly as that section said. It is fine at this size.
+**The ranked-corpus cache S3 describes is the fix when it stops being fine**, and this table is
+the number to watch.
+
+### S10 — Gzip costs real CPU on the largest page — REFUTED
+
+| 16 clients | Identity | Gzip | Bytes, identity → gzip |
+|---|---:|---:|---:|
+| `limit=50` | 205.2 /s | 205.7 /s | 65,687 → 8,901 |
+| `limit=200` | 200.5 /s | 192.8 /s (−4%) | 261,129 → 28,248 |
+
+Predicted ≥ 20%; measured 4% at the largest page and nothing at the default, for a 7–9× smaller
+response. Gzip pays for itself.
+
+### S11 — One IPv6 /64 bypassed every per-address limit 🔴 CONFIRMED, FIXED
+
+| Registration burst, 56 clients × 8 s | Before | After |
+|---|---:|---:|
+| One address (control) | 5 created, 26,419 × 429 | — |
+| Rotating inside one /64 | **5,676 created, zero 429s** | **5 created**, 22,914 × 429 |
+| Rotating inside one /56 | — | 1,280 created, exactly 256 /64s × 5 |
+| One IPv4 address, plain and IPv4-mapped | — | 5 created between them |
+
+S2's flood, back, for anyone with an IPv6 connection: every subscriber is given at least a /64,
+and the limiter keyed on the full address. Server memory rose 389 → 551 MiB during the bypass.
+
+**Fix:** `rate_key` in `src/rate_limit.rs` counts an IPv6 address by its /64 and an IPv4-mapped
+address as its IPv4 address. **What it still allows, stated rather than hidden:** a /56 holder gets
+256 budgets, the 1,280 above, and a /48 holder 65,536. Keying on /56 would close more of that and
+would also put unrelated users of a large provider into one bucket. /64 is the common choice and
+`rate_key` is the one place to change it.
+
+### S12 — Alert paging rejects malformed cursors — HELD
+
+Eighteen malformed inputs to `/hunt/events`: empty, garbage, NUL, Unicode, 8 KB, base64 of
+nonsense, an impossible date, a five-digit year, a 5,000-character id, and `limit`/`since` at
+extremes. Every one got a 400, except the 64 KB cursor, which got a 414 from the HTTP layer. No
+500s, and no panics in the log. (`limit=0` is a 200.)
+
+### S13 — The extension's page lookup is expensive — REFUTED
+
+| | Single request | 16 clients |
+|---|---:|---:|
+| A URL matching nothing (a full scan) | 16 ms | 246 /s, p50 64 ms |
+| A URL matching the first row | 4 ms | 482 /s |
+
+Predicted over 20 ms and below the listing; measured under both. It is signed-in only. The one part
+that held: its comment said "~1,400 rows" and it scans 7,937, expired included. The comment now
+records this measurement and says it grows with the table.
+
+### S14 — One account grew the database without a ceiling 🔴 CONFIRMED, FIXED, WORSE THAN PREDICTED
+
+Predicted: 2,000 answers accepted, +40 MB. Measured, one signed-in account, 16 clients, 10 s:
+
+| | Before | After |
+|---|---:|---:|
+| Answers created | **45,410** | **500**, then 81,064 × 403 |
+| Database | 49 → **1,128 MB** | 46 → 57 MB |
+| `GET /hunt/answers` (the whole library) | **1 GB** in 1.3 s | 11 MB in ~20 ms |
+| `GET /hunt/answers?q=` (ranked) | **4.1 s** of CPU | 47 ms |
+| Server memory after four full lists | **2,819 MiB** | 287 MiB |
+
+At that rate a 20 GB disk fills in about three minutes, and four list requests exhaust a 2 GB
+server's memory. Only a size cap existed. The same gap, smaller, was in résumé variants, extension
+tokens, answer revisions (every edit keeps the old text) and revoked-token tombstones (mint and
+revoke in a loop got round a cap on live tokens).
+
+**Fix:** per-account ceilings. Each one is enforced inside the `INSERT` itself, so concurrent
+requests cannot all see room:
+
+| Collection | Ceiling | Beyond it |
+|---|---:|---|
+| Answers | 500 | 403 |
+| Résumé variants | 100 | 403 |
+| Live extension tokens | 20 | 403; revoking one frees a slot |
+| Revisions per answer | newest 50 kept | older ones deleted |
+| Revoked-token tombstones | newest 100 kept | older ones deleted |
+
+403 rather than 409, because the client already reads 409 as "duplicate name" for résumé variants.
+The site and the extension say which limit was hit. **These are policy numbers**, chosen as about
+ten times what one person writes by hand; change them beside each constant if they are wrong.
+Applications needed no ceiling: one per posting is already enforced.
+
+### S15 — Neither Next server is a bottleneck — HELD
+
+| 16 clients, production builds | Requests/s | p50 |
+|---|---:|---:|
+| Internships site, `/internships` (prerendered) | 6,281 | 2.4 ms |
+| Internships site, `/` → `/internships` | 6,437 | 2.3 ms |
+| Personal site, `/internships` → internships site | 9,187 | 1.6 ms |
+
+30–45 times the backend listing's throughput. The split added no bottleneck.
+
+### Changes to the tools
+
+`load.py` gained `--header`, `--xff-ipv6-prefix` and `--latencies-out`, `merge.py` pools samples
+across processes, and `run-isolated.sh` now binds `127.0.0.1`, because the copy holds
+applications and email addresses and the default was every interface.
+
+### Test-first, as in the first pass
+
+`a59dedd` committed seven tests that failed against the code as it stood: three for S11 and four
+for S14. A guard test, separate /64s keep separate budgets, passed before and after. The ceiling tests
+drive the real router. Full suite after the fix: 1,112 passed. Clippy is unchanged at 27.
+

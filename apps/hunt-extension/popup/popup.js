@@ -748,6 +748,7 @@ saveAnswersButton?.addEventListener("click", async () => {
   const base = config.backendUrl.replace(/\/+$/, "");
 
   let saved = 0;
+  let libraryFull = false;
   for (const question of found) {
     try {
       const res = await fetch(`${base}/hunt/answers`, {
@@ -766,11 +767,15 @@ saveAnswersButton?.addEventListener("click", async () => {
         }),
       });
       if (res.ok) saved += 1;
+      // 403: the account already holds the maximum number of answers (500).
+      if (res.status === 403) libraryFull = true;
     } catch {
       // Keep going; a partial save is better than none and nothing is lost by retrying.
     }
   }
-  answerResultEl.textContent = `Saved ${saved} of ${found.length}.`;
+  answerResultEl.textContent = libraryFull
+    ? `Saved ${saved} of ${found.length}. Your answer library is full (500 answers): delete some on the site to save more.`
+    : `Saved ${saved} of ${found.length}.`;
   saveAnswersButton.hidden = true;
 });
 

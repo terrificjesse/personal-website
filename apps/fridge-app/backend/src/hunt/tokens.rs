@@ -36,6 +36,14 @@ use crate::models::User;
 /// column filled by a client is a denial-of-service vector, not a feature.
 pub const MAX_LABEL_LENGTH: usize = 100;
 
+/// Live tokens one account may hold, and revoked ones kept as tombstones. One per browser
+/// profile is the real use; 20 is plenty. Revoked tokens are kept for their "revoked on the
+/// 3rd" answer, but only the newest 100, because minting and revoking in a loop was the way
+/// round a cap on live ones (S14, `docs/PUBLIC_API_STRESS_TEST.md`, second pass). Policy
+/// numbers: change them here.
+pub const MAX_LIVE_TOKENS_PER_USER: i64 = 20;
+pub const MAX_REVOKED_TOKENS_KEPT: i64 = 100;
+
 /// A token as the API lists it. **Never carries the token itself** — that exists exactly once,
 /// in the response to the call that minted it.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -57,28 +65,60 @@ pub struct MintedToken {
 }
 
 /// Create a token for a user. The caller must already be authenticated.
+///
+/// No ceiling, so test-only: the route calls [`mint_within_limit`].
+#[cfg(test)]
 pub async fn mint(pool: &SqlitePool, user_id: &str, label: &str, now: DateTime<Utc>)
     -> Result<MintedToken>
 {
+    insert(pool, user_id, label, now, i64::MAX)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("an unbounded mint inserted nothing"))
+}
+
+/// [`mint`], or `None` when the account already holds [`MAX_LIVE_TOKENS_PER_USER`] live tokens.
+pub async fn mint_within_limit(
+    pool: &SqlitePool,
+    user_id: &str,
+    label: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<MintedToken>> {
+    insert(pool, user_id, label, now, MAX_LIVE_TOKENS_PER_USER).await
+}
+
+async fn insert(
+    pool: &SqlitePool,
+    user_id: &str,
+    label: &str,
+    now: DateTime<Utc>,
+    max_live: i64,
+) -> Result<Option<MintedToken>> {
     let label = label.trim();
     let label = if label.is_empty() { "Firefox extension" } else { label };
 
     let id = Uuid::new_v4().to_string();
     let secret = auth::generate_session_token();
 
-    sqlx::query(
+    // The ceiling is part of the insert, so concurrent mints cannot all see room.
+    let inserted = sqlx::query(
         "INSERT INTO hunt_tokens (id, user_id, token_hash, label, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE (SELECT COUNT(*) FROM hunt_tokens WHERE user_id = ?2 AND revoked_at IS NULL) < ?6",
     )
     .bind(&id)
     .bind(user_id)
     .bind(auth::session_token_hash(&secret))
     .bind(label)
     .bind(now.to_rfc3339())
+    .bind(max_live)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Ok(None);
+    }
 
-    Ok(MintedToken {
+    Ok(Some(MintedToken {
         token: HuntToken {
             id,
             label: label.to_string(),
@@ -86,7 +126,7 @@ pub async fn mint(pool: &SqlitePool, user_id: &str, label: &str, now: DateTime<U
             last_used_at: None,
         },
         secret,
-    })
+    }))
 }
 
 /// The user this token belongs to, or `None` if it is unknown or revoked.
@@ -163,6 +203,18 @@ pub async fn revoke(pool: &SqlitePool, id: &str, user_id: &str, now: DateTime<Ut
     .execute(pool)
     .await?
     .rows_affected();
+
+    // Keep the newest tombstones only. See `MAX_REVOKED_TOKENS_KEPT`.
+    sqlx::query(
+        "DELETE FROM hunt_tokens
+          WHERE user_id = ?1 AND revoked_at IS NOT NULL
+            AND id NOT IN (SELECT id FROM hunt_tokens WHERE user_id = ?1 AND revoked_at IS NOT NULL
+                            ORDER BY revoked_at DESC, rowid DESC LIMIT ?2)",
+    )
+    .bind(user_id)
+    .bind(MAX_REVOKED_TOKENS_KEPT)
+    .execute(pool)
+    .await?;
 
     Ok(affected > 0)
 }

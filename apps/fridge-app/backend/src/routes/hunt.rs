@@ -190,9 +190,10 @@ pub async fn create_token(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let minted = tokens::mint(&pool, &user.id, &label, Utc::now())
+    let minted = tokens::mint_within_limit(&pool, &user.id, &label, Utc::now())
         .await
-        .map_err(internal("minting a hunt token"))?;
+        .map_err(internal("minting a hunt token"))?
+        .ok_or(StatusCode::FORBIDDEN)?;
 
     Ok((StatusCode::CREATED, Json(minted)))
 }
@@ -319,8 +320,10 @@ pub async fn posting_for_page(
             .await
             .map_err(sql("scanning postings for this page"))?;
 
-    // A linear scan over a corpus this size (~1,400 rows) costs nothing and keeps the matching
-    // rule in one place. Indexing a derived key would mean storing it, and storing it would
+    // A linear scan over every row, expired ones included, keeps the matching rule in one place.
+    // Measured 2026-11-11 at 7,937 rows (S13, `docs/PUBLIC_API_STRESS_TEST.md`): 16 ms for a URL
+    // that matches nothing, and 246 req/s under 16 clients, more than the listing manages. It was
+    // written at ~1,400 rows; it grows with the table, so measure again before it matters. Indexing a derived key would mean storing it, and storing it would
     // mean a migration whose only job is to speed up a query nobody has measured.
     let mut matched = None;
     for (id, url, _company) in &rows {
@@ -445,11 +448,15 @@ pub async fn create_answer(
     CurrentUser(user): CurrentUser,
     Json(body): Json<NewAnswer>,
 ) -> Result<(StatusCode, Json<Answer>), StatusCode> {
-    answers::save(&pool, &user.id, body, Utc::now())
+    match answers::save(&pool, &user.id, body, Utc::now())
         .await
         .map_err(internal("saving an answer"))?
-        .map(|answer| (StatusCode::CREATED, Json(answer)))
-        .ok_or(StatusCode::BAD_REQUEST)
+    {
+        Ok(answer) => Ok((StatusCode::CREATED, Json(answer))),
+        Err(answers::Refused::Invalid) => Err(StatusCode::BAD_REQUEST),
+        // 403, not 409: the client already reads 409 as "duplicate" elsewhere on this API.
+        Err(answers::Refused::LibraryFull) => Err(StatusCode::FORBIDDEN),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -557,6 +564,7 @@ fn refused(refusal: variants::Refused) -> StatusCode {
     match refusal {
         variants::Refused::BadLabel => StatusCode::BAD_REQUEST,
         variants::Refused::DuplicateLabel | variants::Refused::InUse => StatusCode::CONFLICT,
+        variants::Refused::LimitReached => StatusCode::FORBIDDEN,
     }
 }
 

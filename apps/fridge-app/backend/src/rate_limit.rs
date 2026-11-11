@@ -127,6 +127,28 @@ fn forwarded_for(headers: &header::HeaderMap) -> Option<IpAddr> {
         .ok()
 }
 
+/// The unit a per-address limit counts: an IPv4 address, or an IPv6 **/64**.
+///
+/// A /64 is the smallest block an IPv6 subscriber is given, and every address in it is theirs
+/// to use. Keyed on the full address, the registration limit admitted **5,676 accounts in 8
+/// seconds** from one /64 with no 429 (S11, `docs/PUBLIC_API_STRESS_TEST.md`, second pass), the
+/// same flood S2 was fixed for. An IPv4-mapped IPv6 address is its IPv4 address, so switching
+/// notation does not buy a second budget.
+///
+/// **What this still allows, stated rather than hidden:** a subscriber delegated a /56 holds 256
+/// /64s, and a /48 holds 65,536. Keying on /56 would close more of that and would also put
+/// unrelated users of a large provider into one bucket. /64 is the common choice; this is the
+/// place to change it.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !(u128::from(u64::MAX)))),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RateLimits {
     inner: Arc<Mutex<AllLimits>>,
@@ -152,6 +174,7 @@ impl RateLimits {
         account: &str,
         now: Instant,
     ) -> Result<(), RetryAfter> {
+        let ip = rate_key(ip);
         let mut limits = self
             .inner
             .lock()

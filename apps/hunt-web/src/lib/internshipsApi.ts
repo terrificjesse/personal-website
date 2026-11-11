@@ -404,7 +404,9 @@ export async function createResumeVariant(
         ? "Give the résumé variant a label between 1 and 120 characters."
         : res.status === 409
           ? "A résumé variant with that name already exists."
-          : `Could not create the résumé variant (${res.status})`,
+          : res.status === 403
+            ? "You have the maximum of 100 résumé variants. Delete one you no longer use to add another."
+            : `Could not create the résumé variant (${res.status})`,
     );
   }
   return res.json();
@@ -754,6 +756,9 @@ export async function createExtensionToken(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ label }),
   });
+  if (res.status === 403) {
+    throw new Error("You have the maximum of 20 extension tokens. Revoke one you no longer use first.");
+  }
   if (!res.ok) throw new Error(`Could not create a token (${res.status})`);
   return res.json();
 }

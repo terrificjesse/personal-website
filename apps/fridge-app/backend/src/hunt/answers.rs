@@ -38,6 +38,26 @@ pub const MIN_SIMILARITY: f64 = 0.45;
 pub const MAX_QUESTION_LENGTH: usize = 2_000;
 pub const MAX_ANSWER_LENGTH: usize = 20_000;
 
+/// How many answers one account may keep, and how many earlier versions of each.
+///
+/// S14 (`docs/PUBLIC_API_STRESS_TEST.md`, second pass): with only a size cap, one account wrote
+/// 45,410 maximum-length answers in 10 seconds and took the database from 49 MB to 1,128 MB.
+/// Listing them built a 1 GB response, and ranking against them took 4 seconds of CPU per
+/// request. A library a person writes by hand is tens of answers (see `normalize_question`), so
+/// 500 is ten times that and bounds the full list near 11 MB. **Policy numbers: change them here
+/// if they are wrong.**
+pub const MAX_ANSWERS_PER_USER: i64 = 500;
+pub const MAX_REVISIONS_PER_ANSWER: i64 = 50;
+
+/// Why an answer was not saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Empty, or a field past its size cap.
+    Invalid,
+    /// The account already has [`MAX_ANSWERS_PER_USER`].
+    LibraryFull,
+}
+
 /// A stored answer.
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct Answer {
@@ -137,13 +157,13 @@ pub fn detect_company_specific(question: &str, answer: &str, company: Option<&st
         || question_normalized.contains(&company_normalized)
 }
 
-/// Save an answer. Returns `None` if a field exceeded its cap.
+/// Save an answer, unless it is invalid or the account's library is full.
 pub async fn save(
     pool: &SqlitePool,
     user_id: &str,
     new: NewAnswer,
     now: DateTime<Utc>,
-) -> Result<Option<Answer>> {
+) -> Result<Result<Answer, Refused>> {
     let question = new.question_text.trim().to_string();
     let answer_text = new.answer_text.trim().to_string();
     if question.is_empty()
@@ -151,7 +171,7 @@ pub async fn save(
         || question.len() > MAX_QUESTION_LENGTH
         || answer_text.len() > MAX_ANSWER_LENGTH
     {
-        return Ok(None);
+        return Ok(Err(Refused::Invalid));
     }
 
     let company = new
@@ -162,11 +182,14 @@ pub async fn save(
     let company_specific = detect_company_specific(&question, &answer_text, company);
     let id = Uuid::new_v4().to_string();
 
-    sqlx::query(
+    // The ceiling is part of the insert, not a count read before it: SQLite runs one write at a
+    // time, so concurrent saves cannot all see room and all insert.
+    let inserted = sqlx::query(
         "INSERT INTO application_answers
              (id, user_id, question_text, question_normalized, answer_text,
               is_company_specific, company_name, tags, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+         SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?9
+          WHERE (SELECT COUNT(*) FROM application_answers WHERE user_id = ?2) < ?10",
     )
     .bind(&id)
     .bind(user_id)
@@ -177,10 +200,15 @@ pub async fn save(
     .bind(company)
     .bind(new.tags.as_deref().map(str::trim).filter(|t| !t.is_empty()))
     .bind(now.to_rfc3339())
+    .bind(MAX_ANSWERS_PER_USER)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Ok(Err(Refused::LibraryFull));
+    }
 
-    get(pool, &id, user_id).await
+    Ok(get(pool, &id, user_id).await?.ok_or(Refused::Invalid))
 }
 
 const ANSWER_COLUMNS: &str = "id, question_text, answer_text, is_company_specific,
@@ -303,6 +331,19 @@ pub async fn edit(
     .bind(id)
     .bind(&existing.answer_text)
     .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    // Only the most recent versions are kept: every edit adds one, so editing in a loop grew
+    // the database without limit (S14). See `MAX_REVISIONS_PER_ANSWER`.
+    sqlx::query(
+        "DELETE FROM answer_revisions
+          WHERE answer_id = ?1
+            AND id NOT IN (SELECT id FROM answer_revisions WHERE answer_id = ?1
+                            ORDER BY replaced_at DESC, rowid DESC LIMIT ?2)",
+    )
+    .bind(id)
+    .bind(MAX_REVISIONS_PER_ANSWER)
     .execute(pool)
     .await?;
 
@@ -466,13 +507,13 @@ mod tests {
             "Why do you want to work here?",
             "I'm excited about Stripe's approach to developer experience.",
             Some("Stripe"),
-        ), now).await.expect("save");
+        ), now).await.expect("save").expect("saved");
 
         save(&pool, "u1", answer(
             "Tell us about a personal project you're proud of.",
             "I built a fridge inventory app that estimates expiry dates from FoodKeeper data.",
             Some("Stripe"),
-        ), now).await.expect("save");
+        ), now).await.expect("save").expect("saved");
 
         // Datadog asks both questions.
         let why = suggest(&pool, "u1", "Why do you want to work here?", Some("Datadog"), 5)
@@ -500,7 +541,7 @@ mod tests {
         user(&pool, "u1").await;
         save(&pool, "u1", answer(
             "Why do you want to work here?", "Stripe's docs culture.", Some("Stripe"),
-        ), Utc::now()).await.expect("save");
+        ), Utc::now()).await.expect("save").expect("saved");
 
         let again = suggest(&pool, "u1", "Why do you want to work here?", Some("Stripe"), 5)
             .await
@@ -515,7 +556,7 @@ mod tests {
         user(&pool, "u1").await;
         save(&pool, "u1", answer(
             "Why do you want to work here?", "Stripe's docs culture.", Some("Stripe"),
-        ), Utc::now()).await.expect("save");
+        ), Utc::now()).await.expect("save").expect("saved");
 
         assert!(suggest(&pool, "u1", "Why do you want to work here?", None, 5)
             .await
@@ -569,7 +610,7 @@ mod tests {
         user(&pool, "u1").await;
         save(&pool, "u1", answer(
             "Tell us about a personal project you're proud of.", "A fridge app.", None,
-        ), Utc::now()).await.expect("save");
+        ), Utc::now()).await.expect("save").expect("saved");
 
         let unrelated = suggest(&pool, "u1", "What is your expected salary?", None, 5)
             .await
