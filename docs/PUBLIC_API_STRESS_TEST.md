@@ -207,3 +207,24 @@ returns 839 — exactly what `term_year=1900` returns, because those are the unk
 
 50 simultaneous logins for one account from one address: **exactly 10 × 401 and 40 × 429**. The
 check-and-record happens under one lock, so a burst cannot race past it.
+
+---
+
+## Second pass, 2026-11-11 — hypotheses, written before any load ran
+
+The owner asked for more stress testing after the internships site was split out
+(`docs/HUNT.md` § "The internships site, split out"). Since the first pass, the corpus grew from
+2,997 live postings to 4,514 (7,937 rows including expired ones), the listing gained paging and
+gzip, the extension gained alert paging, and two Next servers front the one backend. Same method
+as the first pass: these predictions are committed before any load runs, against a release build
+on an isolated copy (`ops/stress/run-isolated.sh`).
+
+| | Hypothesis | Prediction |
+|---|---|---|
+| S9 | Listing throughput fell with the corpus: S3 says every request ranks the whole corpus | About two-thirds of the post-S1-fix numbers: ~190 req/s at 16 clients, zero errors |
+| S10 | Gzip costs real CPU on the largest page | At `limit=200`, gzip ≥ 20% below identity in req/s; at the default `limit=50`, under 10% |
+| S11 | Per-address limits key on the full IP, so one IPv6 /64 bypasses them | A registration burst rotating addresses inside one /64 gets **no** 429s, against all-but-five for one address |
+| S12 | Alert paging rejects every malformed `cursor` with 400 | Holds: no 500s and no panics |
+| S13 | The extension's page lookup (`/hunt/posting-for`) scans every row and parses each URL | Over 20 ms per request at 7,937 rows, and below the listing's throughput. Its code comment's "~1,400 rows" is stale |
+| S14 | One account can grow the database without a ceiling: answers have a size cap and no count cap | 2,000 maximum-length answers are all accepted and the database grows by about 40 MB |
+| S15 | Neither Next server is the bottleneck after the split | The internships site's `/internships` page and the personal site's `/internships` redirect each sustain over 500 req/s at 16 clients |
