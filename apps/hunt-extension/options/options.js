@@ -31,7 +31,7 @@ const SETTINGS_KEY = "settings";
 const DEFAULTS = {
   backendUrl: "http://localhost:8080",
   token: "",
-  siteUrl: "http://localhost:3000",
+  siteUrl: "http://localhost:3001",
   pollMinutes: 5,
   kinds: { posting: true, email: true, nudge: true },
   maxNotificationsPerPoll: 3,

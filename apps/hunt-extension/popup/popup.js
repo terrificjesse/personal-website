@@ -18,7 +18,7 @@ const CACHE_KEY = "recentEvents";
 const STATUS_KEY = "status";
 const LIST_LIMIT = 25;
 
-const DEFAULTS = { backendUrl: "http://localhost:8080", siteUrl: "http://localhost:3000", token: "" };
+const DEFAULTS = { backendUrl: "http://localhost:8080", siteUrl: "http://localhost:3001", token: "" };
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("events");

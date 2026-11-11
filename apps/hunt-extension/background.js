@@ -56,7 +56,7 @@ const DEFAULT_SETTINGS = {
   // `moz-extension://` page — so this is how the backend knows who we are.
   token: "",
   // Where "open the site" points. Used for a link only; nothing is fetched from it.
-  siteUrl: "http://localhost:3000",
+  siteUrl: "http://localhost:3001",
   // Firefox will not schedule an alarm more often than once a minute.
   pollMinutes: 5,
   // Every kind the backend can produce. A kind missing from a user's stored settings is

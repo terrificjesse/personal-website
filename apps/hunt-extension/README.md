@@ -5,8 +5,9 @@ one. Rules and decisions live in `CLAUDE.md` next to this file; this is just how
 
 ## Load it
 
-1. Start the backend (`cargo run` in `apps/fridge-app/backend`) and sign in to the site at
-   `http://localhost:3000`, so the browser holds a `fridge_session` cookie.
+1. Start the backend (`cargo run` in `apps/fridge-app/backend`) and sign in to the internships
+   site at `http://localhost:3001` (`apps/hunt-web/`, its own website since 2026-11-11), so the
+   browser holds a `fridge_session` cookie.
 2. Open `about:debugging#/runtime/this-firefox` in Firefox.
 3. **Load Temporary Add-on…**, and pick this folder's `manifest.json`.
 4. Open the extension's **Settings** and press **Test connection**. It reports which of the
@@ -38,6 +39,13 @@ Clicking a notification opens the posting. The popup lists recent alerts and say
 check ran and how it went.
 
 ## The backend has to allow the extension's origin
+
+**No longer a manual step.** Since 2026-08-30 the backend admits any `moz-extension://` origin
+(`is_allowed_origin` in `apps/fridge-app/backend/src/routes/mod.rs`), so the `ALLOWED_ORIGINS`
+entry described below is not needed. Kept for the reasoning, which still explains the failure.
+
+**Updating from before 2026-11-11?** The internships site moved to `http://localhost:3001`. A copy
+that saved its Settings keeps the old Site URL, so change it there once.
 
 `credentials: "include"` makes every request a **credentialed cross-origin** request. The
 browser discards the response unless it carries `Access-Control-Allow-Origin` naming the
